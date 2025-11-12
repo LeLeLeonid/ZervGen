@@ -2,6 +2,9 @@ import requests
 import logging
 from urllib.parse import quote
 from ..config import settings
+import yt_dlp
+import tempfile
+import base64
 
 class ApiClientError(Exception):
     """Custom exception for API client errors."""
@@ -74,3 +77,46 @@ class PollinationsClient:
         except (KeyError, IndexError, TypeError):
             logging.error(f"API returned an unexpected or malformed response: {data}")
             raise ApiClientError("API returned a response that could not be parsed.")
+
+    def transcribe_youtube(self, url: str) -> str:
+        """Downloads audio from a YouTube URL, transcribes it, and returns the text."""
+        if not url:
+            raise ValueError("YouTube URL cannot be empty.")
+
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'wav',
+                'preferredquality': '192',
+            }],
+            'outtmpl': f'{tempfile.gettempdir()}/%(id)s.%(ext)s', # Save to temp dir
+        }
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                audio_file_path = f"{tempfile.gettempdir()}/{info['id']}.wav"
+            
+            with open(audio_file_path, "rb") as f:
+                audio_data = base64.b64encode(f.read()).decode()
+
+            payload = {
+                "model": "openai-audio",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Transcribe this audio:"},
+                        {
+                            "type": "input_audio",
+                            "input_audio": {"data": audio_data, "format": "wav"}
+                        }
+                    ]
+                }]
+            }
+            response = self._handle_request("post", self.base_text_url, json=payload, timeout=600) # Longer timeout
+            data = response.json()
+            return data['choices'][0]['message']['content'].strip()
+
+        except Exception as e:
+            raise ApiClientError(f"Failed to transcribe YouTube video. Error: {e}")

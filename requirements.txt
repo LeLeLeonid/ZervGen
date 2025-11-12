@@ -1,3 +1,6 @@
 requests
 python-dotenv
 rich
+yt-dlp
+ffmpeg-python
+thefuzz
