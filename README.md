@@ -1,17 +1,21 @@
-# ZervGen: A Multi-Agent AI Framework
+# ZervGen
+
+An Orchestration Framework for Autonomous AI Agents.
 
 [![Python Version](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-ZervGen is a modular, terminal-first multi-agent AI framework designed for robust task automation and system orchestration. It is built on principles of clean architecture, providing a scalable and extensible platform for developing sophisticated AI agents.
+ZervGen is a lightweight, terminal-first framework for building and orchestrating multi-agent AI systems. It is designed around a clean, modular architecture, empowering developers to create sophisticated workflows where AI agents collaborate to solve complex tasks.
+
+The core is the **Supervisor-Executor** model. A central Supervisor agent acts as the strategic brain, deconstructing high-level goals into concrete, machine-executable plans. These plans are then carried out by a series of specialized Executor agents, turning abstract intent into tangible results.
 
 ## Features
 
--   **Modular Architecture:** A clean separation between the core logic, tooling, and user interface, making the framework easy to extend and maintain.
--   **Terminal-First Interface:** A powerful and responsive command-line interface powered by `rich` for an excellent user experience.
--   **Extensible Tooling:** Easily integrate with powerful external APIs. The initial implementation includes a robust client for the **Pollinations.AI API**.
--   **Configuration Management:** Simple and secure configuration using `.env` files for managing API keys and other settings.
--   **Scalable by Design:** The structure is prepared for future expansion into a true multi-agent system with supervisors and specialized executors.
+-   **Self-Evolving:** ZervGen can generate and save its own high-quality patterns, allowing the framework to learn and expand its capabilities over time.
+-   **Pattern-Driven:** Instead of simple prompts, the framework uses a library of robust, reusable patterns to ensure high-quality, predictable results.
+-   **Centralized Orchestration:** A powerful Supervisor (Agent 0) deconstructs complex goals into clear, multi-step plans, enabling true task automation.
+-   **Modular by Design:** A clean separation between logic, tooling, and interface makes the framework incredibly easy to extend.
+-   **Extensible Tooling:** Easily integrate any external API. The initial implementation includes a robust client for the Pollinations.AI API, including YouTube transcription.
 
 ## Getting Started
 
@@ -27,80 +31,94 @@ ZervGen is a modular, terminal-first multi-agent AI framework designed for robus
     cd ZervGen
     ```
 
-2.  **Install dependencies:**
-    It is highly recommended to use a virtual environment.
+2.  **Set up a virtual environment (recommended):**
     ```bash
     python -m venv venv
     source venv/bin/activate  # On Windows, use `venv\Scripts\activate`
+    ```
+
+3.  **Install dependencies:**
+    ```bash
     pip install -r requirements.txt
     ```
 
-3.  **Configure Environment:**
-    Create a file named `.env` in the root of the project by copying the example:
-    ```bash
-    cp .env.example .env
-    ```
-    Open the `.env` file and add your Pollinations.AI Bearer Token. This is optional for basic usage but recommended for higher rate limits.
-    ```ini
-    # Get a token from auth.pollinations.ai for higher limits
-    POLLINATIONS_API_TOKEN="YOUR_TOKEN_HERE"
-    ```
+4.  **Configure your environment:**
+    Create a `.env` file in the project root. If the file is missing, the application will guide you on the first run. Open the `.env` file to add your Pollinations.AI Bearer Token for higher rate limits.
 
 ## Usage
 
-Run the ZervGen Kernel from the project's root directory:
+Run the ZervGen framework from the project's root directory:
 
 ```bash
 python main.py
 ```
 
-The Kernel operates in an interactive loop. To use a tool, prefix your prompt with the tool name and a colon.
+The framework operates in two primary modes: creating new patterns and using existing ones. Use the `list` command to see available patterns.
 
-### Examples
+### Example Workflow 1: Creating a New Pattern
 
--   **Generate text:**
-    ```
-    > text: Explain the concept of emergent behavior in complex systems
-    ```
+You can teach ZervGen a new skill by telling it to create a new pattern.
 
--   **Generate an image:**
-    ```
-    > image: a photorealistic image of an astronaut discovering an ancient alien library on Mars
-    ```
-    The generated image will be saved to the `outputs/` directory.
+**Your Goal:**
+> `create pattern: to summarize complex texts into three distinct formats`
 
--   **Exit the application:**
-    ```
-    > exit
-    ```
+**The Supervisor's Plan (Generated Auto):**
+```json
+[
+  {
+    "tool_name": "generate_text",
+    "params": {
+      "prompt": "# IDENTITY\nYou are the Pattern Engine... \n\n**[GOAL]:**\n`to summarize complex texts into three distinct formats`"
+    }
+  },
+  {
+    "tool_name": "generate_pattern",
+    "params": {
+      "pattern_name": "multi_format_summarizer",
+      "explanation": "Summarizes complex texts into three distinct formats."
+    }
+  }
+]
+```
+The Executor will then run these steps, creating a new `multi_format_summarizer.md` file in your patterns library and making it instantly available for use.
 
-## Project Structure
+### Example Workflow 2: Using an Existing Pattern
 
-The project follows a professional structure that separates concerns, ensuring the codebase is clean, scalable, and maintainable.
+Once a pattern exists, you can use it to perform tasks.
+
+**Your Goal:**
+> `use multi_format_summarizer: summarize the latest article about AI from a news site.`
+
+The Executor will then use the `multi_format_summarizer` pattern to generate a plan and execute it, giving you the structured summary you need.
+
+## Project Arch.
+
+ZervGen's structure is designed for clarity and scalability.
 
 ```
 ZervGen/
-├── .env                  # Local environment configuration (API keys)
-├── README.md             # You are here
-├── requirements.txt      # Project dependencies
-├── main.py               # The main entry point for the application
+├── .env
+├── main.py               # The entrypoint.
+├── README.md             # You're here (*-*)
+├── requirements.txt
 └── src/
-    ├── __init__.py
-    ├── cli.py        # Handles all command-line interaction
-    ├── config.py     # Manages loading settings and secrets
-    ├── core/
-    │   └── kernel.py   # The core "headless" logic of the application
+    ├── cli.py            # Manages all user interaction.
+    ├── config.py         # Handles loading settings and API keys.
+    ├── agents/
+    │   ├── supervisor.py     # Contains Agent 0, the core planning logic.
+    │   └── executors/
+    │       └── tool_executor.py # Executes plans from the Supervisor.
+    ├── patterns/
+    │   ├── data/             # Contains the raw .md pattern files.
+    │   └── explanations.json # A registry of what each pattern does.
     └── tools/
-        └── pollinations_client.py # Client for interacting with external APIs
+        ├── pattern_manager.py   # Loads and suggests patterns.
+        └── pollinations_client.py # Client for external APIs.
 ```
 
 ## Roadmap
 
--   [ ] Implement a Supervisor agent to deconstruct complex tasks.
--   [ ] Develop specialized Executor agents (e.g., File System Agent, Web Search Agent).
--   [ ] Introduce a message bus (e.g., Redis or RabbitMQ) for inter-agent communication.
--   [ ] Add comprehensive unit and integration tests.
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+-   [ ] **Memory Implementation:** Introduce short-term memory for conversational context.
+-   [ ] **Executor Expansion:** Develop new Executor agents for file system operations and web searches.
+-   [ ] **Tool Abstraction:** Create a base `Tool` class to simplify adding new capabilities.
+-   [ ] **Testing Suite:** Implement comprehensive unit and integration tests.
