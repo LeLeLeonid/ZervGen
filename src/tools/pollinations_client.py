@@ -7,13 +7,14 @@ import tempfile
 import base64
 
 class ApiClientError(Exception):
-    """Custom exception for API client errors."""
+    """
+    Custom exception for API client errors.
+    """
     pass
 
 class PollinationsClient:
     """
     A robust and professional client for the Pollinations.AI API.
-    This version correctly handles the API response structure.
     """
     def __init__(self, api_token: str | None = None):
         self.base_image_url = "https://image.pollinations.ai/prompt/"
@@ -26,38 +27,43 @@ class PollinationsClient:
         self.VALID_IMAGE_PARAMS = {'model', 'width', 'height', 'seed', 'nologo', 'enhance', 'private'}
         self.VALID_TEXT_PARAMS = {'model', 'temperature', 'max_tokens', 'stream', 'tools', 'reasoning_effort'}
 
+        self.default_image_params = settings.api_settings.get('pollinations', {}).get('default_image_params', {})
+
     def _handle_request(self, method, url, **kwargs) -> requests.Response:
-        """A centralized method to handle API requests and errors."""
+        """
+        A centralized method to handle API requests and errors.
+        """
         try:
             response = requests.request(method, url, **kwargs)
             response.raise_for_status()
             return response
         except requests.exceptions.HTTPError as e:
-            status_code = e.response.status_code
-            if 400 <= status_code < 500:
-                error_details = e.response.text
-                raise ApiClientError(f"API returned a client error: {status_code} {e.response.reason}. Details: {error_details}")
-            elif 500 <= status_code < 600:
-                raise ApiClientError(f"API server error: {status_code} {e.response.reason}. This is likely a temporary issue. Please try again later.")
-            else:
-                raise ApiClientError(f"An unexpected HTTP error occurred: {status_code}")
+            raise ApiClientError(f"API Error {e.response.status_code}: {e.response.text}")
         except requests.exceptions.RequestException as e:
-            raise ApiClientError(f"A network error occurred: {e}")
+            raise ApiClientError(f"Network Error: {e}")
 
     def generate_image(self, **kwargs) -> bytes:
-        """Generates an image using only valid, whitelisted parameters."""
-        prompt = kwargs.pop('prompt', 'a beautiful abstract image')
+        """
+        Generates an image using only valid, whitelisted parameters.
+        """
+        prompt = kwargs.pop('prompt', 'abstract art')
         url = f"{self.base_image_url}{quote(prompt)}"
-        valid_params = {key: value for key, value in kwargs.items() if key in self.VALID_IMAGE_PARAMS}
+
+        final_params = self.default_image_params.copy()
+        final_params.update(kwargs)
+
+        valid_params = {key: value for key, value in final_params.items() if key in self.VALID_IMAGE_PARAMS}
         
         response = self._handle_request(
             "get", url, params=valid_params, headers=self.headers, 
-            timeout=settings.TIMEOUT_IMAGE_GENERATION
+            timeout=settings.performance.get('timeout_image', 180)
         )
         return response.content
 
     def generate_text(self, **kwargs) -> str:
-        """Generates text using only valid, whitelisted parameters."""
+        """
+        Generates text using only valid, whitelisted parameters.
+        """
         if 'prompt' not in kwargs:
             raise ValueError("generate_text requires a 'prompt' parameter.")
             
@@ -68,18 +74,19 @@ class PollinationsClient:
         
         response = self._handle_request(
             "post", self.base_text_url, json=payload, headers=self.headers, 
-            timeout=settings.TIMEOUT_TEXT_GENERATION
+            timeout=settings.performance.get('timeout_text', 90)
         )
         data = response.json()
         
         try:
             return data['choices'][0]['message']['content'].strip()
         except (KeyError, IndexError, TypeError):
-            logging.error(f"API returned an unexpected or malformed response: {data}")
-            raise ApiClientError("API returned a response that could not be parsed.")
-
+            raise ApiClientError(f"API returned an unparsable response: {data}")
+    
     def transcribe_youtube(self, url: str) -> str:
-        """Downloads audio from a YouTube URL, transcribes it, and returns the text."""
+        """
+        Downloads audio from a YouTube URL, transcribes it, and returns the text.
+        """
         if not url:
             raise ValueError("YouTube URL cannot be empty.")
 
