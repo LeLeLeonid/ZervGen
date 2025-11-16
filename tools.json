@@ -1,0 +1,18 @@
+{
+  "execute_python": {
+    "module_name": "python_executor",
+    "description": "Executes a block of Python code. Parameters: `code` (string, required)."
+  },
+  "generate_image": {
+    "module_name": "image_executor",
+    "description": "Creates an image from a text prompt. Parameters: `prompt` (string, required), `width` (int, optional), `height` (int, optional), `enhance` (bool, optional), `nologo` (bool, optional)."
+  },
+  "analyze_webpage": {
+    "module_name": "web_executor",
+    "description": "Downloads and extracts clean text content from a webpage. Parameters: `url` (string, required)."
+  },
+  "generate_text": {
+    "module_name": "text_executor",
+    "description": "A general-purpose tool that generates text using an LLM. Parameters: `prompt` (string, required), `temperature` (float, optional)."
+  }
+}

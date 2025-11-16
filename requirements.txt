@@ -4,3 +4,4 @@ rich
 yt-dlp
 ffmpeg-python
 thefuzz
+beautifulsoup4

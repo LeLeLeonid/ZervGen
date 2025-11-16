@@ -1,0 +1,19 @@
+{
+  "features": {
+    "use_patterns": false
+  },
+  "api_settings": {
+    "pollinations": {
+      "default_image_params": {
+        "nologo": true,
+        "enhance": true,
+        "width": 1024,
+        "height": 1024
+      }
+    }
+  },
+  "performance": {
+    "timeout_image": 180,
+    "timeout_text": 90
+  }
+}
