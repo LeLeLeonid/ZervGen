@@ -1,19 +1,14 @@
 {
-  "features": {
-    "use_patterns": false
-  },
-  "api_settings": {
+    "provider": "pollinations",
     "pollinations": {
-      "default_image_params": {
-        "nologo": true,
-        "enhance": true,
-        "width": 1024,
-        "height": 1024
-      }
+        "text_model": "openai",
+        "image_model": "flux",
+        "audio_model": "openai-audio",
+        "voice": "echo",
+        "reasoning_effort": "minimal",
+        "safe_filter": true,
+        "image_width": 1024,
+        "image_height": 1024,
+        "output_path": "tmp"
     }
-  },
-  "performance": {
-    "timeout_image": 180,
-    "timeout_text": 90
-  }
 }

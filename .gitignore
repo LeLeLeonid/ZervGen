@@ -9,4 +9,4 @@ env/
 les
 .idea/
 .vscode/
-outputs/
+tmp/

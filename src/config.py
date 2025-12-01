@@ -1,36 +1,33 @@
-import os
 import json
-from dotenv import load_dotenv, set_key
 from pathlib import Path
+from typing import Literal
+from pydantic import BaseModel, Field
 
-class Settings:
-    """Centralized configuration management."""
-    def __init__(self):
-        self.project_root = Path(__file__).parent.parent
-        self.env_path = self.project_root / ".env"
-        self.config_path = self.project_root / "config.json"
-        
-        self._load_env()
-        self._load_config()
+CONFIG_PATH = Path("config.json")
 
-    def _load_env(self):
-        if not self.env_path.exists():
-            self.env_path.touch()
-        load_dotenv(dotenv_path=self.env_path)
-        self.pollinations_api_token: str | None = os.getenv("POLLINATIONS_API_TOKEN")
+class PollinationsSettings(BaseModel):
+    text_model: str = "openai"
+    image_model: str = "flux"
+    audio_model: str = "openai-audio"
+    voice: str = "nova"
+    reasoning_effort: str = "minimal"
+    safe_filter: bool = True
+    image_width: int = 1024
+    image_height: int = 1024
+    output_path: str = "tmp"
 
-    def _load_config(self):
-        if not self.config_path.exists():
-            raise FileNotFoundError("config.json not found in the project root.")
-        with open(self.config_path, 'r') as f:
-            config_data = json.load(f)
-        
-        self.features = config_data.get('features', {})
-        self.api_settings = config_data.get('api_settings', {})
-        self.performance = config_data.get('performance', {})
+class GlobalSettings(BaseModel):
+    provider: Literal["pollinations"] = "pollinations"
+    pollinations: PollinationsSettings = Field(default_factory=PollinationsSettings)
 
-    def save_token(self, token: str):
-        set_key(self.env_path, "POLLINATIONS_API_TOKEN", token)
-        self.pollinations_api_token = token
+    def save(self):
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(self.model_dump(), f, indent=4)
 
-settings = Settings()
+def load_config() -> GlobalSettings:
+    if not CONFIG_PATH.exists():
+        defaults = GlobalSettings()
+        defaults.save()
+        return defaults
+    with open(CONFIG_PATH, "r") as f:
+        return GlobalSettings.model_validate(json.load(f))
