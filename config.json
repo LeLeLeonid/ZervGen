@@ -1,14 +1,19 @@
 {
     "provider": "pollinations",
     "pollinations": {
+        "api_key": "q",
         "text_model": "openai",
         "image_model": "flux",
         "audio_model": "openai-audio",
-        "voice": "echo",
+        "voice": "nova",
         "reasoning_effort": "minimal",
-        "safe_filter": true,
         "image_width": 1024,
         "image_height": 1024,
         "output_path": "tmp"
+    },
+    "gemini": {
+        "api_key": null,
+        "model": "gemini-2.0-flash",
+        "temperature": 0.7
     }
 }

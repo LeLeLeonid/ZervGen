@@ -1,75 +1,97 @@
-import os
-import httpx
+import json
+import re
 import platform
+import datetime
+import pkgutil
+import os
 import subprocess
 import time
 from pathlib import Path
-from typing import List, Dict
 from src.core.provider import AIProvider
 from src.config import GlobalSettings
+from src.providers.pollinations import PollinationsProvider
+from src.tools import TOOL_REGISTRY, get_tools_schema, download_and_open_image, extract_json_from_text
 
 class Orchestrator:
     def __init__(self, provider: AIProvider, settings: GlobalSettings):
-        self.provider = provider
+        self.brain = provider
         self.settings = settings
-        self.history: List[Dict[str, str]] = []
-        self.tmp_dir = Path(self.settings.pollinations.output_path)
-        self.tmp_dir.mkdir(exist_ok=True)
+        self.history = []
+        self.media_engine = PollinationsProvider(self.settings.pollinations)
 
-    def _play_audio(self, file_path: Path):
-        system = platform.system()
-        str_path = str(file_path.absolute())
-        
+    def _get_system_context(self) -> str:
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        os_info = f"{platform.system()} {platform.release()}"
+        return f"CONTEXT: [Time: {now}] [OS: {os_info}]"
+
+    def _scan_available_agents(self) -> str:
+        agents = []
+        agents_path = Path("src/agents")
+        if agents_path.exists():
+            for _, name, _ in pkgutil.iter_modules([str(agents_path)]):
+                agents.append(name)
+        return ", ".join(agents)
+
+    def _build_system_prompt(self) -> str:
         try:
-            if system == "Windows":
-                cmd = f'powershell -c (New-Object Media.SoundPlayer "{str_path}").PlaySync()'
-                subprocess.Popen(cmd, shell=True)
-            elif system == "Darwin":
-                subprocess.Popen(["afplay", str_path])
-            else:
-                subprocess.Popen(["xdg-open", str_path])
-        except Exception:
-            pass
+            with open("src/prompts/system.md", "r", encoding="utf-8") as f:
+                base_prompt = f.read()
+        except:
+            base_prompt = "You are ZervGen Supervisor."
 
-    async def _download_image(self, url: str) -> Path:
-        filename = f"img_{int(time.time())}.jpg"
-        path = self.tmp_dir / filename
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(url)
-            with open(path, "wb") as f:
-                f.write(resp.content)
-        return path
+        context = self._get_system_context()
+        agents_list = self._scan_available_agents()
+        tools_list = get_tools_schema()
+
+        full_prompt = (
+            f"{context}\n\n"
+            f"{base_prompt}\n\n"
+            f"AVAILABLE AGENTS: {agents_list}\n"
+            f"AVAILABLE TOOLS: {tools_list}"
+        )
+        return full_prompt
 
     async def process(self, user_input: str) -> str:
         self.history.append({"role": "user", "content": user_input})
         
-        if user_input.lower().startswith("/image"):
-            prompt = user_input.replace("/image", "").strip()
-            url = await self.provider.generate_image(prompt)
-            local_path = await self._download_image(url)
-            
-            if platform.system() == "Windows": os.startfile(local_path)
-            elif platform.system() == "Darwin": subprocess.run(["open", str(local_path)])
-            
-            response = f"Image saved: {local_path}\nURL: {url}"
+        system_prompt = self._build_system_prompt()
+        response = await self.brain.generate_text(self.history, system_prompt)
         
-        elif user_input.lower().startswith("/speak"):
-            text = user_input.replace("/speak", "").strip()
-            try:
-                audio_bytes = await self.provider.generate_audio(text)
-                filename = f"audio_{int(time.time())}.wav"
-                path = self.tmp_dir / filename
-                
-                with open(path, "wb") as f:
-                    f.write(audio_bytes)
-                
-                self._play_audio(path)
-                response = f"Audio playing... (Saved to {path})"
-            except Exception as e:
-                response = f"Audio Generation Failed: {str(e)}"
-            
-        else:
-            response = await self.provider.generate_text(self.history, "You are ZervGen (The Orchestrator).")
+        json_str = extract_json_from_text(response)
+        text_part = re.sub(r'```json.*?```', '', response, flags=re.DOTALL).strip()
+        if json_str:
+            text_part = text_part.replace(json_str, "").strip()
 
-        self.history.append({"role": "assistant", "content": response})
-        return response
+        final_output = text_part if text_part else ""
+
+        if json_str:
+            try:
+                action_data = json.loads(json_str)
+                tool_name = action_data.get("tool")
+                args = action_data.get("args", {})
+                
+                if tool_name == "generate_image":
+                    prompt = args.get("prompt", "")
+                    url = await self.media_engine.generate_image(prompt)
+                    local_path = await download_and_open_image(url)
+                    result = f"\n[Image Generated: {url}]"
+                
+                elif tool_name in TOOL_REGISTRY:
+                    func = TOOL_REGISTRY[tool_name]
+                    import inspect
+                    if inspect.iscoroutinefunction(func):
+                        result = await func(**args)
+                    else:
+                        result = func(**args)
+                else:
+                    result = f"Error: Tool '{tool_name}' not found."
+
+                final_output += f"\n\n[Action: {tool_name}]\nResult: {result}"
+                
+            except json.JSONDecodeError:
+                final_output += "\n[System Error: Failed to parse action JSON]"
+            except Exception as e:
+                final_output += f"\n[System Error: {e}]"
+
+        self.history.append({"role": "assistant", "content": final_output})
+        return final_output
