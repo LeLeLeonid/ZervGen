@@ -1,24 +1,30 @@
 import json
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional
 from pydantic import BaseModel, Field
 
 CONFIG_PATH = Path("config.json")
 
 class PollinationsSettings(BaseModel):
+    api_key: Optional[str] = None
     text_model: str = "openai"
     image_model: str = "flux"
     audio_model: str = "openai-audio"
     voice: str = "nova"
     reasoning_effort: str = "minimal"
-    safe_filter: bool = True
     image_width: int = 1024
     image_height: int = 1024
     output_path: str = "tmp"
 
+class GeminiSettings(BaseModel):
+    api_key: Optional[str] = None
+    model: str = "gemini-2.0-flash"
+    temperature: float = 0.7
+
 class GlobalSettings(BaseModel):
-    provider: Literal["pollinations"] = "pollinations"
+    provider: Literal["pollinations", "gemini"] = "pollinations"
     pollinations: PollinationsSettings = Field(default_factory=PollinationsSettings)
+    gemini: GeminiSettings = Field(default_factory=GeminiSettings)
 
     def save(self):
         with open(CONFIG_PATH, "w") as f:
