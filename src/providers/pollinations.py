@@ -21,9 +21,16 @@ class PollinationsProvider(AIProvider):
             return text.split(ad_marker)[0].strip()
         return text
 
-    @async_retry()
-    async def generate_text(self, history: List[Dict], system_prompt: str) -> str:
+    def _check_errors(self, response):
+        if response.status_code in [500, 502, 503, 504]:
+            raise Exception(f"Server Error: {response.status_code}")
         
+        text = response.text.lower()
+        if "bad gateway" in text or "service unavailable" in text:
+            raise Exception(f"Gateway Error: {text[:100]}...")
+
+    @async_retry(retries=5, delays=[1, 2, 5, 10, 20])
+    async def generate_text(self, history: List[Dict], system_prompt: str) -> str:
         short_history = history[-10:] if len(history) > 10 else history
         
         try:
@@ -39,31 +46,39 @@ class PollinationsProvider(AIProvider):
 
                 resp = await client.post(f"{self.base_url_text}/openai", json=payload, headers=self.headers, timeout=60)
                 
+                self._check_errors(resp)
+                
                 if resp.status_code == 402: raise Exception("Tier Restriction")
                 resp.raise_for_status()
+                
                 raw_text = resp.json()['choices'][0]['message']['content']
                 return self._clean_response(raw_text)
-        except Exception:
-            # Fallback
+        except Exception as e:
+            if "Tier Restriction" in str(e): raise e
+            
             conversation = f"System: {system_prompt}\n"
             for msg in short_history: conversation += f"{msg['role']}: {msg['content']}\n"
             safe_prompt = quote(conversation[-4000:]) 
             url = f"{self.base_url_text}/{safe_prompt}?model={self.settings.text_model}"
+            
             async with httpx.AsyncClient() as client:
                 resp = await client.get(url, timeout=60)
+                self._check_errors(resp)
                 return self._clean_response(resp.text)
 
-    @async_retry()
+    @async_retry(retries=3, delays=[2, 5, 10])
     async def generate_image(self, prompt: str) -> str:
         safe_prompt = quote(prompt)
         params = f"width={self.settings.image_width}&height={self.settings.image_height}&nologo=true&enhance=true"
         return f"{self.base_url_image}/{safe_prompt}?{params}&model={self.settings.image_model}"
 
-    @async_retry()
+    @async_retry(retries=3, delays=[2, 5, 10])
     async def generate_audio(self, text: str) -> bytes:
+        safe_text = quote(text)
         url = f"{self.base_url_text}/{safe_text}?model=openai-audio&voice={self.settings.voice}"
         async with httpx.AsyncClient() as client:
             resp = await client.get(url, timeout=60)
+            self._check_errors(resp)
             if resp.status_code != 200: raise Exception("API Error")
             return resp.content
 
