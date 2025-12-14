@@ -1,5 +1,10 @@
 import asyncio
 import functools
+import platform
+import datetime
+import pkgutil
+import re
+from pathlib import Path
 from rich.console import Console
 
 console = Console()
@@ -19,3 +24,16 @@ def async_retry(retries=3, delays=[2, 5, 10]):
                     await asyncio.sleep(wait_time)
         return wrapper
     return decorator
+
+def get_system_context() -> str:
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    os_info = f"{platform.system()} {platform.release()}"
+    return f"CONTEXT: [Time: {now}] [OS: {os_info}]"
+
+def scan_available_agents() -> str:
+    agents = []
+    agents_path = Path("src/agents")
+    if agents_path.exists():
+        for _, name, _ in pkgutil.iter_modules([str(agents_path)]):
+            agents.append(name)
+    return ", ".join(agents)
