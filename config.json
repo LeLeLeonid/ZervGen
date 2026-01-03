@@ -1,7 +1,7 @@
 {
-    "provider": "pollinations",
+    "provider": "openrouter",
     "pollinations": {
-        "api_key": "q",
+        "api_key": "",
         "text_model": "openai",
         "image_model": "flux",
         "audio_model": "openai-audio",
@@ -15,5 +15,11 @@
         "api_key": null,
         "model": "gemini-2.0-flash",
         "temperature": 0.7
+    },
+    "openrouter": {
+        "api_key": "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",
+        "model": "xiaomi/mimo-v2-flash:free",
+        "site_url": "https://github.com/LeLeLeonid/ZervGen",
+        "app_name": "ZervGen"
     }
 }

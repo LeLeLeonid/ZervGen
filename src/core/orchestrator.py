@@ -2,7 +2,6 @@ import json
 import re
 import platform
 import subprocess
-import os
 import time
 from pathlib import Path
 from src.core.provider import AIProvider
@@ -18,7 +17,7 @@ class Orchestrator:
         self.settings = settings
         self.history = []
         self.media_engine = PollinationsProvider(self.settings.pollinations)
-        self.max_steps = 10
+        self.max_steps = self.settings.max_steps
 
     def _build_system_prompt(self) -> str:
         try:
@@ -39,6 +38,11 @@ class Orchestrator:
         )
         return full_prompt
 
+    def _trim_history(self):
+            limit = self.settings.history_limit
+            if len(self.history) > limit + 2:
+                self.history = [self.history[0]] + self.history[-limit:]
+
     async def process(self, user_input: str) -> str:
         self.history.append({"role": "user", "content": user_input})
         sys_logger.log("user", "input", {"content": user_input})
@@ -47,6 +51,8 @@ class Orchestrator:
         step = 0
         
         while step < self.max_steps:
+            self._trim_history()
+
             try:
                 response = await self.brain.generate_text(self.history, system_prompt)
             except Exception as e:
@@ -85,12 +91,15 @@ class Orchestrator:
                 else:
                     result = f"Error: Tool '{tool_name}' not found."
 
+                if len(result) > 2000:
+                    result = result[:2000] + "... [TRUNCATED]"
+
                 observation = f"[OBSERVATION]\nTool: {tool_name}\nResult: {result}"
+                
+                print(f"\n[Step {step+1}] Executed {tool_name}...")
+                
                 self.history.append({"role": "user", "content": observation})
                 sys_logger.log("system", "tool_execution", {"tool": tool_name, "result": result})
-                
-                # Feedback loop: Print intermediate step to CLI (optional, handled by CLI usually)
-                print(f"\n[Step {step+1}] Executed {tool_name}...")
 
             except json.JSONDecodeError:
                 error_msg = "[SYSTEM ERROR] Invalid JSON format. Please correct syntax."
