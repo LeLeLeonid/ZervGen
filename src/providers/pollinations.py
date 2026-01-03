@@ -26,7 +26,7 @@ class PollinationsProvider(AIProvider):
             raise Exception(f"Server Error: {response.status_code}")
         
         text = response.text.lower()
-        if "bad gateway" in text or "service unavailable" in text:
+        if "bad gateway" in text or "cloudflare" in text or "service unavailable" in text:
             raise Exception(f"Gateway Error: {text[:100]}...")
 
     @async_retry(retries=5, delays=[1, 2, 5, 10, 20])

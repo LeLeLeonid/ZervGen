@@ -21,10 +21,19 @@ class GeminiSettings(BaseModel):
     model: str = "gemini-2.0-flash"
     temperature: float = 0.7
 
+class OpenRouterSettings(BaseModel):
+    api_key: Optional[str] = None
+    model: str = "google/gemini-2.0-flash-exp:free"
+    site_url: str = "https://github.com/LeLeLeonid/ZervGen"
+    app_name: str = "ZervGen"
+
 class GlobalSettings(BaseModel):
-    provider: Literal["pollinations", "gemini"] = "pollinations"
+    provider: Literal["pollinations", "gemini", "openrouter"] = "pollinations"
+    max_steps: int = 100
+    history_limit: int = 15
     pollinations: PollinationsSettings = Field(default_factory=PollinationsSettings)
     gemini: GeminiSettings = Field(default_factory=GeminiSettings)
+    openrouter: OpenRouterSettings = Field(default_factory=OpenRouterSettings)
 
     def save(self):
         with open(CONFIG_PATH, "w") as f:

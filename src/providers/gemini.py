@@ -4,25 +4,17 @@ from src.core.provider import AIProvider
 from src.config import GeminiSettings
 from src.utils import async_retry
 
-# Not Accurate 
-GEMINI_MODELS = [
-    "gemini-2.5-pro-preview-03-25",
-    "gemini-2.5-flash",
-    "gemini-2.5-pro",
-    "gemini-2.0-flash-exp",
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite-preview-02-05",
-    "gemini-2.0-pro-exp-02-05",
-    "gemini-flash-latest",
-    "gemini-pro-latest",
-    "gemini-1.5-flash",
-    "gemini-1.5-pro",
-    "gemini-1.5-flash-8b",
-    "gemini-exp-1206",
-    "gemini-2.0-flash-thinking-exp-01-21",
-    "learnlm-2.0-flash-experimental",
-    "gemma-3-27b-it"
-]
+def fetch_available_models(api_key: str) -> List[str]:
+    try:
+        genai.configure(api_key=api_key)
+        models = []
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                name = m.name.replace("models/", "")
+                models.append(name)
+        return models
+    except Exception:
+        return ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-3.0-flash"]
 
 class GeminiProvider(AIProvider):
     def __init__(self, settings: GeminiSettings):
