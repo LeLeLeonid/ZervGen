@@ -2,68 +2,62 @@
 
 **Autonomous AI Orchestration**
 
-[![Version](https://img.shields.io/badge/Version-1.1.1-purple?style=flat-square)](https://github.com/LeLeLeonid/ZervGen)
-[![Python](https://img.shields.io/badge/Python-3.10%2B-000000?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
-[![License](https://img.shields.io/badge/License-MIT-000000?style=flat-square)](LICENSE)
+[![Version](https://img.shields.io/badge/Version-1.2.0-purple?style=for-the-badge)](https://github.com/LeLeLeonid/ZervGen)
+[![License](https://img.shields.io/badge/License-MIT-000000?style=for-the-badge)](LICENSE)
 
-ZervGen is a terminal-first framework implementing a **Supervisor-Worker** architecture for Large Language Models. It decouples the reasoning engine (Orchestrator) from execution units (Agents), enabling dynamic task routing, autonomous tool execution, and seamless provider switching in a stateless environment.
+ZervGen features a self-healing ReAct loop, a GraphRAG memory core, and a plugin-based skill architecture.
 
 ---
 
-## // CORE CAPABILITIES
+## // NEURAL CAPABILITIES
 
-*   **Supervisor Architecture:** Centralized intent analysis and task delegation using a robust ReAct (Reasoning + Acting) loop.
-*   **Multi-Provider Support:**
-    *   **OpenRouter:** Access to Claude, Llama, DeepSeek, and more.
-    *   **Google Gemini:** Native integration with Flash/Pro models.
-    *   **Pollinations.AI:** Fallback support for free text and media generation.
-*   **Dynamic Tool Registry:** Runtime injection of capabilities including Web Search (DDG), File System operations, TTS (Edge-TTS), and Media generation.
-*   **Specialized Agents:**
-    *   `@Coder`: File system manipulation, code synthesis, and command execution.
-    *   `@Researcher`: Web scraping, weather analysis, and data aggregation.
-*   **Resilience:** Built-in cognitive retry logic, smart history trimming, and anti-bot measures for web scraping.
+### 🧠 The Brain (Hybrid Core)
+*   **Supervisor Architecture:** Decouples reasoning (Orchestrator) from execution (Agents).
+*   **Multi-Model Support:** Native integration with **OpenRouter** (Claude 3.5, Llama 3), **Google Gemini**, and **Pollinations.AI**.
+*   **Self-Reflection:** The system analyzes its own actions and saves critical insights to long-term memory automatically.
+
+### 💾 The Memory (GraphRAG)
+*   **Knowledge Graph:** Stores facts and relationships, not just text vectors.
+*   **Semantic Search:** Allows the agent to "recall" past projects and preferences.
+*   **Self-Evolution:** The memory system evolves based on successful query patterns.
+
+### 🛠️ The Arsenal (Dynamic Tooling)
+*   **MCP Support:** Connect to external servers (GitHub, Slack, Postgres) via Model Context Protocol.
+*   **Native Tools:**
+    *   `web_search` (DDG) & `visit_page` (Anti-Bot Scraper)
+    *   `filesystem` (Safe Read/Write/Grep)
+    *   `speak` (Edge-TTS Neural Voice)
+    *   `generate_image` (Pollinations Art)
+*   **Rate Limiter:** Built-in protection against API abuse and cost overruns.
+
+---
 
 ## // INSTALLATION
 
 ```bash
-# 1. Clone repository
 git clone https://github.com/LeLeLeonid/ZervGen.git
 cd ZervGen
-
-# 2. Virtual Environment
 python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
+# Windows:
+venv\Scripts\activate
+# Linux/Mac:
+source venv/bin/activate
 
-# 3. Dependencies
 pip install -r requirements.txt
+python main.py
 ```
 
 ## // CONFIGURATION
 
-On the first launch, ZervGen generates a `config.json` file. You can configure it via the CLI menu or manually.
+ZervGen generates a `config.json` on first launch.
+You can enable/disable specific MCP servers (Puppeteer, Filesystem) and configure API keys.
 
-**Supported Providers:**
-1.  **OpenRouter:** Requires API Key. Recommended for best performance.
-2.  **Gemini:** Requires Google API Key. High speed and large context.
-3.  **Pollinations:** No key required. Good for testing and media generation.
-
-## // USAGE
-
-Initialize the kernel:
-
-```bash
-python main.py
+```json
+"mcp_servers": {
+    "puppeteer": { "enabled": true },
+    "obsidian": { "args": ["...path to vault..."], "enabled": true }
+}
 ```
-
-**System Commands:**
-*   `/history`: View current session context.
-*   `/time`: Check system time.
-*   `/clear`: Flush short-term memory.
-
-**CLI Menu:**
-*   `[1] Start Chat`: Enter the orchestration loop.
-*   `[2] Configuration`: Hot-swap providers and models.
-*   `[3] Exit`: Terminate session.
 
 ## // ARCHITECTURE
 
@@ -77,38 +71,42 @@ ZervGen/
 ├── src/
 │   ├── cli.py            # UI / Input Loop (Rich-based)
 │   ├── config.py         # Pydantic Data Models
+│   ├── skills_loader.py  # Skills Loader
 │   ├── tools.py          # Unified Function Registry
 │   ├── utils.py          # Helpers (Retry logic, JSON parsing)
 │   ├── core/
 │   │   ├── orchestrator.py  # Logic Core (The Supervisor)
 │   │   ├── base_agent.py    # Agent Interface
+│   │   ├── mcp_manager.py  # MCPManager (false)
+│   │   ├── memory.py    # Agent Interface
 │   │   └── provider.py      # API Interface
 │   ├── agents/           # Worker Units
 │   │   ├── coder.py
 │   │   └── researcher.py
-│   ├── prompts/          # System Instructions (Markdown)
+│   ├── skills/           # System Instructions (Markdown)
 │   └── providers/        # API Wrappers (OpenRouter, Gemini, Pollinations)
 └── tmp/                  # Artifact Storage (Images, Audio)
 ```
 
-## // WORKFLOW EXAMPLE
 
-**Input:**
-> "Analyze the current weather in Tokyo and write a report to weather.txt"
+## // USAGE
 
-**Execution Flow:**
-1.  **Orchestrator** receives input and initializes ReAct loop.
-2.  **Router** detects intent: `Research` + `File I/O`.
-3.  **Action 1:** Calls `get_weather("Tokyo")` via Tool Registry.
-4.  **Action 2:** Delegates to `@Coder` agent to write file.
-5.  **Output:** Confirms execution to user.
+**Chat Loop:**
+> **User:** "Research the latest news and summarize them in my Obsidian vault."
+> **ZervGen:** *[Calls Web Search -> Visits Pages -> Summarizes -> Writes to Obsidian]*
 
-## // ROADMAP
+**Commands:**
+*   `/history` - View session context.
+*   `/clear` - Reset short-term memory.
+*   `/stats` - View memory graph statistics.
 
-- [ ] **Persistent Memory:** Vector-based session storage for long-term context.
-- [ ] **Plugin System:** Hot-swappable agent modules via drag-and-drop.
-- [ ] **Voice Input:** STT integration for full duplex voice interaction.
-- [ ] **Dockerization:** Containerized deployment.
+---
+
+## // ROADMAP (2026)
+
+- [ ] **Docker Sandboxing:** Run generated code in isolated containers.
+- [ ] **Voice Interface:** Real-time STT/TTS loop (JARVIS mode).
+- [ ] **Visual Cortex:** Integration with Multimodal models for screen analysis.
 
 ---
 

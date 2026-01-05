@@ -37,7 +37,6 @@ class OpenRouterProvider(AIProvider):
             try:
                 resp = await client.post(self.base_url, headers=self.headers, json=payload, timeout=60)
                 
-                # 1. Check HTTP Status
                 if resp.status_code != 200:
                     error_text = resp.text
                     try:
@@ -47,13 +46,11 @@ class OpenRouterProvider(AIProvider):
                     except: pass
                     raise Exception(f"OpenRouter HTTP {resp.status_code}: {error_text}")
 
-                # 2. Parse JSON
                 try:
                     data = resp.json()
                 except json.JSONDecodeError:
                     raise Exception(f"OpenRouter returned invalid JSON (possibly Cloudflare error): {resp.text[:200]}")
 
-                # 3. Validate Structure
                 if "error" in data:
                     raise Exception(f"OpenRouter API Error: {data['error']}")
                 
@@ -70,7 +67,6 @@ class OpenRouterProvider(AIProvider):
             except httpx.TimeoutException:
                 raise Exception("OpenRouter Timeout (60s). The model is too slow or down.")
             except Exception as e:
-                # Re-raise to trigger retry logic
                 raise e
 
     async def generate_image(self, prompt: str) -> str:
@@ -79,5 +75,43 @@ class OpenRouterProvider(AIProvider):
     async def generate_audio(self, text: str) -> bytes:
         return b"OpenRouter does not support audio."
 
-    async def analyze_image(self, prompt: str, image_url: str) -> str:
-        return "Vision not implemented for OpenRouter yet."
+    async def analyze_image(self, prompt: str, image_path_or_url: str) -> str:
+        if image_path_or_url.startswith("http"):
+            image_url = image_path_or_url
+        else:
+            try:
+                with open(image_path_or_url, "rb") as image_file:
+                    import base64
+                    base64_image = base64.b64encode(image_file.read()).decode('utf-8')
+                    image_url = f"data:image/jpeg;base64,{base64_image}"
+            except Exception as e:
+                return f"Error loading image: {e}"
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": image_url}
+                    }
+                ]
+            }
+        ]
+        
+        payload = {
+            "model": self.settings.model,
+            "messages": messages,
+            "temperature": 0.5
+        }
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(self.base_url, headers=self.headers, json=payload, timeout=60)
+            if resp.status_code != 200:
+                return f"Vision Error {resp.status_code}: {resp.text}"
+            
+            data = resp.json()
+            if "choices" in data and data["choices"]:
+                return data['choices'][0]['message']['content']
+            return "No description returned."

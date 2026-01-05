@@ -1,9 +1,30 @@
 import json
+import shutil
+import os
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal, Optional, Dict, List, Any
 from pydantic import BaseModel, Field
 
 CONFIG_PATH = Path("config.json")
+
+class MCPServerConfig(BaseModel):
+    command: str
+    args: List[str]
+    env: Dict[str, str] = Field(default_factory=dict)
+    enabled: bool = False
+    
+    def is_executable_available(self) -> bool:
+        cmd = self.command
+        if cmd == "npx" and os.name == "nt":
+            return shutil.which("npx") is not None or shutil.which("npx.cmd") is not None
+        return shutil.which(cmd) is not None
+    
+    def validate_env_vars(self) -> tuple[bool, List[str]]:
+        missing_vars = []
+        for key, value in self.env.items():
+            if value in ["YOUR_KEY_HERE", "YOUR_TOKEN_HERE", "...", "xoxb-...", "T...", "..."]:
+                missing_vars.append(key)
+        return len(missing_vars) == 0, missing_vars
 
 class PollinationsSettings(BaseModel):
     api_key: Optional[str] = None
@@ -27,13 +48,74 @@ class OpenRouterSettings(BaseModel):
     site_url: str = "https://github.com/LeLeLeonid/ZervGen"
     app_name: str = "ZervGen"
 
+DEFAULT_MCP_SERVERS = {
+    "filesystem": MCPServerConfig(
+        command="npx", 
+        args=["-y", "@modelcontextprotocol/server-filesystem", "."], 
+        enabled=False
+    ),
+    "git": MCPServerConfig(
+        command="npx", 
+        args=["-y", "@modelcontextprotocol/server-git"], 
+        enabled=False
+    ),
+    "puppeteer": MCPServerConfig(
+        command="npx", 
+        args=["-y", "@modelcontextprotocol/server-puppeteer"], 
+        enabled=False
+    ),
+    "fetch": MCPServerConfig(
+        command="npx", 
+        args=["-y", "@modelcontextprotocol/server-fetch"], 
+        enabled=False
+    ),
+    "memory": MCPServerConfig(
+        command="npx",
+        args=["-y", "@modelcontextprotocol/server-memory"],
+        enabled=False
+    ),
+    "godot": MCPServerConfig(
+        command="npx",
+        args=["-y", "godot-mcp-server-placeholder"],
+        enabled=False
+    )
+}
+
 class GlobalSettings(BaseModel):
     provider: Literal["pollinations", "gemini", "openrouter"] = "pollinations"
     max_steps: int = 100
     history_limit: int = 15
+    debug_mode: bool = False
+    require_approval: bool = False
+    allowed_directories: List[str] = Field(default_factory=list)
+    mcp_servers: Dict[str, MCPServerConfig] = Field(default_factory=lambda: DEFAULT_MCP_SERVERS)
+    mcp_enabled: bool = False
     pollinations: PollinationsSettings = Field(default_factory=PollinationsSettings)
     gemini: GeminiSettings = Field(default_factory=GeminiSettings)
     openrouter: OpenRouterSettings = Field(default_factory=OpenRouterSettings)
+    
+    def get_mcp_health_report(self) -> Dict[str, Any]:
+        report = {}
+        for name, config in self.mcp_servers.items():
+            if not config.enabled:
+                report[name] = {"status": "disabled", "issues": []}
+                continue
+            
+            issues = []
+            if not config.is_executable_available():
+                issues.append(f"Command '{config.command}' not found in PATH")
+            
+            env_valid, missing_vars = config.validate_env_vars()
+            if not env_valid:
+                issues.append(f"Missing environment variables: {', '.join(missing_vars)}")
+            
+            report[name] = {
+                "status": "healthy" if not issues else "issues",
+                "issues": issues,
+                "executable_available": config.is_executable_available(),
+                "env_valid": env_valid
+            }
+        return report
 
     def save(self):
         with open(CONFIG_PATH, "w") as f:
@@ -44,5 +126,28 @@ def load_config() -> GlobalSettings:
         defaults = GlobalSettings()
         defaults.save()
         return defaults
-    with open(CONFIG_PATH, "r") as f:
-        return GlobalSettings.model_validate(json.load(f))
+    
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            return GlobalSettings.model_validate(json.load(f))
+    except Exception:
+        if CONFIG_PATH.exists():
+            shutil.copy(CONFIG_PATH, CONFIG_PATH.with_suffix(".bak"))
+        defaults = GlobalSettings()
+        defaults.save()
+        return defaults
+
+def validate_config(config: GlobalSettings) -> tuple[bool, List[str]]:
+    issues = []
+    
+    if config.provider == "gemini" and not config.gemini.api_key:
+        issues.append("Gemini API key is missing")
+    elif config.provider == "openrouter" and not config.openrouter.api_key:
+        issues.append("OpenRouter API key is missing")
+    
+    health = config.get_mcp_health_report()
+    for name, status in health.items():
+        if status["status"] == "issues":
+            issues.extend([f"MCP {name}: {issue}" for issue in status["issues"]])
+    
+    return len(issues) == 0, issues
