@@ -6,18 +6,32 @@ from src.core.provider import AIProvider
 from src.tools import TOOL_REGISTRY
 
 class BaseAgent(ABC):
-    def __init__(self, name: str, provider: AIProvider, prompt_filename: str):
+    def __init__(self, name: str, provider: AIProvider, skill_name: str):
         self.name = name
         self.provider = provider
-        self.system_prompt = self._load_prompt(prompt_filename)
+        self.system_prompt = self._load_skill(skill_name)
         self.tools: Dict[str, Callable] = {}
         self.history: List[Dict] = []
 
-    def _load_prompt(self, filename: str) -> str:
+    def _load_skill(self, skill_name: str) -> str:
+        """Load skill from skills directory (new system)"""
         try:
-            path = Path("src/prompts") / filename
-            with open(path, "r", encoding="utf-8") as f: return f.read()
-        except: return f"You are {self.name}."
+            from ZervGen.src.skills_loader import load_skill
+            skill_content = load_skill(skill_name)
+            if skill_content:
+                return skill_content
+        except:
+            pass
+
+        try:
+            path = Path("src/prompts") / f"{skill_name}.md"
+            if path.exists():
+                with open(path, "r", encoding="utf-8") as f:
+                    return f.read()
+        except:
+            pass
+        
+        return f"You are {self.name}."
 
     def load_tools(self, tool_names: List[str]):
         for name in tool_names:
