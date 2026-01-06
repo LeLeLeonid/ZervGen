@@ -51,7 +51,7 @@ class Orchestrator:
                 raise Exception("System skill not found")
         except Exception as e:
             try:
-                with open("src/prompts/system.md", "r", encoding="utf-8") as f:
+                with open("src/skills/system.md", "r", encoding="utf-8") as f:
                     base_prompt = f.read()
             except Exception as e2:
                 sys_logger.log("system", "prompt_load_fail", {"error": str(e2)})
