@@ -10,4 +10,4 @@ les
 .idea/
 .vscode/
 tmp/
-config.json
+*.json
