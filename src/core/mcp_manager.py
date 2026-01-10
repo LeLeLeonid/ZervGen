@@ -5,7 +5,7 @@ from typing import Dict, Any, List
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from src.config import GlobalSettings
-from src.utils import sys_logger
+from src.core.memory import memory_core
 
 class MCPManager:
     def __init__(self, settings: GlobalSettings):
@@ -18,23 +18,21 @@ class MCPManager:
 
     async def connect_all(self):
         if not self.enabled:
-            sys_logger.log("system", "mcp_disabled_global", {})
-            print("[MCP] Globally disabled, skipping all MCP servers.")
             return
+            
         from contextlib import AsyncExitStack
         self.exit_stack = AsyncExitStack()
 
         for name, cfg in self.settings.mcp_servers.items():
             if not cfg.enabled: 
-                sys_logger.log("system", "mcp_disabled", {"server": name})
                 continue 
             
             exe = shutil.which(cfg.command)
             if not exe:
                 msg = f"Command '{cfg.command}' not found in PATH"
                 self.failed_servers[name] = msg
-                sys_logger.log("system", "mcp_missing_exe", {"server": name, "command": cfg.command})
-                print(f"[MCP] Warning: {msg}. Install Node.js/Docker.")
+                memory_core.log_event("system", {"server": name, "error": msg}, "mcp_error")
+                print(f"[MCP] Warning: {msg}")
                 continue
 
             try:
@@ -47,8 +45,6 @@ class MCPManager:
                     env=env
                 )
                 
-                sys_logger.log("system", "mcp_connecting", {"server": name, "command": cfg.command})
-                
                 read, write = await self.exit_stack.enter_async_context(stdio_client(params))
                 session = await self.exit_stack.enter_async_context(ClientSession(read, write))
                 await session.initialize()
@@ -60,19 +56,13 @@ class MCPManager:
                     scoped_name = f"{name}_{tool.name}" 
                     self.tools_map[scoped_name] = {"session": session, "def": tool}
                 
-                sys_logger.log("system", "mcp_connected", {"server": name, "tools_count": len(tools.tools)})
-                print(f"[MCP] Connected to '{name}' with {len(tools.tools)} tools.")
+                memory_core.log_event("system", {"server": name, "tools": len(tools.tools)}, "mcp_connected")
                     
             except Exception as e:
                 error_msg = str(e)
                 self.failed_servers[name] = error_msg
-                
-                if "Connection closed" in error_msg:
-                    sys_logger.log("system", "mcp_connection_closed", {"server": name, "error": error_msg})
-                    print(f"[MCP] Failed to connect to '{name}': Connection closed (server may have crashed or timed out)")
-                else:
-                    sys_logger.log("system", "mcp_connect_fail", {"server": name, "error": error_msg})
-                    print(f"[MCP] Failed to connect to '{name}': {error_msg}")
+                memory_core.log_event("system", {"server": name, "error": error_msg}, "mcp_fail")
+                print(f"[MCP] Failed to connect to '{name}': {error_msg}")
 
     async def execute_tool(self, tool_name: str, arguments: dict) -> str:
         if not self.enabled:
@@ -94,7 +84,7 @@ class MCPManager:
                     output.append("[Image Data]")
             return "\n".join(output)
         except Exception as e:
-            sys_logger.log("system", "mcp_tool_execution_fail", {"tool": tool_name, "error": str(e)})
+            memory_core.log_event("system", {"tool": tool_name, "error": str(e)}, "mcp_exec_fail")
             return f"MCP Execution Error: {e}"
 
     def get_tools_schema(self) -> str:
@@ -111,7 +101,5 @@ class MCPManager:
         if self.exit_stack:
             try:
                 await self.exit_stack.aclose()
-                sys_logger.log("system", "mcp_cleanup", {"status": "success"})
-            except Exception as e:
-                sys_logger.log("system", "mcp_cleanup_fail", {"error": str(e)})
+            except Exception:
                 pass
