@@ -2,33 +2,31 @@
 
 **Autonomous AI Orchestration**
 
-[![Version](https://img.shields.io/badge/Version-1.2.0-purple?style=for-the-badge)](https://github.com/LeLeLeonid/ZervGen)
+[![Version](https://img.shields.io/badge/Version-1.3.0-purple?style=for-the-badge)](https://github.com/LeLeLeonid/ZervGen)
 [![License](https://img.shields.io/badge/License-MIT-000000?style=for-the-badge)](LICENSE)
 
-ZervGen features a self-healing ReAct loop, a GraphRAG memory core, and a plugin-based skill architecture.
+ZervGen is a terminal-first **Supervisor-Worker** framework designed for complex task orchestration. It decouples reasoning (The Brain) from execution (Tools) and memory (GraphRAG), allowing you to build self-evolving AI agents that actually work.
 
 ---
 
-## // NEURAL CAPABILITIES
+## // CORE ARCHITECTURE
 
-### 🧠 The Brain (Hybrid Core)
+### 🧠 The Brain (Hybrid)
 *   **Supervisor Architecture:** Decouples reasoning (Orchestrator) from execution (Agents).
-*   **Multi-Model Support:** Native integration with **OpenRouter** (Claude 3.5, Llama 3), **Google Gemini**, and **Pollinations.AI**.
-*   **Self-Reflection:** The system analyzes its own actions and saves critical insights to long-term memory automatically.
+*   **Provider Agnostic:** Swap between **OpenRouter** (Gemini 3, Llama), **Google Gemini**, and **Pollinations.AI** on the fly.
 
 ### 💾 The Memory (GraphRAG)
-*   **Knowledge Graph:** Stores facts and relationships, not just text vectors.
-*   **Semantic Search:** Allows the agent to "recall" past projects and preferences.
-*   **Self-Evolution:** The memory system evolves based on successful query patterns.
+*   **Knowledge Graph:** Stores facts and relationships (`knowledge_graph.json`).
+*   **Session Persistence:** Automatically saves chat history. You can travel back in time with `/load`.
+*   **Self-Evolution:** The system analyzes successful interactions and crystallizes them into long-term memory.
 
-### 🛠️ The Arsenal (Dynamic Tooling)
-*   **MCP Support:** Connect to external servers (GitHub, Slack, Postgres) via Model Context Protocol.
+### 🛠️ The Arsenal (Tooling)
 *   **Native Tools:**
-    *   `web_search` (DDG) & `visit_page` (Anti-Bot Scraper)
-    *   `filesystem` (Safe Read/Write/Grep)
+    *   `read_files` / `write_file` (Safe FS access)
+    *   `web_search` (DuckDuckGo)
+    *   `visit_page` (Anti-Bot Scraper)
     *   `speak` (Edge-TTS Neural Voice)
-    *   `generate_image` (Pollinations Art)
-*   **Rate Limiter:** Built-in protection against API abuse and cost overruns.
+*   **Delegate:** Can spawn specialized sub-agents (`Coder`, `Researcher`, `Architect`) with unique personas.
 
 ---
 
@@ -47,7 +45,16 @@ pip install -r requirements.txt
 python main.py
 ```
 
-## // CONFIGURATION
+## // CONTROL FREAK FEATURES
+
+ZervGen is designed for power users. Check `config.json`:
+
+*   **`debug_mode`**: See the raw JSON thoughts of the AI before it acts.
+*   **`require_approval`**: The "Leash". Force the AI to ask permission before every tool execution.
+*   **`log_truncation`**: Keep your log files clean by hiding massive file dumps, while the AI still sees everything.
+*   **`allowed_directories`**: Whitelist folders (like your Obsidian Vault) for the AI to access.
+
+# // CONFIGURATION
 
 ZervGen generates a `config.json` on first launch.
 You can enable/disable specific MCP servers (Puppeteer, Filesystem) and configure API keys.
@@ -88,7 +95,6 @@ ZervGen/
 └── tmp/                  # Artifact Storage (Images, Audio)
 ```
 
-
 ## // USAGE
 
 **Chat Loop:**
@@ -96,9 +102,10 @@ ZervGen/
 > **ZervGen:** *[Calls Web Search -> Visits Pages -> Summarizes -> Writes to Obsidian]*
 
 **Commands:**
-*   `/history` - View session context.
-*   `/clear` - Reset short-term memory.
-*   `/stats` - View memory graph statistics.
+*   `/mode [name]` - Switch persona (e.g., `/mode architect` to plan, `/mode coder` to build).
+*   `/history` - View current context window.
+*   `/load` - Load a previous session.
+*   `/evolve` - Force memory consolidation.
 
 ---
 
