@@ -52,50 +52,53 @@ DEFAULT_MCP_SERVERS = {
     "filesystem": MCPServerConfig(
         command="npx", 
         args=["-y", "@modelcontextprotocol/server-filesystem", "."], 
-        enabled=False
+        enabled=True
     ),
     "git": MCPServerConfig(
         command="npx", 
         args=["-y", "@modelcontextprotocol/server-git"], 
-        enabled=False
+        enabled=True
     ),
     "puppeteer": MCPServerConfig(
         command="npx", 
         args=["-y", "@modelcontextprotocol/server-puppeteer"], 
-        enabled=False
+        enabled=True
     ),
     "fetch": MCPServerConfig(
         command="npx", 
         args=["-y", "@modelcontextprotocol/server-fetch"], 
-        enabled=False
+        enabled=True
     ),
     "memory": MCPServerConfig(
         command="npx",
         args=["-y", "@modelcontextprotocol/server-memory"],
-        enabled=False
-    ),
-    "godot": MCPServerConfig(
-        command="npx",
-        args=["-y", "godot-mcp-server-placeholder"],
-        enabled=False
+        enabled=True
     )
 }
 
 class GlobalSettings(BaseModel):
     provider: Literal["pollinations", "gemini", "openrouter"] = "pollinations"
     max_steps: int = 100
-    history_limit: int = 15
+    history_limit: int = 50
+    log_truncation: bool = True 
     debug_mode: bool = False
     require_approval: bool = False
-    allowed_directories: List[str] = Field(default_factory=list)
-    mcp_servers: Dict[str, MCPServerConfig] = Field(default_factory=lambda: DEFAULT_MCP_SERVERS)
     mcp_enabled: bool = False
+    allowed_directories: List[str] = Field(
+        default_factory=lambda: ["./tmp", "C:/Users/Public"]
+    )
+    
+    mcp_servers: Dict[str, MCPServerConfig] = Field(default_factory=lambda: DEFAULT_MCP_SERVERS)
+    
     pollinations: PollinationsSettings = Field(default_factory=PollinationsSettings)
     gemini: GeminiSettings = Field(default_factory=GeminiSettings)
     openrouter: OpenRouterSettings = Field(default_factory=OpenRouterSettings)
     
     def get_mcp_health_report(self) -> Dict[str, Any]:
         report = {}
+        if not self.mcp_enabled:
+            return {"global": {"status": "disabled", "issues": ["MCP Globally Disabled"]}}
+            
         for name, config in self.mcp_servers.items():
             if not config.enabled:
                 report[name] = {"status": "disabled", "issues": []}
@@ -123,6 +126,7 @@ class GlobalSettings(BaseModel):
 
 def load_config() -> GlobalSettings:
     if not CONFIG_PATH.exists():
+        print("[System] Config not found. Generating default config.json...")
         defaults = GlobalSettings()
         defaults.save()
         return defaults
@@ -147,7 +151,7 @@ def validate_config(config: GlobalSettings) -> tuple[bool, List[str]]:
     
     health = config.get_mcp_health_report()
     for name, status in health.items():
-        if status["status"] == "issues":
+        if status.get("status") == "issues":
             issues.extend([f"MCP {name}: {issue}" for issue in status["issues"]])
     
     return len(issues) == 0, issues
