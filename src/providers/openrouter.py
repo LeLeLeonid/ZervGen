@@ -101,13 +101,14 @@ class OpenRouterProvider(AIProvider):
         ]
         
         payload = {
-            "model": self.settings.model,
+            "model": self.settings.vision_model, 
             "messages": messages,
-            "temperature": 0.5
+            "temperature": 0.1 # Low temp for precision
         }
 
         async with httpx.AsyncClient() as client:
-            resp = await client.post(self.base_url, headers=self.headers, json=payload, timeout=60)
+            resp = await client.post(self.base_url, headers=self.headers, json=payload, timeout=90)
+            
             if resp.status_code != 200:
                 return f"Vision Error {resp.status_code}: {resp.text}"
             

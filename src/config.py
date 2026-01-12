@@ -45,6 +45,7 @@ class GeminiSettings(BaseModel):
 class OpenRouterSettings(BaseModel):
     api_key: Optional[str] = None
     model: str = "google/gemini-2.0-flash-exp:free"
+    vision_model: str = "allenai/molmo-2-8b:free"      
     site_url: str = "https://github.com/LeLeLeonid/ZervGen"
     app_name: str = "ZervGen"
 

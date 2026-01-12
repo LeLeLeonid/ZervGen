@@ -16,6 +16,9 @@ from ddgs import DDGS
 from fake_useragent import UserAgent
 from src.core.memory import memory_core
 from src.utils import extract_json_from_text
+import pyautogui
+import mss
+from PIL import Image
 
 TEMP_DIR = Path("tmp")
 TEMP_DIR.mkdir(exist_ok=True)
@@ -284,7 +287,7 @@ async def delegate_to(agent_name: str, task: str, **kwargs) -> str:
         from src.config import load_config
         config = load_config()
         provider = _get_active_provider()
-        agent = BaseAgent(name=agent_name.capitalize(), provider=provider, skill_name=agent_name, settings=config)
+        agent = BaseAgent(name=agent_name.capitalize(), provider=provider, skill_name=agent_name.lower().strip(), settings=config)
         agent.tools = TOOL_REGISTRY
         return await agent.run(task)
     except Exception as e:
@@ -347,6 +350,7 @@ async def append_file(path: str, content: str, **kwargs) -> str:
         return f"Append Error: {e}"
 
 async def debug_system_prompt(**kwargs) -> str:
+    """Output the reconstructed system prompt."""
     from src.utils import get_system_context
     from src.skills_loader import load_skill, get_skills_schema
     from src.core.memory import memory_core
@@ -382,6 +386,61 @@ async def debug_system_prompt(**kwargs) -> str:
         f"--- SKILLS ---\n{skills}\n\n"
         f"--- TOOLS ---\n{local_tools}\n{mcp_tools}"
     )
+
+async def take_screenshot(filename: str = "screen.png", **kwargs) -> str:
+    """Takes a screenshot and saves it to tmp/."""
+    try:
+        path = TEMP_DIR / filename
+        with mss.mss() as sct:
+            sct.shot(mon=-1, output=str(path)) 
+        return str(path)
+    except Exception as e:
+        raise RuntimeError(f"Screenshot Error: {e}")
+
+async def analyze_screen(question: str, **kwargs) -> str:
+    """Takes a screenshot and asks the Vision Model about it."""
+    path_str = None
+    try:
+        path_str = await take_screenshot("vision_buffer.png")
+        provider = _get_active_provider()
+        
+        if not hasattr(provider, 'analyze_image'):
+             return "Error: Current provider does not support Vision."
+
+        width, height = pyautogui.size()
+        
+        full_prompt = (
+            f"{question}. The current screen resolution is {width}x{height}. "
+            f"If referring to UI elements, provide approximate coordinates [x, y] "
+            f"based on this {width}x{height} grid."
+        )
+
+        result = await provider.analyze_image(full_prompt, path_str)
+        return f"Screen Analysis: {result}"
+    except Exception as e:
+        return f"Vision Error: {e}"
+    finally:
+        if path_str and os.path.exists(path_str):
+            try:
+                os.remove(path_str)
+            except:
+                pass
+
+async def mouse_click(x: int, y: int, **kwargs) -> str:
+    """Moves mouse to x,y and clicks."""
+    try:
+        pyautogui.click(x=int(x), y=int(y))
+        return f"Clicked at {x}, {y}"
+    except Exception as e:
+        return f"Click Error: {e}"
+
+async def type_text(text: str, **kwargs) -> str:
+    """Types text at current cursor position."""
+    try:
+        pyautogui.write(text, interval=0.05)
+        return f"Typed: {text}"
+    except Exception as e:
+        return f"Type Error: {e}"
 
 def _generate_registry():
     current_module = sys.modules[__name__]
