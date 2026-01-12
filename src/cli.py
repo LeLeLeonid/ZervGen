@@ -70,7 +70,7 @@ class ZervGenCLI:
 [bold blue] ███╔╝  ██╔══╝  ██╔══██╗╚██╗ ██╔╝██║   ██║██╔══╝  ██║╚██╗██║[/bold blue]
 [bold purple]███████╗███████╗██║  ██║ ╚████╔╝ ╚██████╔╝███████╗██║ ╚████║[/bold purple]
 [bold purple]╚══════╝╚══════╝╚═╝  ╚═╝  ╚═══╝   ╚═════╝ ╚══════╝╚═╝  ╚═══╝[/bold purple]
-[dim]v1.3.0 - Neural Graph Core[/dim]
+[dim]v1.3.1 - Neural Graph Core[/dim]
         """
         console.print(Panel(banner, border_style="purple", expand=False))
         
@@ -164,18 +164,18 @@ back     - Return to main menu
                 return True
                 
             console.print("\n[bold purple]AVAILABLE SESSIONS:[/bold purple]")
-            for i, f in enumerate(files[:10]): # Show last 10
+            for i, f in enumerate(files[:10]): 
                 console.print(f"[{i+1}] {f}")
             
-            choice = IntPrompt.ask("Load Session #", choices=[str(i+1) for i in range(len(files[:10]))])
-            selected_file = files[choice-1]
-            loaded_hist = memory_core.load_session_from_file(selected_file)
-            self.orchestrator.history = loaded_hist
-            
-            console.print(f"[green]Session '{selected_file}' loaded ({len(loaded_hist)} msgs).[/green]")
+            try:
+                choice = IntPrompt.ask("Load Session #", choices=[str(i+1) for i in range(len(files[:10]))])
+                selected_file = files[choice-1]
+                loaded_hist = memory_core.load_session_from_file(selected_file)
+                self.orchestrator.history = loaded_hist
+                console.print(f"[green]Session '{selected_file}' loaded ({len(loaded_hist)} msgs).[/green]")
+            except Exception as e:
+                console.print(f"[red]Load error: {e}[/red]")
             return True
-            
-        return False
 
         # Unknown command handler
         console.print(f"[red]Unknown command: {cmd}[/red]")
@@ -220,21 +220,21 @@ back     - Return to main menu
             if self.config.provider == "gemini":
                 cfg = self.config.gemini
                 key_display = "********" if cfg.api_key else "NOT SET"
-                table.add_row("4", "Model", cfg.model)
-                table.add_row("5", "API Key", key_display)
+                table.add_row("5", "Model", cfg.model)
+                table.add_row("6", "API Key", key_display)
             
             elif self.config.provider == "openrouter":
                 cfg = self.config.openrouter
                 key_display = "********" if cfg.api_key else "NOT SET"
-                table.add_row("4", "Model", cfg.model)
-                table.add_row("5", "API Key", key_display)
+                table.add_row("5", "Model", cfg.model)
+                table.add_row("6", "API Key", key_display)
 
             else:
                 cfg = self.config.pollinations
                 key_display = "********" if cfg.api_key else "NOT SET"
-                table.add_row("4", "Model", cfg.text_model)
-                table.add_row("5", "API Key", key_display)
-                table.add_row("6", "Voice", cfg.voice)
+                table.add_row("5", "Model", cfg.text_model)
+                table.add_row("6", "API Key", key_display)
+                table.add_row("7", "Voice", cfg.voice)
             
             console.print(table)
             console.print("\n[dim]ID to edit, 'b' to return[/dim]")
@@ -278,22 +278,22 @@ back     - Return to main menu
                     continue
 
                 if self.config.provider == "gemini":
-                    if choice == '4': self.select_gemini_model()
-                    elif choice == '5': self.config.gemini.api_key = Prompt.ask("API Key")
+                    if choice == '5': self.select_gemini_model()
+                    elif choice == '6': self.config.gemini.api_key = Prompt.ask("API Key")
                 
                 elif self.config.provider == "openrouter":
-                    if choice == '4':
+                    if choice == '5':
                         console.print("[dim]Enter full model ID (e.g. 'anthropic/claude-3.5-sonnet')[/dim]")
                         self.config.openrouter.model = Prompt.ask("Model ID")
-                    elif choice == '5':
+                    elif choice == '6':
                         self.config.openrouter.api_key = Prompt.ask("API Key")
 
                 else: 
-                    if choice == '4': 
+                    if choice == '5': 
                         self.config.pollinations.text_model = Prompt.ask("Model", choices=["openai", "mistral", "searchgpt"], default="openai")
-                    elif choice == '5':
-                        self.config.pollinations.api_key = Prompt.ask("API Key")
                     elif choice == '6':
+                        self.config.pollinations.api_key = Prompt.ask("API Key")
+                    elif choice == '7':
                         self.config.pollinations.voice = Prompt.ask("Voice", choices=["alloy", "echo", "nova", "shimmer"], default="nova")
                 
                 self.config.save()
@@ -307,36 +307,47 @@ back     - Return to main menu
             self._init_system()
         
         self.print_banner()
-        console.print("[dim]Ready. Commands: /help. Ctrl+C or 'back' to menu.[/dim]\n")
+        console.print("[dim]Ready. Commands: /help. Ctrl+C to cancel generation.[/dim]\n")
         
         while True:
             try:
-                user_input = Prompt.ask("[bold purple]USER[/bold purple]")
+                try:
+                    user_input = Prompt.ask("[bold purple]USER[/bold purple]")
+                except KeyboardInterrupt:
+                    console.print("\n[yellow]Returning to Menu...[/yellow]")
+                    return
+
                 if not user_input.strip(): continue
-                
+
                 if user_input.lower() in ['exit', 'quit', 'q', '/q']:
                     sys.exit(0)
-                
                 if user_input.lower() in ['back', 'menu', 'b', '/back']:
                     return
                 
-                # Command interceptor
                 if user_input.startswith("/"):
                     if self.handle_system_command(user_input):
                         continue
 
-                status_word = random.choice(LOADING_PHRASES)
-                with console.status(f"[bold purple]{status_word}[/bold purple]", spinner="dots"):
-                    response = await self.orchestrator.process(user_input)
+                try:
+                    task = asyncio.create_task(self.orchestrator.process(user_input))
+                    response = await task
+                    
+                    if response and response.strip():
+                        console.print(Panel(Markdown(response), border_style="purple"))
                 
-                if response:
-                    console.print(Panel(Markdown(response), border_style="purple"))
-                
-            except (KeyboardInterrupt, EOFError):
-                console.print("\n[yellow]Returning to Menu...[/yellow]")
-                break
+                except asyncio.CancelledError:
+                    console.print("\n[bold red]Generation Cancelled.[/bold red]")
+                except KeyboardInterrupt:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    console.print("\n[bold red]✋ Stopped.[/bold red]")
+            except EOFError:
+                return
             except Exception as e:
-                console.print(f"[bold red]Error:[/bold red] {e}")
+                console.print(f"[bold red]System Error:[/bold red] {e}")
 
     async def run(self):
         while True:

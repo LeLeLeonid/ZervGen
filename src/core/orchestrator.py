@@ -3,6 +3,7 @@ import re
 import platform
 import subprocess
 import time
+import random
 from pathlib import Path
 from rich.prompt import Confirm
 from rich.console import Console
@@ -82,8 +83,11 @@ class Orchestrator:
                 self._trim_history()
                 system_prompt = self._build_system_prompt()
 
+                response = ""
                 try:
-                    response = await self.brain.generate_text(self.history, system_prompt)
+                    from src.cli import LOADING_PHRASES
+                    with console.status(f"[bold purple]{random.choice(LOADING_PHRASES)}[/bold purple]", spinner="dots"):
+                        response = await self.brain.generate_text(self.history, system_prompt)
                 except Exception as e:
                     return f"Critical Brain Failure: {e}"
 
@@ -110,9 +114,14 @@ class Orchestrator:
                         args = action_data.get("args", {})
                         
                         if self.settings.require_approval:
-                            if not Confirm.ask(f"Execute {tool_name}?"):
+                            console.print(f"\n[bold yellow]✋ APPROVAL REQUIRED[/bold yellow]")
+                            console.print(f"Tool: [cyan]{tool_name}[/cyan]")
+                            console.print(f"Args: [dim]{args}[/dim]")
+
+                            if not Confirm.ask("Execute?"):
                                 self.history.append({"role": "user", "content": f"SYSTEM: User denied {tool_name}"})
-                                continue
+                                console.print("[red]Action Denied.[/red]")
+                                continue # Skip execution, let model retry
 
                         result = ""
 

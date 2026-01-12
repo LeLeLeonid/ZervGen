@@ -83,11 +83,10 @@ class MemoryManager:
     def load_session_from_file(self, filename: str) -> List[Dict]:
         path = SESSIONS_DIR / filename
         if not path.exists(): return []
-
         reconstructed_history = []
         valid_lines = 0
         errors = 0
-        
+
         try:
             with open(path, "r", encoding="utf-8") as f:
                 for line in f:
@@ -96,17 +95,18 @@ class MemoryManager:
                         role = entry.get("role")
                         event = entry.get("event")
                         data = entry.get("data")
+                        
                         content = ""
                         if isinstance(data, dict) and "result" in data:
-                            content = f"\nTool: {data.get('tool')}\nResult: {data.get('result')}"
+                             content = f"\nTool: {data.get('tool')}\nResult: {data.get('result')}"
                         elif isinstance(data, dict) and "content" in data:
-                            content = data["content"]
+                             content = data["content"]
                         else:
-                            content = str(data)
+                             content = str(data)
 
-                        if event in ["message", "tool_result", "thought", "final_answer"]:
+                        if event in ["message", "tool_result", "thought", "final_answer", "input"]:
                             reconstructed_history.append({"role": role, "content": content})
-                            
+                        
                         valid_lines += 1
                     except json.JSONDecodeError:
                         errors += 1
@@ -115,7 +115,8 @@ class MemoryManager:
             self.session_file = path
             self.current_session_id = path.stem
             self.history_buffer = reconstructed_history
-            self.log_event("system", "Session Resumed", "system_event")
+            
+            self.log_event("system", "Session Resumed From Log", "system_event")
             
             if errors > 0:
                 print(f"[Memory] Loaded {valid_lines} lines. Skipped {errors} corrupted lines.")

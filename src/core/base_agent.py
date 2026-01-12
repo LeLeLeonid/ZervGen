@@ -7,7 +7,7 @@ from src.core.provider import AIProvider
 from src.tools import TOOL_REGISTRY, get_tools_schema
 from src.config import GlobalSettings
 from src.core.mcp_manager import MCPManager
-from src.utils import get_system_context
+from src.utils import get_system_context, extract_json_from_text
 from src.core.memory import memory_core
 
 class BaseAgent(ABC):
@@ -52,9 +52,12 @@ class BaseAgent(ABC):
     async def run(self, task: str) -> str:
         await self._ensure_mcp()
 
+        if self.system_prompt.startswith("You are") and self.settings.debug_mode:
+            console.print(f"[yellow]⚠️ Warning: Skill file '{self.skill_name}.md' not found. Using fallback.[/yellow]")
+
         self.history.append({"role": "user", "content": f"TASK: {task}"})
         memory_core.log_event(f"agent:{self.name}", f"Started task: {task}", "subtask_start")
-        
+        step = 0
         context = get_system_context()
         memories = memory_core.get_recent_memories(limit=5)
         
@@ -84,6 +87,8 @@ class BaseAgent(ABC):
                 return error_msg
 
             json_str = extract_json_from_text(response)
+            if self.settings.debug_mode and json_str:
+                console.print(f"\n[dim cyan][{self.name}] THOUGHT: {json_str}[/dim cyan]")
 
             if not json_str:
                 self.history.append({"role": "assistant", "content": response})
@@ -114,6 +119,9 @@ class BaseAgent(ABC):
 
                 if len(str(result)) > 4000:
                     result = str(result)[:4000] + "... [TRUNCATED]"
+
+                if not self.settings.debug_mode:
+                    print(f"\n[Step {step+1}] Executed {tool_name}...")
 
                 self.history.append({"role": "assistant", "content": json_str})
                 self.history.append({"role": "user", "content": f"TOOL RESULT: {result}"})
