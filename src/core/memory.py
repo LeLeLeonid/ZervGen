@@ -1,13 +1,22 @@
 import json
 import time
+import uuid
 import os
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any
 
+try:
+    import chromadb
+    CHROMA_AVAILABLE = True
+except ImportError:
+    CHROMA_AVAILABLE = False
+    print("[Memory] Warning: 'chromadb' not found. Semantic search disabled.")
+
 MEMORY_DIR = Path("tmp") / "memory"
 SESSIONS_DIR = MEMORY_DIR / "sessions"
 KG_FILE = MEMORY_DIR / "knowledge_graph.json"
+VECTOR_DIR = MEMORY_DIR / "vector_store"
 
 MEMORY_DIR.mkdir(parents=True, exist_ok=True)
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -18,13 +27,21 @@ class MemoryManager:
         self.current_session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.session_file = SESSIONS_DIR / f"{self.current_session_id}.jsonl"
         self.history_buffer = [] 
-        
+        self.chroma_client = None
+        self.collection = None
+        if CHROMA_AVAILABLE:
+            try:
+                self.chroma_client = chromadb.PersistentClient(path=str(VECTOR_DIR))
+                self.collection = self.chroma_client.get_or_create_collection(name="zervgen_facts")
+            except Exception as e:
+                print(f"[Memory] Vector DB Init Error: {e}")
+
         self.stats = {
             "total_memories": len(self.kg_data.get("facts", [])),
             "successful_queries": 0,
-            "evolution_events": 0
+            "vector_enabled": self.collection is not None
         }
-
+        
     def _load_kg(self) -> Dict[str, Any]:
         if KG_FILE.exists():
             try:
@@ -134,21 +151,48 @@ class MemoryManager:
 
     def add_memory(self, content: str, category: str = "general", *args, **kwargs):
         fact = {
+            "id": str(uuid.uuid4())[:8],
             "timestamp": time.time(),
             "content": str(content),
             "category": str(category)
         }
         self.kg_data.setdefault("facts", []).append(fact)
         self._save_kg()
-        return f"Memory stored: [{category}] {content}"
+
+        # Vector DB
+        if self.collection:
+            try:
+                self.collection.add(
+                    documents=[str(content)],
+                    metadatas=[{"category": category, "timestamp": fact["timestamp"]}],
+                    ids=[fact["id"]]
+                )
+                return f"Memory stored (Vectorized): [{category}] {content}"
+            except Exception as e:
+                return f"Memory stored (JSON only, Vector failed): {e}"
+        
+        return f"Memory stored (JSON only): [{category}] {content}"
 
     def search_memory(self, query: str, mode: str = "semantic", *args, **kwargs) -> str:
+        if self.collection:
+            try:
+                results = self.collection.query(
+                    query_texts=[query],
+                    n_results=5
+                )
+                found = results['documents'][0]
+                if found:
+                    self.stats["successful_queries"] += 1
+                    return "RELEVANT MEMORIES (Semantic):\n" + "\n".join([f"- {doc}" for doc in found])
+            except Exception as e:
+                print(f"Vector search failed: {e}")
+
+        # Old way
         results = []
         for fact in self.kg_data.get("facts", []):
             if query.lower() in fact.get("content", "").lower():
                 results.append(f"- [{fact.get('category', 'general')}] {fact.get('content')}")
-        if results: self.stats["successful_queries"] += 1
-        return "FOUND MEMORIES:\n" + "\n".join(results[-10:]) if results else "No relevant memories found."
+        return "FOUND MEMORIES (Text Match):\n" + "\n".join(results[-10:]) if results else "No relevant memories found."
 
     def evolve(self) -> str:
         self.stats["evolution_events"] += 1

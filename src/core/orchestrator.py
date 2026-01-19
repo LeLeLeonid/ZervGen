@@ -1,12 +1,8 @@
 import json
-import re
-import platform
-import subprocess
-import time
-import random
 from pathlib import Path
 from rich.prompt import Confirm
 from rich.console import Console
+from rich.panel import Panel
 from src.core.provider import AIProvider
 from src.config import GlobalSettings
 from src.providers.pollinations import PollinationsProvider
@@ -71,100 +67,96 @@ class Orchestrator:
             self.history = [self.history[0]] + self.history[-limit:]
 
     async def process(self, user_input: str) -> str:
-            await self._ensure_mcp()
+            # await self._ensure_mcp()
             
             self.history.append({"role": "user", "content": user_input})
             memory_core.log_event("user", user_input, "input")
             
             step = 0
+            self.last_title = "Thinking..." # Default start status
             last_json = None
             
             while step < self.max_steps:
                 self._trim_history()
                 system_prompt = self._build_system_prompt()
-
-                response = ""
+                response_text = ""
                 try:
-                    from src.cli import LOADING_PHRASES
-                    with console.status(f"[bold purple]{random.choice(LOADING_PHRASES)}[/bold purple]", spinner="dots"):
-                        response = await self.brain.generate_text(self.history, system_prompt)
+                    with console.status(f"[bold purple]{self.last_title}[/bold purple]", spinner="dots"):
+                        response_text = await self.brain.generate_text(self.history, system_prompt)
+                        from src.utils import print_token_usage
+                        print_token_usage(self.history + [{"content": system_prompt}], response_text)
                 except Exception as e:
                     return f"Critical Brain Failure: {e}"
 
-                json_str = extract_json_from_text(response)
-                
+                json_str = extract_json_from_text(response_text)
+
                 if json_str and json_str == last_json:
                     self.history.append({"role": "user", "content": "SYSTEM: Loop detected. Change arguments."})
                     step += 1
                     continue
-                
                 if json_str: last_json = json_str
 
-                if self.settings.debug_mode and json_str:
-                    console.print(f"\n[dim cyan]THOUGHT: {json_str}[/dim cyan]")
-
-                text_part = re.sub(r'```json.*?```', '', response, flags=re.DOTALL).strip()
-                if json_str:
-                    text_part = text_part.replace(json_str, "").strip()
-
-                if json_str:
-                    try:
-                        action_data = json.loads(json_str)
-                        tool_name = action_data.get("tool")
-                        args = action_data.get("args", {})
-                        
-                        if self.settings.require_approval:
-                            console.print(f"\n[bold yellow]✋ APPROVAL REQUIRED[/bold yellow]")
-                            console.print(f"Tool: [cyan]{tool_name}[/cyan]")
-                            console.print(f"Args: [dim]{args}[/dim]")
-
-                            if not Confirm.ask("Execute?"):
-                                self.history.append({"role": "user", "content": f"SYSTEM: User denied {tool_name}"})
-                                console.print("[red]Action Denied.[/red]")
-                                continue # Skip execution, let model retry
-
-                        result = ""
-
-                        # --- TOOL DISPATCHER ---
-                        if tool_name in TOOL_REGISTRY:
-                            func = TOOL_REGISTRY[tool_name]
-                            import inspect
-                            if inspect.iscoroutinefunction(func):
-                                result = await func(**args)
-                            else:
-                                result = func(**args)
-                        
-                        elif self.settings.mcp_enabled and tool_name in self.mcp.tools_map:
-                            result = await self.mcp.execute_tool(tool_name, args)
-                        
-                        else:
-                            result = f"Error: Tool '{tool_name}' not found."
-
-                        if len(str(result)) > 5000:
-                            result = str(result)[:5000] + "... [TRUNCATED]"
-
-                        observation = f"\nTool: {tool_name}\nResult: {result}"
-                        
-                        if not self.settings.debug_mode:
-                            print(f"\n[Step {step+1}] Executed {tool_name}...")
-                        
-                        self.history.append({"role": "assistant", "content": response})
-                        self.history.append({"role": "user", "content": observation})
-                        
-                        memory_core.log_event("system", {"tool": tool_name, "args": args, "result": result}, "tool_execution")
-
-                    except json.JSONDecodeError:
-                        self.history.append({"role": "user", "content": "SYSTEM: Invalid JSON."})
-                        memory_core.log_event("system", "Invalid JSON", "error")
-                    except Exception as e:
-                        self.history.append({"role": "user", "content": f"SYSTEM: Tool Error: {e}"})
-                        memory_core.log_event("system", str(e), "error")
-
                 if not json_str:
-                    self.history.append({"role": "assistant", "content": response})
-                    memory_core.log_event("assistant", response, "final_answer")
-                    return response
+                    self.history.append({"role": "assistant", "content": response_text})
+                    memory_core.log_event("assistant", response_text, "text_response")
+                    return response_text
 
-                step += 1
+                try:
+                    data = json.loads(json_str)
+                    thoughts = data.get("thoughts", [])
+                    title = data.get("title", "Processing...")
+                    tool_name = data.get("tool")
+                    args = data.get("args", {})
+                    
+                    self.last_title = title
+
+                    if self.settings.debug_mode:
+                        thought_text = "\n".join([f"- {t}" for t in thoughts])
+                        console.print(Panel(thought_text, title=f"[dim]🧠 THOUGHTS: {title}[/dim]", border_style="dim cyan"))
+                    else:
+                        console.print(f"[dim purple]→ {title}[/dim purple]")
+
+                    if tool_name == "response":
+                        final_text = args.get("text", "")
+                        self.history.append({"role": "assistant", "content": json_str})
+                        memory_core.log_event("assistant", final_text, "response")
+                        return final_text
+
+                    if self.settings.require_approval:
+                        console.print(f"[bold yellow]✋ Action: {tool_name}[/bold yellow]")
+                        if not Confirm.ask("Execute?"):
+                            self.history.append({"role": "user", "content": f"SYSTEM: User denied {tool_name}"})
+                            continue
+
+                    result = ""
+
+                    # --- TOOL DISPATCHER ---
+                    if tool_name in TOOL_REGISTRY:
+                        func = TOOL_REGISTRY[tool_name]
+                        import inspect
+                        if inspect.iscoroutinefunction(func):
+                            result = await func(**args)
+                        else:
+                            result = func(**args)
+                    elif self.settings.mcp_enabled and tool_name in self.mcp.tools_map:
+                        result = await self.mcp.execute_tool(tool_name, args)
+                    else:
+                        result = f"Error: Tool '{tool_name}' not found."
+
+                    if len(str(result)) > 5000:
+                        result = str(result)[:5000] + "... [TRUNCATED]"
+
+                    observation = f"TOOL_OUTPUT ({tool_name}): {result}"
+                    
+                    self.history.append({"role": "assistant", "content": json_str})
+                    self.history.append({"role": "user", "content": observation})
+                    
+                    memory_core.log_event("system", {"tool": tool_name, "result": result}, "tool_execution")
+                    step += 1
+
+                except json.JSONDecodeError:
+                    self.history.append({"role": "user", "content": "SYSTEM ERROR: Invalid JSON."})
+                except Exception as e:
+                    self.history.append({"role": "user", "content": f"SYSTEM ERROR: {e}"})
 
             return "Max steps reached."

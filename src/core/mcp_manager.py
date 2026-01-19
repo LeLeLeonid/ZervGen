@@ -1,6 +1,7 @@
 import asyncio
 import shutil
 import os
+from contextlib import AsyncExitStack
 from typing import Dict, Any, List
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -24,15 +25,14 @@ class MCPManager:
         self.exit_stack = AsyncExitStack()
 
         for name, cfg in self.settings.mcp_servers.items():
-            if not cfg.enabled: 
-                continue 
-            
-            exe = shutil.which(cfg.command)
-            if not exe:
-                msg = f"Command '{cfg.command}' not found in PATH"
-                self.failed_servers[name] = msg
-                memory_core.log_event("system", {"server": name, "error": msg}, "mcp_error")
-                print(f"[MCP] Warning: {msg}")
+            if not cfg.enabled: continue 
+
+            cmd = cfg.command
+            if cmd == "npx" and os.name == "nt":
+                cmd = "npx.cmd"
+
+            if not shutil.which(cmd):
+                print(f"[MCP] Error: '{cmd}' not found.")
                 continue
 
             try:
@@ -40,11 +40,11 @@ class MCPManager:
                 env.update(cfg.env)
 
                 params = StdioServerParameters(
-                    command=cfg.command, 
+                    command=cmd, 
                     args=cfg.args, 
                     env=env
                 )
-                
+
                 read, write = await self.exit_stack.enter_async_context(stdio_client(params))
                 session = await self.exit_stack.enter_async_context(ClientSession(read, write))
                 await session.initialize()
@@ -57,12 +57,15 @@ class MCPManager:
                     self.tools_map[scoped_name] = {"session": session, "def": tool}
                 
                 memory_core.log_event("system", {"server": name, "tools": len(tools.tools)}, "mcp_connected")
+                print(f"[MCP] Connected: {name}")
                     
             except Exception as e:
                 error_msg = str(e)
                 self.failed_servers[name] = error_msg
-                memory_core.log_event("system", {"server": name, "error": error_msg}, "mcp_fail")
                 print(f"[MCP] Failed to connect to '{name}': {error_msg}")
+        
+        self.is_connected = True
+
 
     async def execute_tool(self, tool_name: str, arguments: dict) -> str:
         if not self.enabled:

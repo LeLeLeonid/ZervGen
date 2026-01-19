@@ -34,3 +34,15 @@ def extract_json_from_text(text: str):
     match = re.search(r'(\{.*\})', text, re.DOTALL)
     if match: return match.group(1)
     return None
+
+def print_token_usage(history: list, response: str):
+    """Prints estimated token usage and cost indicator."""
+    input_text = "".join([str(m.get('content', '')) for m in history])
+    input_tokens = len(input_text) // 4
+    output_tokens = len(response) // 4
+    total = input_tokens + output_tokens
+    color = "green"
+    if total > 4000: color = "yellow"
+    if total > 16000: color = "red"
+    
+    console.print(f"[dim]🎫 Tokens: [{color}]{total}[/{color}] (In: {input_tokens} | Out: {output_tokens})[/dim]", justify="right")

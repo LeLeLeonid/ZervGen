@@ -1,6 +1,5 @@
 import sys
 import asyncio
-import random
 import datetime
 from pathlib import Path
 from rich.console import Console
@@ -13,27 +12,12 @@ from src.config import load_config
 from src.providers.pollinations import PollinationsProvider
 from src.providers.gemini import GeminiProvider, fetch_available_models
 from src.providers.openrouter import OpenRouterProvider
+from src.providers.openai import OpenAIProvider
+from src.providers.anthropic import AnthropicProvider
 from src.core.orchestrator import Orchestrator
 from src.core.memory import memory_core
 
 console = Console()
-
-LOADING_PHRASES = [
-    "Thinking...", 
-    "Orchestrating...", 
-    "Aligning parameters...",
-    "Synthesizing...", 
-    "Analyzing intent...", 
-    "Processing...",
-    "Consulting the Hive...",
-    "Optimizing neural pathways...",
-    "Querying external nodes...",
-    "Constructing response matrix...",
-    "Synchronizing agents...",
-    "Accessing core mainframe...",
-    "Decrypting user intent...",
-    "Routing data packets..."
-]
 
 class ZervGenCLI:
     def __init__(self):
@@ -46,10 +30,19 @@ class ZervGenCLI:
                 provider = GeminiProvider(self.config.gemini)
             elif self.config.provider == "openrouter":
                 provider = OpenRouterProvider(self.config.openrouter)
+            elif self.config.provider == "openai":
+                provider = OpenAIProvider(self.config.openai)
+            elif self.config.provider == "anthropic":
+                provider = AnthropicProvider(self.config.anthropic)
             else:
                 provider = PollinationsProvider(self.config.pollinations)
-            
+             
             self.orchestrator = Orchestrator(provider, self.config)
+             
+            if self.config.mcp_enabled:
+                import asyncio
+                loop = asyncio.get_event_loop()
+                loop.create_task(self.orchestrator.mcp.connect_all())
 
         except Exception as e:
             console.print(f"\n[bold red]SYSTEM INITIALIZATION ERROR: {e}[/bold red]")
@@ -70,7 +63,7 @@ class ZervGenCLI:
 [bold blue] ███╔╝  ██╔══╝  ██╔══██╗╚██╗ ██╔╝██║   ██║██╔══╝  ██║╚██╗██║[/bold blue]
 [bold purple]███████╗███████╗██║  ██║ ╚████╔╝ ╚██████╔╝███████╗██║ ╚████║[/bold purple]
 [bold purple]╚══════╝╚══════╝╚═╝  ╚═╝  ╚═══╝   ╚═════╝ ╚══════╝╚═╝  ╚═══╝[/bold purple]
-[dim]v1.3.1 - Neural Graph Core[/dim]
+[dim]v1.4.0 - Neural Graph Core[/dim]
         """
         console.print(Panel(banner, border_style="purple", expand=False))
         
@@ -80,6 +73,8 @@ class ZervGenCLI:
             prov_info = self.config.provider.upper()
             if self.config.provider == "gemini": prov_info += f" ({self.config.gemini.model})"
             elif self.config.provider == "openrouter": prov_info += f" ({self.config.openrouter.model})"
+            elif self.config.provider == "openai": prov_info += f" ({self.config.openai.model})"
+            elif self.config.provider == "anthropic": prov_info += f" ({self.config.anthropic.model})"
             
             console.print(f"[dim]Memory: {mem_info} | Provider: {prov_info}[/dim]")
         except:
@@ -216,26 +211,40 @@ back     - Return to main menu
             table.add_row("2", "Debug Mode", str(self.config.debug_mode))
             table.add_row("3", "Require Approval", str(self.config.require_approval))
             table.add_row("4", "Log Truncation", str(self.config.log_truncation))
-
+            
             if self.config.provider == "gemini":
                 cfg = self.config.gemini
                 key_display = "********" if cfg.api_key else "NOT SET"
                 table.add_row("5", "Model", cfg.model)
                 table.add_row("6", "API Key", key_display)
-            
+             
             elif self.config.provider == "openrouter":
                 cfg = self.config.openrouter
                 key_display = "********" if cfg.api_key else "NOT SET"
                 table.add_row("5", "Model", cfg.model)
                 table.add_row("6", "API Key", key_display)
-
+            
+            elif self.config.provider == "openai":
+                cfg = self.config.openai
+                key_display = "********" if cfg.api_key else "NOT SET"
+                table.add_row("5", "Model", cfg.model)
+                table.add_row("6", "API Key", key_display)
+            
+            elif self.config.provider == "anthropic":
+                cfg = self.config.anthropic
+                key_display = "********" if cfg.api_key else "NOT SET"
+                table.add_row("5", "Model", cfg.model)
+                table.add_row("6", "API Key", key_display)
+            
             else:
                 cfg = self.config.pollinations
                 key_display = "********" if cfg.api_key else "NOT SET"
                 table.add_row("5", "Model", cfg.text_model)
                 table.add_row("6", "API Key", key_display)
-                table.add_row("7", "Voice", cfg.voice)
+                table.add_row("8", "Voice", cfg.voice)
             
+            table.add_row("7", "MCP Servers", "Manage...")
+
             console.print(table)
             console.print("\n[dim]ID to edit, 'b' to return[/dim]")
             
@@ -244,19 +253,27 @@ back     - Return to main menu
                 if choice.lower() in ['back', 'b', 'q', '/q', '/exit']: break
                 
                 if choice == '1':
-                    console.print("\n[1] Pollinations\n[2] Gemini\n[3] OpenRouter")
-                    p_choice = IntPrompt.ask("Select", choices=["1", "2", "3"])
-                    
-                    if p_choice == 1: 
+                    console.print("\n[1] Pollinations\n[2] Gemini\n[3] OpenRouter\n[4] OpenAI\n[5] Anthropic")
+                    p_choice = IntPrompt.ask("Select", choices=["1", "2", "3", "4", "5"])
+                     
+                    if p_choice == 1:
                         self.config.provider = "pollinations"
-                    elif p_choice == 2: 
+                    elif p_choice == 2:
                         self.config.provider = "gemini"
                         if not self.config.gemini.api_key:
                             self.config.gemini.api_key = Prompt.ask("Enter Gemini API Key")
-                    elif p_choice == 3: 
+                    elif p_choice == 3:
                         self.config.provider = "openrouter"
                         if not self.config.openrouter.api_key:
                             self.config.openrouter.api_key = Prompt.ask("Enter OpenRouter API Key")
+                    elif p_choice == 4:
+                        self.config.provider = "openai"
+                        if not self.config.openai.api_key:
+                            self.config.openai.api_key = Prompt.ask("Enter OpenAI API Key")
+                    elif p_choice == 5:
+                        self.config.provider = "anthropic"
+                        if not self.config.anthropic.api_key:
+                            self.config.anthropic.api_key = Prompt.ask("Enter Anthropic API Key")
                     
                     self.config.save()
                     # Re-init not needed here, will happen on chat entry
@@ -287,19 +304,71 @@ back     - Return to main menu
                         self.config.openrouter.model = Prompt.ask("Model ID")
                     elif choice == '6':
                         self.config.openrouter.api_key = Prompt.ask("API Key")
+                
+                elif self.config.provider == "openai":
+                    if choice == '5':
+                        console.print("[dim]Enter OpenAI model (e.g. 'gpt-4o')[/dim]")
+                        self.config.openai.model = Prompt.ask("Model", default="gpt-4o")
+                    elif choice == '6':
+                        self.config.openai.api_key = Prompt.ask("API Key")
+                
+                elif self.config.provider == "anthropic":
+                    if choice == '5':
+                        console.print("[dim]Enter Anthropic model (e.g. 'claude-3-5-sonnet-20240620')[/dim]")
+                        self.config.anthropic.model = Prompt.ask("Model", default="claude-3-5-sonnet-20240620")
+                    elif choice == '6':
+                        self.config.anthropic.api_key = Prompt.ask("API Key")
 
                 else: 
                     if choice == '5': 
                         self.config.pollinations.text_model = Prompt.ask("Model", choices=["openai", "mistral", "searchgpt"], default="openai")
                     elif choice == '6':
                         self.config.pollinations.api_key = Prompt.ask("API Key")
-                    elif choice == '7':
+                    elif choice == '8': # TODO(self) throw it or tidy it up, also in the tools
                         self.config.pollinations.voice = Prompt.ask("Voice", choices=["alloy", "echo", "nova", "shimmer"], default="nova")
                 
+                if choice == '7':
+                    self.mcp_settings_menu()
+                    continue
+
                 self.config.save()
                 
             except (KeyboardInterrupt, EOFError):
                 break
+    
+    def mcp_settings_menu(self):
+        import time
+        while True:
+            console.clear()
+            table = Table(title="MCP SERVER MANAGEMENT", border_style="purple")
+            table.add_column("ID", style="dim", width=4)
+            table.add_column("Server", style="bold green")
+            table.add_column("Status", style="magenta")
+            table.add_column("Command", style="dim")
+
+            server_names = list(self.config.mcp_servers.keys())
+            
+            for idx, name in enumerate(server_names, 1):
+                cfg = self.config.mcp_servers[name]
+                status = "[green]ENABLED[/green]" if cfg.enabled else "[red]DISABLED[/red]"
+                table.add_row(str(idx), name, status, cfg.command)
+
+            console.print(table)
+            console.print("\n[dim]Enter ID to toggle, 'b' to back[/dim]")
+
+            choice = Prompt.ask("[bold purple]MCP Config[/bold purple]")
+            if choice.lower() in ['b', 'back']: break
+            
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(server_names):
+                    name = server_names[idx]
+                    self.config.mcp_servers[name].enabled = not self.config.mcp_servers[name].enabled
+                    self.config.save()
+                    console.print(f"[yellow]Toggled {name}. Restart required to apply.[/yellow]")
+                    time.sleep(.5) 
+            except ValueError:
+                pass
 
     async def chat_loop(self):
         # Lazy init system to ensure config is fresh
