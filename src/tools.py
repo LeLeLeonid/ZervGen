@@ -15,6 +15,7 @@ from urllib.parse import quote
 from ddgs import DDGS
 from fake_useragent import UserAgent
 from src.core.memory import memory_core
+from src.core.sandbox import sandbox
 from src.utils import extract_json_from_text
 import pyautogui
 import mss
@@ -59,10 +60,14 @@ def _get_active_provider():
     from src.providers.pollinations import PollinationsProvider
     from src.providers.gemini import GeminiProvider
     from src.providers.openrouter import OpenRouterProvider
+    from src.providers.openai import OpenAIProvider
+    from src.providers.anthropic import AnthropicProvider
     config = load_config()
     try:
         if config.provider == "gemini" and config.gemini.api_key: return GeminiProvider(config.gemini)
         elif config.provider == "openrouter" and config.openrouter.api_key: return OpenRouterProvider(config.openrouter)
+        elif config.provider == "openai" and config.openai.api_key: return OpenAIProvider(config.openai)
+        elif config.provider == "anthropic" and config.anthropic.api_key: return AnthropicProvider(config.anthropic)
         else: return PollinationsProvider(config.pollinations)
     except: return PollinationsProvider(config.pollinations)
 
@@ -81,10 +86,14 @@ async def download_and_open_image(url: str, **kwargs) -> str:
         return str(path)
     except Exception as e: return f"Image Download Error: {e}"
 
-async def generate_image(prompt: str, **kwargs) -> str:
+async def generate_image(prompt: str, width: int = None, height: int = None, **kwargs) -> str:
     try:
+        from src.config import load_config
+        config = load_config()
         safe_prompt = quote(prompt)
-        url = f"https://image.pollinations.ai/prompt/{safe_prompt}?width=1024&height=1024&nologo=true&enhance=true"
+        actual_width = width if width is not None else config.pollinations.image_width
+        actual_height = height if height is not None else config.pollinations.image_height
+        url = f"https://image.pollinations.ai/prompt/{safe_prompt}?width={actual_width}&height={actual_height}&nologo=true&enhance=true"
         return await download_and_open_image(url)
     except Exception as e: return f"Generation Error: {e}"
 
@@ -124,20 +133,6 @@ async def get_weather(city: str, **kwargs) -> str:
             cond = WMO_CODES.get(curr['weather_code'], "Unknown")
             return f"Weather in {data['results'][0]['name']}:\nCondition: {cond}\nTemp: {curr['temperature_2m']}°C\nHumidity: {curr['relative_humidity_2m']}%\nWind: {curr['wind_speed_10m']} km/h"
     except Exception as e: return f"Weather Error: {e}"
-
-async def speak(text: str, **kwargs) -> str:
-    try:
-        if not text.strip(): return "Error: Empty text."
-        filename = f"tts_{abs(hash(text))}.mp3"
-        output_file = TEMP_DIR / filename
-        communicate = edge_tts.Communicate(text, "en-US-AriaNeural")
-        await communicate.save(str(output_file))
-        
-        if platform.system() == "Windows": os.startfile(output_file)
-        elif platform.system() == "Darwin": subprocess.run(["open", str(output_file)])
-        else: subprocess.run(["xdg-open", str(output_file)])
-        return f"[Audio Played]: \"{text}\""
-    except Exception as e: return f"TTS Error: {e}"
 
 async def read_files(paths: str, **kwargs) -> str:
     """Reads one or multiple files. Usage: 'file1.py' or 'file1.py, file2.py'."""
@@ -200,11 +195,36 @@ async def grep_files(pattern: str, path: str = ".", **kwargs) -> str:
     except Exception as e:
         return f"Grep Error: {e}"
 
-async def write_file(path: str, content: str, **kwargs) -> str:
+async def write_file(path: str, content: str, **kwargs) -> str:   
     try:
         if not _is_safe_path(path): return "Security Error: Path outside project."
+        
+        old_content = ""
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                old_content = f.read()
+        
+        if old_content != content:
+            import difflib
+            diff = difflib.unified_diff(
+                old_content.splitlines(),
+                content.splitlines(),
+                fromfile=f"a/{path}",
+                tofile=f"b/{path}",
+                lineterm=""
+            )
+            diff_text = "\n".join(list(diff))
+            
+            if diff_text:
+                from rich.console import Console
+                from rich.syntax import Syntax
+                from rich.panel import Panel
+                syntax = Syntax(diff_text, "diff", theme="monokai", line_numbers=False)
+                Console().print(Panel(syntax, title=f"[bold yellow]CHANGES: {path}[/bold yellow]", border_style="yellow")) 
+
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
         with open(path, "w", encoding="utf-8") as f: f.write(content)
+        
         return f"File written: {path}"
     except Exception as e: return f"Write Error: {e}"
 
@@ -374,9 +394,9 @@ async def debug_system_prompt(**kwargs) -> str:
 
     mcp_tools = "MCP DISABLED"
     if config.mcp_enabled:
-        # Create temp manager just to get schema string
         temp_mcp = MCPManager(config)
-        mcp_tools = mcp.get_tools_schema()
+        enabled_servers = [k for k, v in config.mcp_servers.items() if v.enabled]
+        mcp_tools = f"MCP Servers Enabled: {', '.join(enabled_servers)}"
 
     return (
         f"=== DEBUG SNAPSHOT ===\n"
@@ -441,6 +461,39 @@ async def type_text(text: str, **kwargs) -> str:
         return f"Typed: {text}"
     except Exception as e:
         return f"Type Error: {e}"
+    
+async def run_safe_code(code: str, **kwargs) -> str:
+    """Executes Python code inside a secure Docker Sandbox."""
+    if not sandbox.is_active():
+        return "Error: Docker Sandbox is offline."
+    
+    return sandbox.execute(code)
+
+async def get_code_skeleton(path: str, **kwargs) -> str:
+    """Reads a Python file and returns ONLY the structure."""
+    import ast
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            source = f.read()
+            tree = ast.parse(source)
+            
+        skeleton = []
+        
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                skeleton.append(f"\n[Line {node.lineno}] class {node.name}:")
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef):
+                        args = [a.arg for a in item.args.args]
+                        skeleton.append(f"    [Line {item.lineno}] def {item.name}({', '.join(args)}): ...")
+            elif isinstance(node, ast.FunctionDef):
+                if not isinstance(getattr(node, "parent", None), ast.ClassDef):
+                    if node.col_offset == 0:
+                        args = [a.arg for a in node.args.args]
+                        skeleton.append(f"[Line {node.lineno}] def {node.name}({', '.join(args)}): ...")
+        return "\n".join(skeleton) if skeleton else "No structure found (script or empty)."
+    except Exception as e:
+        return f"Skeleton Error: {e}"
 
 def _generate_registry():
     current_module = sys.modules[__name__]

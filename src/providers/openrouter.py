@@ -87,6 +87,11 @@ class OpenRouterProvider(AIProvider):
             except Exception as e:
                 return f"Error loading image: {e}"
 
+        # Use the configured vision model
+        model = self.settings.vision_model
+        if not model:
+            model = "google/gemini-2.0-flash-exp:free"  # Fallback
+
         messages = [
             {
                 "role": "user",
@@ -101,7 +106,7 @@ class OpenRouterProvider(AIProvider):
         ]
         
         payload = {
-            "model": self.settings.vision_model, 
+            "model": model,
             "messages": messages,
             "temperature": 0.1 # Low temp for precision
         }

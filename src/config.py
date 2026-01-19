@@ -45,14 +45,31 @@ class GeminiSettings(BaseModel):
 class OpenRouterSettings(BaseModel):
     api_key: Optional[str] = None
     model: str = "google/gemini-2.0-flash-exp:free"
-    vision_model: str = "allenai/molmo-2-8b:free"      
+    vision_model: str = "allenai/molmo-2-8b:free"
     site_url: str = "https://github.com/LeLeLeonid/ZervGen"
     app_name: str = "ZervGen"
+
+class OpenAISettings(BaseModel):
+    api_key: Optional[str] = None
+    model: str = "gpt-5.2"
+
+class AnthropicSettings(BaseModel):
+    api_key: Optional[str] = None
+    model: str = "claude-sonnet-4.5"
 
 DEFAULT_MCP_SERVERS = {
     "filesystem": MCPServerConfig(
         command="npx", 
         args=["-y", "@modelcontextprotocol/server-filesystem", "."], 
+        enabled=True
+    ),
+    "n8n": MCPServerConfig(
+        command="npx", 
+        args=[
+            "-y", "supergateway", 
+            "--streamableHttp", "http://localhost:5678/api/v1/docs/swagger.json",
+            "--header", "X-N8N-API-KEY: YOUR_KEY_HERE"
+        ], 
         enabled=True
     ),
     "git": MCPServerConfig(
@@ -78,22 +95,22 @@ DEFAULT_MCP_SERVERS = {
 }
 
 class GlobalSettings(BaseModel):
-    provider: Literal["pollinations", "gemini", "openrouter"] = "pollinations"
-    max_steps: int = 100
+    provider: Literal["pollinations", "gemini", "openrouter", "openai", "anthropic"] = "pollinations"
+    max_steps: int = 500
     history_limit: int = 50
-    log_truncation: bool = True 
+    log_truncation: bool = True
     debug_mode: bool = False
     require_approval: bool = False
-    mcp_enabled: bool = False
+    mcp_enabled: bool = True
+    mcp_servers: Dict[str, MCPServerConfig] = Field(default_factory=lambda: DEFAULT_MCP_SERVERS)
     allowed_directories: List[str] = Field(
         default_factory=lambda: ["./tmp", "C:/Users/Public"]
     )
-    
-    mcp_servers: Dict[str, MCPServerConfig] = Field(default_factory=lambda: DEFAULT_MCP_SERVERS)
-    
     pollinations: PollinationsSettings = Field(default_factory=PollinationsSettings)
     gemini: GeminiSettings = Field(default_factory=GeminiSettings)
     openrouter: OpenRouterSettings = Field(default_factory=OpenRouterSettings)
+    openai: OpenAISettings = Field(default_factory=OpenAISettings)
+    anthropic: AnthropicSettings = Field(default_factory=AnthropicSettings)
     
     def get_mcp_health_report(self) -> Dict[str, Any]:
         report = {}
@@ -149,6 +166,10 @@ def validate_config(config: GlobalSettings) -> tuple[bool, List[str]]:
         issues.append("Gemini API key is missing")
     elif config.provider == "openrouter" and not config.openrouter.api_key:
         issues.append("OpenRouter API key is missing")
+    elif config.provider == "openai" and not config.openai.api_key:
+        issues.append("OpenAI API key is missing")
+    elif config.provider == "anthropic" and not config.anthropic.api_key:
+        issues.append("Anthropic API key is missing")
     
     health = config.get_mcp_health_report()
     for name, status in health.items():

@@ -2,7 +2,7 @@
 
 **Autonomous AI Orchestration**
 
-[![Version](https://img.shields.io/badge/Version-1.3.0-purple?style=for-the-badge)](https://github.com/LeLeLeonid/ZervGen)
+[![Version](https://img.shields.io/badge/Version-1.4.0-purple?style=for-the-badge)](https://github.com/LeLeLeonid/ZervGen)
 [![License](https://img.shields.io/badge/License-MIT-000000?style=for-the-badge)](LICENSE)
 
 ZervGen is a terminal-first **Supervisor-Worker** framework designed for complex task orchestration. It decouples reasoning (The Brain) from execution (Tools) and memory (GraphRAG), allowing you to build self-evolving AI agents that actually work.
@@ -13,7 +13,7 @@ ZervGen is a terminal-first **Supervisor-Worker** framework designed for complex
 
 ### 🧠 The Brain (Hybrid)
 *   **Supervisor Architecture:** Decouples reasoning (Orchestrator) from execution (Agents).
-*   **Provider Agnostic:** Swap between **OpenRouter** (Gemini 3, Llama), **Google Gemini**, and **Pollinations.AI** on the fly.
+*   **Provider Agnostic:** Swap between **OpenRouter** (Gemini 3, Llama), **Google Gemini**, **Pollinations.AI**, **OpenAI**, and **Anthropic** on the fly.
 
 ### 💾 The Memory (GraphRAG)
 *   **Knowledge Graph:** Stores facts and relationships (`knowledge_graph.json`).
@@ -91,7 +91,7 @@ ZervGen/
 │   │   ├── coder.py
 │   │   └── researcher.py
 │   ├── skills/           # System Instructions (Markdown)
-│   └── providers/        # API Wrappers (OpenRouter, Gemini, Pollinations)
+│   └── providers/        # API Wrappers (OpenRouter, Gemini, Pollinations, OpenAI, Anthropic)
 └── tmp/                  # Artifact Storage (Images, Audio)
 ```
 
