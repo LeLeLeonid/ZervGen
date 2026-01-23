@@ -2,7 +2,6 @@ import os
 import subprocess
 import platform
 import httpx
-import edge_tts
 import requests
 import time
 import sys
@@ -17,9 +16,6 @@ from fake_useragent import UserAgent
 from src.core.memory import memory_core
 from src.core.sandbox import sandbox
 from src.utils import extract_json_from_text
-import pyautogui
-import mss
-from PIL import Image
 
 TEMP_DIR = Path("tmp")
 TEMP_DIR.mkdir(exist_ok=True)
@@ -372,7 +368,7 @@ async def append_file(path: str, content: str, **kwargs) -> str:
 async def debug_system_prompt(**kwargs) -> str:
     """Output the reconstructed system prompt."""
     from src.utils import get_system_context
-    from src.skills_loader import load_skill, get_skills_schema
+    from src.skills_loader import load_role, get_roles_overview
     from src.core.memory import memory_core
     from src.config import load_config
     from src.core.mcp_manager import MCPManager
@@ -380,7 +376,7 @@ async def debug_system_prompt(**kwargs) -> str:
     config = load_config()
     
     try:
-        base_prompt = load_skill("system")
+        base_prompt = load_role("system")
         if not base_prompt:
             with open("src/skills/system.md", "r", encoding="utf-8") as f:
                 base_prompt = f.read()
@@ -388,7 +384,7 @@ async def debug_system_prompt(**kwargs) -> str:
         base_prompt = "You are ZervGen Supervisor. Route tasks via JSON."
 
     context = get_system_context()
-    skills = get_skills_schema()
+    skills = get_roles_overview()
     local_tools = get_tools_schema()
     memories = memory_core.get_recent_memories(limit=5)
 
@@ -410,15 +406,17 @@ async def debug_system_prompt(**kwargs) -> str:
 async def take_screenshot(filename: str = "screen.png", **kwargs) -> str:
     """Takes a screenshot and saves it to tmp/."""
     try:
+        import mss
         path = TEMP_DIR / filename
         with mss.mss() as sct:
-            sct.shot(mon=-1, output=str(path)) 
+            sct.shot(mon=-1, output=str(path))
         return str(path)
     except Exception as e:
         raise RuntimeError(f"Screenshot Error: {e}")
 
 async def analyze_screen(question: str, **kwargs) -> str:
     """Takes a screenshot and asks the Vision Model about it."""
+    import pyautogui
     path_str = None
     try:
         path_str = await take_screenshot("vision_buffer.png")
@@ -449,6 +447,7 @@ async def analyze_screen(question: str, **kwargs) -> str:
 async def mouse_click(x: int, y: int, **kwargs) -> str:
     """Moves mouse to x,y and clicks."""
     try:
+        import pyautogui
         pyautogui.click(x=int(x), y=int(y))
         return f"Clicked at {x}, {y}"
     except Exception as e:
@@ -457,6 +456,7 @@ async def mouse_click(x: int, y: int, **kwargs) -> str:
 async def type_text(text: str, **kwargs) -> str:
     """Types text at current cursor position."""
     try:
+        import pyautogui
         pyautogui.write(text, interval=0.05)
         return f"Typed: {text}"
     except Exception as e:

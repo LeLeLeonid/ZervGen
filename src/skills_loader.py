@@ -1,41 +1,58 @@
+import os
+import yaml
 from pathlib import Path
 from typing import Dict, Optional
 
 SKILLS_DIR = Path(__file__).parent / "skills"
 
-def load_skill(skill_name: str) -> Optional[str]:
-    """Load a skill definition by name"""
-    if not SKILLS_DIR.exists():
+class RoleConfig:
+    def __init__(self, name: str, content: str, meta: Dict):
+        self.name = name
+        self.prompt = content
+        self.description = meta.get("description", "No description provided.")
+        self.tools = meta.get("tools", [])
+
+def load_role(name: str) -> Optional[RoleConfig]:
+    path = SKILLS_DIR / f"{name}.md"
+    if not path.exists():
         return None
     
-    skill_file = SKILLS_DIR / f"{skill_name}.md"
-    if skill_file.exists():
-        with open(skill_file, "r", encoding="utf-8") as f:
-            return f.read()
-    return None
+    with open(path, "r", encoding="utf-8") as f:
+        raw = f.read()
+    
+    if raw.startswith("---"):
+        try:
+            parts = raw.split("---", 2)
+            if len(parts) >= 3:
+                meta = yaml.safe_load(parts[1])
+                content = parts[2].strip()
+                return RoleConfig(name, content, meta)
+        except Exception as e:
+            print(f"[System] Warning: Failed to parse YAML for {name}: {e}")
+            
+    return RoleConfig(name, raw, {"description": "Legacy role", "tools": []})
 
-def get_all_skills() -> Dict[str, str]:
-    """Get all available skills"""
-    skills = {}
+def get_all_roles() -> Dict[str, RoleConfig]:
+    roles = {}
     if not SKILLS_DIR.exists():
-        return skills
+        return roles
     
-    for skill_file in SKILLS_DIR.glob("*.md"):
-        name = skill_file.stem
-        skills[name] = load_skill(name)
-    return skills
+    for f in SKILLS_DIR.glob("*.md"):
+        if f.stem == "system":
+            continue
+        
+        role = load_role(f.stem)
+        if role:
+            roles[f.stem] = role
+    return roles
 
-def get_skills_schema() -> str:
-    """Get formatted schema of all skills"""
-    skills = get_all_skills()
-    if not skills:
-        return "No skills available."
+def get_roles_overview() -> str:
+    roles = get_all_roles()
+    if not roles:
+        return "No specialized roles available."
     
-    schema = ["# AVAILABLE SKILLS\n"]
-    for name, content in skills.items():
-        # Extract first line as description
-        lines = content.strip().split('\n')
-        description = lines[0] if lines else "No description"
-        schema.append(f"- {name}: {description}")
+    schema = []
+    for name, config in roles.items():
+        schema.append(f"- {name}: {config.description}")
     
     return "\n".join(schema)

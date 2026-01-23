@@ -111,6 +111,7 @@ class GlobalSettings(BaseModel):
     openrouter: OpenRouterSettings = Field(default_factory=OpenRouterSettings)
     openai: OpenAISettings = Field(default_factory=OpenAISettings)
     anthropic: AnthropicSettings = Field(default_factory=AnthropicSettings)
+    mode: str = "CREATE"
     
     def get_mcp_health_report(self) -> Dict[str, Any]:
         report = {}
@@ -141,6 +142,30 @@ class GlobalSettings(BaseModel):
     def save(self):
         with open(CONFIG_PATH, "w") as f:
             json.dump(self.model_dump(), f, indent=4)
+
+MODES = {
+    "ASK": {
+        "description": "Fast, direct answers. No heavy reasoning.",
+        "prompt": "MODE: [ASK]. Output the answer immediately. Do not plan. Do not use complex tool chains. Just answer.",
+        "max_steps": None
+    },
+    "PLAN": {
+        "description": "Deep reasoning, architectural design.",
+        "prompt": "MODE: [PLAN]. Do not write code or execute actions yet. Analyze the problem, list dependencies, and outline a step-by-step strategy.",
+        "max_steps": None
+    },
+    "BUILD": {
+        "description": "Execution, coding, file manipulation.",
+        "prompt": "MODE: [BUILD]. Execute the plan. Write files, run commands, and verify results. Be precise and complete.",
+        "max_steps": None
+    },
+    "DEBUG": {
+        "description": "Identify and fix issues in code or logic.",
+        "prompt": "MODE: [DEBUG]. Identify and fix issues in code or logic. Use systematic debugging techniques to resolve problems.",
+        "max_steps": None
+    }
+}
+
 
 def load_config() -> GlobalSettings:
     if not CONFIG_PATH.exists():
