@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import os
 import platform
 from datetime import datetime
 import re
@@ -26,7 +27,8 @@ def async_retry(retries=3, delays=[2, 5, 10]):
 def get_system_context() -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     os_info = f"{platform.system()} {platform.release()}"
-    return f"CONTEXT: [Time: {now}] [OS: {os_info}]"
+    shell_info = os.getenv("SHELL", "Unknown")
+    return f"CONTEXT: [Time: {now}] [OS: {os_info}] [Shell: {shell_info}]"
 
 def extract_json_from_text(text: str):
     match = re.search(r'```json\s*(\{.*?\})\s*```', text, re.DOTALL)

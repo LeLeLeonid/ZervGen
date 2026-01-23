@@ -20,7 +20,7 @@ class BaseAgent(ABC):
         self.provider = provider
         self.skill_name = skill_name
         self.settings = settings
-        self.system_prompt = self._load_skill()
+        self.system_prompt = "You are a ZervGen Agent."
         self.tools: Dict[str, Callable] = {}
         self.history: List[Dict] = []
         self.mcp = MCPManager(self.settings) if self.settings.mcp_enabled else None
@@ -33,15 +33,6 @@ class BaseAgent(ABC):
                 self.mcp_initialized = True
             except:
                 pass
-
-    def _load_skill(self) -> str:
-        try:
-            from src.skills_loader import load_skill
-            content = load_skill(self.skill_name)
-            if content: return content
-        except:
-            pass
-        return f"You are {self.name}."
 
     def load_tools(self, tool_names: List[str]):
         for name in tool_names:
@@ -56,8 +47,8 @@ class BaseAgent(ABC):
     async def run(self, task: str) -> str:
         # await self._ensure_mcp()
 
-        if self.system_prompt.startswith("You are") and self.settings.debug_mode:
-            console.print(f"[yellow]⚠️ Warning: Skill file '{self.skill_name}.md' not found. Using fallback.[/yellow]")
+        if self.system_prompt == "You are a ZervGen Agent." and self.settings.debug_mode:
+            console.print(f"[yellow]⚠️ Warning: Agent {self.name} has default prompt.[/yellow]")
 
         self.history.append({"role": "user", "content": f"TASK: {task}"})
         memory_core.log_event(f"agent:{self.name}", f"Started task: {task}", "subtask_start")
@@ -66,9 +57,16 @@ class BaseAgent(ABC):
         context = get_system_context()
         memories = memory_core.get_recent_memories(limit=5)
         
-        local_desc = get_tools_schema()
+        allowed_tools_schema = []
+        for name, func in self.tools.items():
+            import inspect
+            sig = str(inspect.signature(func)).replace(" -> str", "")
+            doc = inspect.getdoc(func) or "Tool."
+            allowed_tools_schema.append(f"- {name}{sig}: {doc}")
+        
+        local_desc = "\n".join(allowed_tools_schema)
         mcp_desc = self.mcp.get_tools_schema() if self.mcp_initialized else "None"
-        all_tools = f"{local_desc}\n{mcp_desc}" if mcp_desc else local_desc
+        all_tools = f"{local_desc}\n\n--- MCP TOOLS ---\n{mcp_desc}" if mcp_desc else local_desc
 
         full_prompt = (
             f"{context}\n\n"
@@ -124,12 +122,15 @@ class BaseAgent(ABC):
                     console.print(Panel(thought_text, title=f"[dim]🧠 [{self.name}] {title}[/dim]", border_style="dim magenta"))
                 else:
                     console.print(f"[dim magenta]  ↳ [{self.name}] {title}[/dim magenta]")
-
-                if tool_name == "response":
-                    final_text = args.get("text", "")
+                
+                if tool_name == "response" or tool_name is None:
+                    final_text = args.get("text") or args.get("content") or args.get("answer") or args.get("response")
+                    if not final_text and isinstance(data.get("args"), str):
+                        final_text = data["args"]
+                    if not final_text:
+                        final_text = ". ".join(thoughts) if thoughts else response_text
                     self.history.append({"role": "assistant", "content": json_str})
-                    return final_text
-
+                    return str(final_text)
                 result = ""
 
                 # --- TOOL DISPATCHER ---
