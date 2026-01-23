@@ -111,7 +111,7 @@ class GlobalSettings(BaseModel):
     openrouter: OpenRouterSettings = Field(default_factory=OpenRouterSettings)
     openai: OpenAISettings = Field(default_factory=OpenAISettings)
     anthropic: AnthropicSettings = Field(default_factory=AnthropicSettings)
-    mode: str = "CREATE"
+    mode: str = "BUILD"
     
     def get_mcp_health_report(self) -> Dict[str, Any]:
         report = {}
