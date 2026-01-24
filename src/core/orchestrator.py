@@ -47,33 +47,29 @@ class Orchestrator:
             return True
         return False
 
-    def _build_system_prompt(self) -> str:
-        base_prompt = load_role("system")
-        if not base_prompt:
-            base_prompt = "You are ZervGen Supervisor. Route tasks via JSON."
-
+    def _build_system_prompt(self, role_cfg) -> str:
+        from src.config import MODES
         context = get_system_context()
-        skills_info = get_roles_overview()
-        
+        roles_info = get_roles_overview()
         memories = memory_core.get_recent_memories(limit=5)
-
-        full_prompt = (
-            f"{context}\n\n"
-            f"{base_prompt}\n\n"
-            f"--- MEMORY ---\n{memories}\n\n"
-            f"--- AVAILABLE SPECIALISTS ---\n{skills_info}\n\n"
-            f"--- INSTRUCTIONS ---\n"
-            f"If the user asks for a specific task (Code, Research), the Auto-Router will handle it.\n"
-            f"If it is a general chat, use your internal knowledge."
+        mode_def = MODES.get(self.current_mode, MODES["BUILD"])
+        
+        return (
+            f"{role_cfg.prompt}\n\n"
+            f"=== OP STATE ===\n"
+            f"ROLE: {self.current_role}\n"
+            f"BEHAVIOR: {mode_def['prompt']}\n\n"
+            f"--- CONTEXT ---\n{context}\n"
+            f"--- MEMORY ---\n{memories}\n"
+            f"--- ROLES ---\n{roles_info}"
         )
-        return full_prompt
         
     def _trim_history(self):
         limit = max(self.settings.history_limit, 50)
         if len(self.history) > limit:
             self.history = [self.history[0]] + self.history[-limit:]
 
-    def _spawn_agent(self, role_name: str, task_context: str = "") -> BaseAgent:
+    def _spawn_agent(self, role_name: str) -> BaseAgent:
         target_role = role_name if role_name != "system" else self.current_role
         
         role_config = load_role(target_role)
@@ -88,13 +84,13 @@ class Orchestrator:
         )
         
         from src.config import MODES
-        mode_prompt = MODES.get(self.current_mode, MODES["BUILD"])["prompt"]
+        current_mode_def = MODES.get(self.current_mode, MODES["BUILD"])
+        mode_prompt = current_mode_def["prompt"]
         
         worker.system_prompt = (
             f"{role_config.prompt}\n\n"
-            f"=== MODE: {self.current_mode} ===\n"
-            f"{mode_prompt}\n\n"
-            f"MISSION:\n{task_context}"
+            f"=== OPERATIONAL MODE: {self.current_mode} ===\n"
+            f"{mode_prompt}"
         )
         
         if role_config.tools:
@@ -111,10 +107,85 @@ class Orchestrator:
     async def process(self, user_input: str) -> str:
         self.history.append({"role": "user", "content": user_input})
         memory_core.log_event("user", user_input, "input")
+        
+        step = 0
+        self.last_title = "Processing..."
 
-        if not hasattr(self, 'current_worker'):
-            self.current_worker = self._spawn_agent(self.current_role)
+        while step < self.max_steps:
+            self._trim_history()
+            
+            role_cfg = load_role(self.current_role) or load_role("system")
+            system_prompt = self._build_system_prompt(role_cfg)
+            
+            from src.config import MODES
+            mode_def = MODES.get(self.current_mode, MODES["BUILD"])
+            full_prompt = f"{system_prompt}\n\n=== CURRENT FOCUS: {mode_def['prompt']} ==="
 
-        from src.config import MODES
-        mode_def = MODES.get(self.current_mode, MODES["BUILD"])
-        return await self.current_worker.run(user_input)
+            response_text = ""
+            try:
+                with console.status(f"[bold purple]{self.last_title}[/bold purple]", spinner="dots"):
+                    response_text = await self.brain.generate_text(self.history, full_prompt)
+                    from src.utils import print_token_usage
+                    print_token_usage(self.history + [{"content": full_prompt}], response_text)
+            except Exception as e:
+                return f"Critical Brain Failure: {e}"
+
+            json_str = extract_json_from_text(response_text)
+
+            if not json_str:
+                self.history.append({"role": "assistant", "content": response_text})
+                return response_text
+
+            try:
+                data = json.loads(json_str)
+                thoughts = data.get("thoughts", [])
+                self.last_title = data.get("title", "Thinking...")
+                tool_name = data.get("tool")
+                args = data.get("args", {})
+
+                if self.settings.debug_mode:
+                    console.print(Panel("\n".join(thoughts), title=f"[dim]🧠 {self.last_title}[/dim]", border_style="dim cyan"))
+                else:
+                    console.print(f"[dim purple]→ {self.last_title}[/dim purple]")
+
+                if tool_name == "set_state":
+                    new_role = args.get("role")
+                    new_mode = args.get("mode")
+                    if new_role: self.set_role(new_role)
+                    if new_mode: self.set_mode(new_mode)
+                    
+                    if hasattr(self, 'current_worker'): delattr(self, 'current_worker')
+                    
+                    self.history.append({"role": "system", "content": f"STATE UPDATED: Role={new_role}, Mode={new_mode}"})
+                    continue
+
+                if tool_name == "response" or tool_name is None:
+                    final_text = args.get("text") or args.get("content") or response_text
+                    self.history.append({"role": "assistant", "content": json_str})
+                    return str(final_text)
+
+                result = ""
+                
+                if not hasattr(self, 'current_worker'):
+                    self.current_worker = self._spawn_agent(self.current_role)
+                
+                if tool_name in self.current_worker.tools:
+                    func = self.current_worker.tools[tool_name]
+                    import inspect
+                    result = await func(**args) if inspect.iscoroutinefunction(func) else func(**args)
+                elif self.settings.mcp_enabled and tool_name in self.mcp.tools_map:
+                    result = await self.mcp.execute_tool(tool_name, args)
+                else:
+                    result = f"Error: Tool '{tool_name}' not found or permission denied for role '{self.current_role}'."
+
+                self.history.append({"role": "assistant", "content": json_str})
+                self.history.append({"role": "user", "content": f"OBSERVATION: {str(result)[:5000]}"})
+                memory_core.log_event("system", {"tool": tool_name, "result": result}, "tool_execution")
+                
+                step += 1
+
+            except Exception as e:
+                self.history.append({"role": "user", "content": f"SYSTEM ERROR: {e}"})
+                step += 1
+
+        return "Max steps reached."
