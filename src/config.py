@@ -147,12 +147,12 @@ MODES = {
     "ASK": {
         "description": "Fast, direct answers. No heavy reasoning.",
         "prompt": "MODE: [ASK]. Output the answer immediately. Do not plan. Do not use complex tool chains. Just answer.",
-        "max_steps": None
+        "max_steps": 1
     },
     "PLAN": {
         "description": "Deep reasoning, architectural design.",
         "prompt": "MODE: [PLAN]. Do not write code or execute actions yet. Analyze the problem, list dependencies, and outline a step-by-step strategy.",
-        "max_steps": None
+        "max_steps": 500
     },
     "BUILD": {
         "description": "Execution, coding, file manipulation.",

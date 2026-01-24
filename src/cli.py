@@ -1,4 +1,4 @@
-import sys
+﻿import sys
 import asyncio
 from pathlib import Path
 from rich.console import Console
@@ -279,6 +279,7 @@ back     - Return to main menu
                 key_display = "********" if cfg.api_key else "NOT SET"
                 table.add_row("5", "Model", cfg.model)
                 table.add_row("6", "API Key", key_display)
+                table.add_row("8", "Vision Model", cfg.vision_model)
 
             elif self.config.provider == "openai":
                 cfg = self.config.openai
@@ -327,7 +328,11 @@ back     - Return to main menu
                 elif choice == '7':
                     self.mcp_settings_menu()
                 elif choice == '8':
-                    self._handle_voice_selection()
+                    if self.config.provider == "openrouter":
+                        CC.print("[dim]Enter full vision model ID (e.g. 'google/gemini-2.0-flash-exp:free')[/dim]")
+                        self.config.openrouter.vision_model = Prompt.ask("Vision Model ID")
+                    else:
+                        self._handle_voice_selection()
 
                 self.config.save()
 
@@ -365,6 +370,10 @@ back     - Return to main menu
         elif self.config.provider == "openrouter":
             CC.print("[dim]Enter full model ID (e.g. 'anthropic/claude-3.5-sonnet')[/dim]")
             self.config.openrouter.model = Prompt.ask("Model ID")
+            CC.print("[dim]Enter Vision Model ID (Leave empty to keep current)[/dim]")
+            v_model = Prompt.ask("Vision Model ID", default=self.config.openrouter.vision_model)
+            if v_model:
+                self.config.openrouter.vision_model = v_model
         elif self.config.provider == "openai":
             CC.print("[dim]Enter OpenAI model (e.g. 'gpt-4o')[/dim]")
             self.config.openai.model = Prompt.ask("Model", default="gpt-4o")
