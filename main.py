@@ -14,15 +14,28 @@ console = Console()
 def handle_exit(sig, frame):
     os._exit(0)
 
+async def main_with_cleanup():
+    """Main entry point with proper MCP cleanup."""
+    from src.cli import ZervGenCLI
+    cli = ZervGenCLI()
+    try:
+        await cli.run()
+    finally:
+        if cli.orchestrator and cli.orchestrator.mcp:
+            try:
+                await cli.orchestrator.mcp.cleanup()
+            except Exception:
+                pass
+
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, handle_exit)
     signal.signal(signal.SIGTERM, handle_exit)
 
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    
+
     try:
-        asyncio.run(main())
+        asyncio.run(main_with_cleanup())
     except KeyboardInterrupt:
         os._exit(0)
     except Exception as e:

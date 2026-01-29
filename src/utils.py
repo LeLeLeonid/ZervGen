@@ -1,12 +1,71 @@
 import asyncio
 import functools
-import os
-import platform
 from datetime import datetime
 import re
+import secrets
+from typing import Optional
+from urllib.parse import urlparse
 from rich.console import Console
 
 console = Console()
+
+def sanitize_for_prompt(text: str) -> str:
+    """
+    Sanitize user input to prevent prompt injection attacks.
+    Escapes delimiter patterns that could be used to manipulate prompts.
+    """
+    if not text or not isinstance(text, str):
+        return text
+
+    replacements = [
+        (r'===', '\\==='),
+        (r'---', '\\---'),
+        (r'```', '\\`\\`\\`'),
+        (r'<\|', '\\<\\|'),
+        (r'\|>', '\\|\\>'),
+        (r'\[SYSTEM\]', '\\[SYSTEM\\]'),
+        (r'\[USER\]', '\\[USER\\]'),
+        (r'\[ASSISTANT\]', '\\[ASSISTANT\\]'),
+    ]
+
+    sanitized = text
+    for pattern, replacement in replacements:
+        sanitized = re.sub(pattern, replacement, sanitized, flags=re.IGNORECASE)
+
+    return sanitized
+
+
+def generate_random_delimiter(length: int = 24) -> str:
+    """
+    Generate a cryptographically secure random delimiter string.
+    Used for boundary markers in prompts to prevent injection.
+    """
+    return secrets.token_urlsafe(length)
+
+
+def validate_url_scheme(url: str, allowed_schemes: Optional[set] = None) -> bool:
+    """
+    Validate that a URL uses an allowed scheme.
+    Prevents file:// and other potentially dangerous protocols.
+    """
+    if allowed_schemes is None:
+        allowed_schemes = {'http', 'https'}
+
+    try:
+        parsed = urlparse(url)
+        return parsed.scheme in allowed_schemes
+    except Exception:
+        return False
+
+
+
+
+def extract_json_from_text(text: str):
+    match = re.search(r'```json\s*(\{.*?\})\s*```', text, re.DOTALL)
+    if match: return match.group(1)
+    match = re.search(r'(\{.*\})', text, re.DOTALL)
+    if match: return match.group(1)
+    return None
 
 def async_retry(retries=3, delays=[2, 5, 10]):
     def decorator(func):
@@ -25,10 +84,13 @@ def async_retry(retries=3, delays=[2, 5, 10]):
     return decorator
 
 def get_system_context() -> str:
+    import platform, os
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     os_info = f"{platform.system()} {platform.release()}"
-    shell_info = os.getenv("SHELL", "Unknown")
-    return f"CONTEXT: [Time: {now}] [OS: {os_info}] [Shell: {shell_info}]"
+    shell = "Unknown"
+    if "SHELL" in os.environ: shell = os.environ["SHELL"]
+    elif "COMSPEC" in os.environ: shell = os.environ["COMSPEC"]
+    return f"CONTEXT: [Time: {now}] [OS: {os_info}] [Shell: {shell}]"
 
 def extract_json_from_text(text: str):
     match = re.search(r'```json\s*(\{.*?\})\s*```', text, re.DOTALL)

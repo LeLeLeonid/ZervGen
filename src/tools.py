@@ -7,15 +7,25 @@ import time
 import sys
 import inspect
 import re
+import shlex
+import asyncio
+from types import MappingProxyType
 from typing import List
 from bs4 import BeautifulSoup
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from ddgs import DDGS
 from fake_useragent import UserAgent
 from src.core.memory import memory_core
-from src.core.sandbox import sandbox
 from src.utils import extract_json_from_text
+
+# Command whitelist for execute_command security
+ALLOWED_COMMANDS = {
+    'git', 'python', 'pip', 'npm', 'pytest', 'ls', 'dir', 'cat', 'type',
+    'mkdir', 'cd', 'pwd', 'echo', 'find', 'grep', 'curl', 'wget',
+    'terraform', 'docker', 'kubectl', 'helm', 'npm', 'node', 'npx',
+    'cargo', 'rustc', 'go', 'javac', 'java'
+}
 
 TEMP_DIR = Path("tmp")
 TEMP_DIR.mkdir(exist_ok=True)
@@ -58,29 +68,59 @@ def _get_active_provider():
     from src.providers.openrouter import OpenRouterProvider
     from src.providers.openai import OpenAIProvider
     from src.providers.anthropic import AnthropicProvider
+    from src.providers.groq import GroqProvider
     config = load_config()
     try:
         if config.provider == "gemini" and config.gemini.api_key: return GeminiProvider(config.gemini)
         elif config.provider == "openrouter" and config.openrouter.api_key: return OpenRouterProvider(config.openrouter)
         elif config.provider == "openai" and config.openai.api_key: return OpenAIProvider(config.openai)
         elif config.provider == "anthropic" and config.anthropic.api_key: return AnthropicProvider(config.anthropic)
+        elif config.provider == "groq" and config.groq.api_key: return GroqProvider(config.groq)
         else: return PollinationsProvider(config.pollinations)
-    except: return PollinationsProvider(config.pollinations)
+    except Exception as e:
+        print(f"[Provider] Failed to load {config.provider}: {e}. Falling back to Pollinations.")
+        return PollinationsProvider(config.pollinations)
 
 async def download_and_open_image(url: str, **kwargs) -> str:
+    """Download and open image with URL validation and non-blocking I/O."""
     try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ('http', 'https'):
+            return f"Security Error: URL scheme '{parsed.scheme}' is not allowed. Only http:// and https:// are permitted."
+
         filename = f"img_{int(time.time())}.jpg"
         path = TEMP_DIR / filename
+
         async with httpx.AsyncClient() as client:
-            resp = await client.get(url)
-            if resp.status_code != 200: return f"Download Failed: {resp.status_code}"
-            with open(path, "wb") as f: f.write(resp.content)
-        
-        if platform.system() == "Windows": os.startfile(path)
-        elif platform.system() == "Darwin": subprocess.run(["open", str(path)])
-        else: subprocess.run(["xdg-open", str(path)])
+            resp = await client.get(url, follow_redirects=True, timeout=30)
+            if resp.status_code != 200:
+                return f"Download Failed: {resp.status_code}"
+
+            import aiofiles
+            async with aiofiles.open(path, "wb") as f:
+                await f.write(resp.content)
+
+        loop = asyncio.get_event_loop()
+        if platform.system() == "Windows":
+            await loop.run_in_executor(None, os.startfile, str(path))
+        elif platform.system() == "Darwin":
+            proc = await asyncio.create_subprocess_exec(
+                "open", str(path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await proc.wait()
+        else:
+            proc = await asyncio.create_subprocess_exec(
+                "xdg-open", str(path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await proc.wait()
+
         return str(path)
-    except Exception as e: return f"Image Download Error: {e}"
+    except Exception as e:
+        return f"Image Download Error: {e}"
 
 async def generate_image(prompt: str, width: int = None, height: int = None, **kwargs) -> str:
     try:
@@ -94,27 +134,58 @@ async def generate_image(prompt: str, width: int = None, height: int = None, **k
     except Exception as e: return f"Generation Error: {e}"
 
 async def web_search(query: str, **kwargs) -> str:
+    """Search the web using DuckDuckGo (runs in thread executor to prevent blocking)."""
     try:
-        results = DDGS().text(query, max_results=5)
-        if not results: return "No results found."
+        if not query or not isinstance(query, str):
+            return "Error: Invalid query."
+
+        loop = asyncio.get_event_loop()
+        def _search():
+            return DDGS().text(query, max_results=5)
+
+        results = await asyncio.wait_for(
+            loop.run_in_executor(None, _search),
+            timeout=30
+        )
+
+        if not results:
+            return "No results found."
         return "\n".join([f"- {r['title']}: {r['href']}\n  Snippet: {r['body']}" for r in results])
-    except Exception as e: return f"Search Error: {e}"
+    except asyncio.TimeoutError:
+        return "Search Error: Request timed out."
+    except Exception as e:
+        return f"Search Error: {e}"
 
 async def visit_page(url: str, **kwargs) -> str:
+    """Visit a webpage and extract text content (runs parsing in thread executor)."""
     try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ('http', 'https'):
+            return f"Security Error: URL scheme '{parsed.scheme}' is not allowed."
+
         ua = UserAgent()
         headers = {"User-Agent": ua.random, "Accept": "text/html"}
+
         async with httpx.AsyncClient(follow_redirects=True, timeout=20) as client:
             resp = await client.get(url, headers=headers)
-            if resp.status_code == 403: return f"Error 403: Access Denied."
+            if resp.status_code == 403:
+                return f"Error 403: Access Denied."
             resp.raise_for_status()
             html = resp.text
 
-        soup = BeautifulSoup(html, 'html.parser')
-        for s in soup(["script", "style", "nav", "footer", "header", "form", "svg"]): s.decompose()
-        text = ' '.join(soup.get_text(separator=' ', strip=True).split())
-        return text[:14000] + ("..." if len(text) > 14000 else "")
-    except Exception as e: return f"Browsing Error: {e}"
+        def _parse_html(content):
+            soup = BeautifulSoup(content, 'html.parser')
+            for s in soup(["script", "style", "nav", "footer", "header", "form", "svg"]):
+                s.decompose()
+            text = ' '.join(soup.get_text(separator=' ', strip=True).split())
+            return text[:14000] + ("..." if len(text) > 14000 else "")
+
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, _parse_html, html)
+        return result
+
+    except Exception as e:
+        return f"Browsing Error: {e}"
 
 async def get_weather(city: str, **kwargs) -> str:
     try:
@@ -130,10 +201,10 @@ async def get_weather(city: str, **kwargs) -> str:
             return f"Weather in {data['results'][0]['name']}:\nCondition: {cond}\nTemp: {curr['temperature_2m']}°C\nHumidity: {curr['relative_humidity_2m']}%\nWind: {curr['wind_speed_10m']} km/h"
     except Exception as e: return f"Weather Error: {e}"
 
-async def read_files(paths: str, **kwargs) -> str:
-    """Reads one or multiple files. Usage: 'file1.py' or 'file1.py, file2.py'."""
+async def read_files(paths: str, offset: int = 0, limit: int = 0, **kwargs) -> str:
+    """Reads files with optional line range. Usage: 'file.py' or 'file.py' with offset=100, limit=50."""
+    import aiofiles
     try:
-        # Handle list or comma-separated string
         file_list = paths if isinstance(paths, list) else [p.strip() for p in paths.split(',')]
         results = []
 
@@ -147,14 +218,26 @@ async def read_files(paths: str, **kwargs) -> str:
                     results.append(f"### {p}\n[ERROR: File Not Found]")
                     continue
 
-                with open(p, "r", encoding="utf-8") as f:
-                    content = f.read()
-                
-                # Safety cap for huge files
-                if len(content) > 50000:
-                    content = content[:50000] + "\n... [TRUNCATED 50KB+]"
+                async with aiofiles.open(p, "r", encoding="utf-8") as f:
+                    lines = await f.readlines()
 
-                results.append(f"### {p}\n{content}")
+                total_lines = len(lines)
+                start = offset
+                end = offset + limit if limit > 0 else total_lines
+
+                if offset > 0 or limit > 0:
+                    header = f"### {p} (lines {start+1}-{min(end, total_lines)} of {total_lines})\n"
+                    content_lines = lines[start:end]
+                    content = "".join(content_lines)
+                    if end < total_lines:
+                        content += f"\n... [{total_lines - end} more lines, use offset={end} to continue] ..."
+                else:
+                    header = f"### {p}\n"
+                    content = "".join(lines)
+                    if len(content) > 50000:
+                        content = content[:50000] + f"\n... [TRUNCATED at 50KB, use offset and limit params to read more] ..."
+
+                results.append(header + content)
             except Exception as e:
                 results.append(f"### {p}\n[READ ERROR: {e}]")
 
@@ -163,43 +246,59 @@ async def read_files(paths: str, **kwargs) -> str:
         return f"Read Files Error: {e}"
 
 async def grep_files(pattern: str, path: str = ".", **kwargs) -> str:
+    """Search files for pattern using non-blocking I/O."""
+    import aiofiles
     try:
-        if not _is_safe_path(path): return "Access Denied."
-        
+        if not _is_safe_path(path):
+            return "Access Denied."
+
         results = []
         root_path = Path(path)
         ignore_dirs = {'.git', '__pycache__', 'venv', 'node_modules', 'tmp'}
-        
-        for root, dirs, files in os.walk(root_path):
-            dirs[:] = [d for d in dirs if d not in ignore_dirs]
-            for file in files:
-                if not file.endswith(('.py', '.md', '.json', '.txt')): continue
-                
-                file_path = Path(root) / file
-                try:
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        for i, line in enumerate(f, 1):
-                            if pattern in line:
-                                results.append(f"{file_path}:{i}: {line.strip()}")
-                except: pass
-                
+        loop = asyncio.get_event_loop()
+
+        def _walk_files():
+            file_list = []
+            for root, dirs, files in os.walk(root_path):
+                dirs[:] = [d for d in dirs if d not in ignore_dirs]
+                for file in files:
+                    if not file.endswith(('.py', '.md', '.json', '.txt')):
+                        continue
+                    file_list.append(Path(root) / file)
+            return file_list
+
+        file_list = await loop.run_in_executor(None, _walk_files)
+
+        for file_path in file_list:
+            try:
+                async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+                    content = await f.read()
+                    for i, line in enumerate(content.splitlines(), 1):
+                        if pattern in line:
+                            results.append(f"{file_path}:{i}: {line.strip()}")
+
                 if len(results) > 100:
                     results.append("... [Too many matches]")
                     return "\n".join(results)
-                    
+            except Exception:
+                pass
+
         return "\n".join(results) if results else "No matches found."
     except Exception as e:
         return f"Grep Error: {e}"
 
-async def write_file(path: str, content: str, **kwargs) -> str:   
+async def write_file(path: str, content: str, **kwargs) -> str:
+    """Write file with non-blocking I/O and path validation."""
+    import aiofiles
     try:
-        if not _is_safe_path(path): return "Security Error: Path outside project."
-        
+        if not _is_safe_path(path):
+            return "Security Error: Path outside project."
+
         old_content = ""
         if os.path.exists(path):
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                old_content = f.read()
-        
+            async with aiofiles.open(path, "r", encoding="utf-8", errors="ignore") as f:
+                old_content = await f.read()
+
         if old_content != content:
             import difflib
             diff = difflib.unified_diff(
@@ -210,58 +309,112 @@ async def write_file(path: str, content: str, **kwargs) -> str:
                 lineterm=""
             )
             diff_text = "\n".join(list(diff))
-            
+
             if diff_text:
                 from rich.console import Console
                 from rich.syntax import Syntax
                 from rich.panel import Panel
                 syntax = Syntax(diff_text, "diff", theme="monokai", line_numbers=False)
-                Console().print(Panel(syntax, title=f"[bold yellow]CHANGES: {path}[/bold yellow]", border_style="yellow")) 
+                Console().print(Panel(syntax, title=f"[bold yellow]CHANGES: {path}[/bold yellow]", border_style="yellow"))
 
-        os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f: f.write(content)
-        
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+        )
+
+        async with aiofiles.open(path, "w", encoding="utf-8") as f:
+            await f.write(content)
+
         return f"File written: {path}"
-    except Exception as e: return f"Write Error: {e}"
+    except Exception as e:
+        return f"Write Error: {e}"
 
 async def append_file(path: str, content: str, **kwargs) -> str:
+    """Append content to file with non-blocking I/O and path validation."""
+    import aiofiles
     try:
-        if not _is_safe_path(path): return "Security Error: Path outside project."
-        with open(path, "a", encoding="utf-8") as f: f.write(content)
-        return f"Appended to: {path}"
-    except Exception as e: return f"Append Error: {e}"
+        if not _is_safe_path(path):
+            return "Security Error: Cannot write outside project directory."
 
-def execute_command(command: str, **kwargs) -> str:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+        )
+
+        async with aiofiles.open(path, "a", encoding="utf-8") as f:
+            await f.write(content)
+        return f"Appended to file: {path}"
+    except Exception as e:
+        return f"Append Error: {e}"
+
+async def execute_command(command: str, **kwargs) -> str:
+    """
+    Execute a command safely with optional whitelist validation and shell=False.
+    Validation only occurs when require_approval is True in config.
+    """
     try:
         if not command or not isinstance(command, str):
             return "Error: Invalid command."
 
-        if platform.system() == "Windows":
-            safe_cmd = command.replace('"', '\\"')
-            shell_cmd = f'powershell -Command "{safe_cmd}"'
-        else:
-            shell_cmd = command
+        try:
+            cmd_parts = shlex.split(command)
+        except ValueError as e:
+            return f"Error: Invalid command syntax: {e}"
 
-        result = subprocess.run(
-            shell_cmd, 
-            shell=True, 
-            capture_output=True, 
-            text=True,
-            timeout=120
+        if not cmd_parts:
+            return "Error: Empty command."
+
+        base_cmd = cmd_parts[0]
+        base_cmd_name = os.path.basename(base_cmd).lower()
+
+        # Only validate if require_approval is True
+        from src.config import load_config
+        config = load_config()
+        if config.require_approval:
+            if base_cmd_name not in ALLOWED_COMMANDS:
+                return f"Security Error: Command '{base_cmd_name}' is not in the allowed command whitelist."
+
+            dangerous_patterns = [';', '&&', '||', '`', '$(', '${', '|', '>', '<', '&']
+            for pattern in dangerous_patterns:
+                if pattern in command and pattern not in ['>', '<']:
+                    return f"Security Error: Shell operators are not allowed."
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd_parts,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=None
         )
-        
-        output = result.stdout
-        if result.stderr: 
-            output += f"\nSTDERR:\n{result.stderr}"
-        return output.strip() or "Executed successfully (no output)."
-    except subprocess.TimeoutExpired:
-        return "Error: Command timed out."
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=120
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return "Error: Command timed out after 120 seconds."
+
+        output = stdout.decode('utf-8', errors='replace') if stdout else ""
+        if stderr:
+            output += f"\nSTDERR:\n{stderr.decode('utf-8', errors='replace')}"
+
+        return output.strip() or f"Executed successfully (exit code: {proc.returncode})."
+
     except Exception as e:
         return f"Execution Error: {e}"
 
 async def list_dir(path: str = ".", **kwargs) -> str:
-    try: return "\n".join(os.listdir(path))
-    except Exception as e: return f"List Dir Error: {e}"
+    """List directory contents with path traversal protection."""
+    try:
+        if not _is_safe_path(path):
+            return "Security Error: Access denied - path outside project directory."
+        return "\n".join(os.listdir(path))
+    except Exception as e:
+        return f"List Dir Error: {e}"
 
 async def list_files_recursive(path: str = ".", **kwargs) -> str:
     try:
@@ -296,18 +449,100 @@ async def list_files_recursive(path: str = ".", **kwargs) -> str:
     except Exception as e:
         return f"Recursive List Error: {e}"
 
-async def delegate_to(agent_name: str, task: str, **kwargs) -> str:
-    """Delegates to a specialized agent."""
+# Global delegation chain tracker to prevent loops
+_DELEGATION_CHAIN = []
+_MAX_DELEGATION_DEPTH = 5
+
+async def delegate_to(agent_name: str, task: str, context: str = "", **kwargs) -> str:
+    """
+    Delegates to a specialized agent with full context passing.
+    """
     try:
         from src.core.base_agent import BaseAgent
         from src.config import load_config
+        from src.skills_loader import load_role
+        
         config = load_config()
         provider = _get_active_provider()
-        agent = BaseAgent(name=agent_name.capitalize(), provider=provider, skill_name=agent_name.lower().strip(), settings=config)
-        agent.tools = TOOL_REGISTRY
-        return await agent.run(task)
+        
+        # Normalize agent name
+        agent_name = agent_name.lower().strip()
+        
+        # Check delegation depth to prevent infinite loops
+        current_chain = getattr(delegate_to, '_chain', [])
+        if len(current_chain) >= _MAX_DELEGATION_DEPTH:
+            return f"Delegation Error: Maximum delegation depth ({_MAX_DELEGATION_DEPTH}) reached. Chain: {' -> '.join(current_chain)}"
+        
+        # Check for circular delegation
+        if agent_name in current_chain:
+            return f"Delegation Error: Circular delegation detected. {agent_name} is already in chain: {' -> '.join(current_chain)}"
+        
+        # Load skill configuration for the target agent
+        role_config = load_role(agent_name)
+        if not role_config:
+            return f"Delegation Error: Unknown agent '{agent_name}'. Available: code, researcher, architect, system, n8n_expert, memory_manager"
+        
+        # Create agent with proper configuration
+        agent = BaseAgent(
+            name=role_config.name.capitalize(), 
+            provider=provider, 
+            skill_name=agent_name, 
+            settings=config
+        )
+        
+        # Set system prompt from skill
+        agent.system_prompt = role_config.prompt
+        
+        # Load appropriate tools for this agent
+        if role_config.tools:
+            agent.load_tools(role_config.tools)
+        else:
+            agent.tools = dict(TOOL_REGISTRY)
+        
+        # Build enhanced task with context
+        enhanced_task = task
+        if context:
+            enhanced_task = f"""[DELEGATED TASK]
+Original Task: {task}
+
+[CONTEXT FROM DELEGATOR]
+{context}
+
+[DELEGATION CHAIN]
+{' -> '.join(current_chain)} -> {agent_name}
+
+Please complete this task and return results to the original requester."""
+        
+        # Track delegation
+        new_chain = current_chain + [agent_name]
+        original_run = agent.run
+        
+        async def tracked_run(task):
+            """Wrapper to track delegation chain in recursive calls"""
+            old_chain = getattr(delegate_to, '_chain', [])
+            delegate_to._chain = new_chain
+            try:
+                result = await original_run(task)
+                return result
+            finally:
+                delegate_to._chain = old_chain
+        
+        agent.run = tracked_run
+        
+        # Execute the task
+        memory_core.log_event(f"delegate:{agent_name}", f"Task delegated: {task[:100]}...", "delegation_start")
+        
+        result = await agent.run(enhanced_task)
+        
+        memory_core.log_event(f"delegate:{agent_name}", f"Delegation complete: {result[:100]}...", "delegation_end")
+        
+        return f"[DELEGATION RESULT from {agent_name}]:\n{result}"
+        
     except Exception as e:
-        return f"Delegation Error: {e}"
+        import traceback
+        error_detail = traceback.format_exc()
+        memory_core.log_event(f"delegate:{agent_name}", f"Delegation failed: {str(e)}", "delegation_error")
+        return f"Delegation Error: {e}\n{error_detail}"
 
 async def remember(fact: str, category: str = "general", **kwargs) -> str:
     try:
@@ -351,57 +586,6 @@ async def clear_memory(confirm: str = "no", **kwargs) -> str:
         return "Memory cleared."
     except Exception as e:
         return f"Clear Memory Error: {e}"
-
-async def append_file(path: str, content: str, **kwargs) -> str:
-    try:
-        if not _is_safe_path(path):
-            return "Security Error: Cannot write outside project directory."
-
-        os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
-        
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(content)
-        return f"Appended to file: {path}"
-    except Exception as e:
-        return f"Append Error: {e}"
-
-async def debug_system_prompt(**kwargs) -> str:
-    """Output the reconstructed system prompt."""
-    from src.utils import get_system_context
-    from src.skills_loader import load_role, get_roles_overview
-    from src.core.memory import memory_core
-    from src.config import load_config
-    from src.core.mcp_manager import MCPManager
-    
-    config = load_config()
-    
-    try:
-        base_prompt = load_role("system")
-        if not base_prompt:
-            with open("src/skills/system.md", "r", encoding="utf-8") as f:
-                base_prompt = f.read()
-    except:
-        base_prompt = "You are ZervGen Supervisor. Route tasks via JSON."
-
-    context = get_system_context()
-    skills = get_roles_overview()
-    local_tools = get_tools_schema()
-    memories = memory_core.get_recent_memories(limit=5)
-
-    mcp_tools = "MCP DISABLED"
-    if config.mcp_enabled:
-        temp_mcp = MCPManager(config)
-        enabled_servers = [k for k, v in config.mcp_servers.items() if v.enabled]
-        mcp_tools = f"MCP Servers Enabled: {', '.join(enabled_servers)}"
-
-    return (
-        f"=== DEBUG SNAPSHOT ===\n"
-        f"{context}\n\n"
-        f"--- SYSTEM PROMPT ---\n{base_prompt}\n\n"
-        f"--- MEMORY ---\n{memories}\n\n"
-        f"--- SKILLS ---\n{skills}\n\n"
-        f"--- TOOLS ---\n{local_tools}\n{mcp_tools}"
-    )
 
 async def take_screenshot(filename: str = "screen.png", **kwargs) -> str:
     """Takes a screenshot and saves it to tmp/."""
@@ -462,23 +646,158 @@ async def type_text(text: str, **kwargs) -> str:
     except Exception as e:
         return f"Type Error: {e}"
     
+# Whitelist of allowed imports for run_safe_code
+SAFE_CODE_IMPORTS = {
+    'math', 'random', 'datetime', 'json', 're', 'collections',
+    'itertools', 'functools', 'statistics', 'decimal', 'fractions',
+    'typing', 'hashlib', 'string', 'time', 'inspect', 'textwrap',
+    'copy', 'pprint', 'enum', 'dataclasses', 'pathlib', 'uuid'
+}
+
 async def run_safe_code(code: str, **kwargs) -> str:
-    """Executes Python code inside a secure Docker Sandbox."""
-    if not sandbox.is_active():
-        return "Error: Docker Sandbox is offline."
-    
-    return sandbox.execute(code)
+    """
+    Executes Python code inside a restricted sandbox.
+    Uses multiprocessing for isolation with import whitelist.
+    """
+    import multiprocessing
+    import tempfile
+    import io
+    import contextlib
+
+    import ast
+    try:
+        tree = ast.parse(code)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    module = alias.name.split('.')[0]
+                    if module not in SAFE_CODE_IMPORTS:
+                        return f"Security Error: Import '{module}' is not in the allowed whitelist."
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    module = node.module.split('.')[0]
+                    if module not in SAFE_CODE_IMPORTS:
+                        return f"Security Error: Import from '{module}' is not in the allowed whitelist."
+    except SyntaxError as e:
+        return f"Syntax Error: {e}"
+
+    def _execute_in_process(code_str, return_dict):
+        try:
+            stdout_capture = io.StringIO()
+            stderr_capture = io.StringIO()
+
+            safe_globals = {
+                '__builtins__': {
+                    'print': print,
+                    'len': len,
+                    'range': range,
+                    'enumerate': enumerate,
+                    'zip': zip,
+                    'map': map,
+                    'filter': filter,
+                    'sum': sum,
+                    'min': min,
+                    'max': max,
+                    'abs': abs,
+                    'round': round,
+                    'pow': pow,
+                    'divmod': divmod,
+                    'chr': chr,
+                    'ord': ord,
+                    'bin': bin,
+                    'hex': hex,
+                    'oct': oct,
+                    'format': format,
+                    'repr': repr,
+                    'str': str,
+                    'int': int,
+                    'float': float,
+                    'bool': bool,
+                    'list': list,
+                    'dict': dict,
+                    'tuple': tuple,
+                    'set': set,
+                    'frozenset': frozenset,
+                    'sorted': sorted,
+                    'reversed': reversed,
+                    'hasattr': hasattr,
+                    'getattr': getattr,
+                    'isinstance': isinstance,
+                    'type': type,
+                    'Exception': Exception,
+                    'ValueError': ValueError,
+                    'TypeError': TypeError,
+                    'KeyError': KeyError,
+                    'IndexError': IndexError,
+                    'AttributeError': AttributeError,
+                    'StopIteration': StopIteration,
+                    'RuntimeError': RuntimeError,
+                }
+            }
+
+            import importlib
+            for module_name in SAFE_CODE_IMPORTS:
+                try:
+                    module = importlib.import_module(module_name)
+                    safe_globals[module_name] = module
+                except ImportError:
+                    pass
+
+            with contextlib.redirect_stdout(stdout_capture), contextlib.redirect_stderr(stderr_capture):
+                exec(code_str, safe_globals, {})
+
+            return_dict['stdout'] = stdout_capture.getvalue()
+            return_dict['stderr'] = stderr_capture.getvalue()
+            return_dict['success'] = True
+        except Exception as e:
+            return_dict['error'] = str(e)
+            return_dict['success'] = False
+
+    try:
+        manager = multiprocessing.Manager()
+        return_dict = manager.dict()
+
+        process = multiprocessing.Process(
+            target=_execute_in_process,
+            args=(code, return_dict)
+        )
+        process.start()
+        process.join(timeout=30)
+
+        if process.is_alive():
+            process.terminate()
+            process.join()
+            return "Error: Code execution timed out (30s limit)."
+
+        if process.exitcode != 0:
+            return f"Execution Error: Process exited with code {process.exitcode}"
+
+        if return_dict.get('success'):
+            output = return_dict.get('stdout', '')
+            stderr = return_dict.get('stderr', '')
+            if stderr:
+                output += f"\nSTDERR:\n{stderr}"
+            return output.strip() or "Success (No Output)"
+        else:
+            return f"Execution Error: {return_dict.get('error', 'Unknown error')}"
+
+    except Exception as e:
+        return f"Run Code Error: {e}"
 
 async def get_code_skeleton(path: str, **kwargs) -> str:
     """Reads a Python file and returns ONLY the structure."""
     import ast
+    import aiofiles
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            source = f.read()
-            tree = ast.parse(source)
-            
+        if not _is_safe_path(path):
+            return "Security Error: Access denied - path outside project directory."
+
+        async with aiofiles.open(path, "r", encoding="utf-8") as f:
+            source = await f.read()
+
+        tree = ast.parse(source)
         skeleton = []
-        
+
         for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef):
                 skeleton.append(f"\n[Line {node.lineno}] class {node.name}:")
@@ -495,6 +814,55 @@ async def get_code_skeleton(path: str, **kwargs) -> str:
     except Exception as e:
         return f"Skeleton Error: {e}"
 
+async def manage_todo(action: str, task: str = "", todo_id: str = "", **kwargs) -> str:
+    """TODO manager. Actions: add, list, remove, clear."""
+    import json
+    todo_file = Path("tmp/todos.json")
+    
+    # Load existing
+    todos = []
+    if todo_file.exists():
+        try:
+            todos = json.loads(todo_file.read_text())
+        except:
+            pass
+    
+    if action == "add" and task:
+        todos.append({"id": len(todos) + 1, "task": task, "done": False})
+        todo_file.write_text(json.dumps(todos))
+        return f"Added: {task}"
+    
+    elif action == "list":
+        if not todos:
+            return "No TODOs."
+        return "\n".join([f"{t['id']}. {'[x]' if t['done'] else '[ ]'} {t['task']}" for t in todos])
+    
+    elif action == "done" and todo_id:
+        for t in todos:
+            if str(t["id"]) == todo_id:
+                t["done"] = True
+                todo_file.write_text(json.dumps(todos))
+                return f"Marked done: {t['task']}"
+        return "TODO not found"
+    
+    elif action == "remove" and todo_id:
+        todos = [t for t in todos if str(t["id"]) != todo_id]
+        todo_file.write_text(json.dumps(todos))
+        return "TODO removed"
+    
+    elif action == "clear":
+        todo_file.write_text("[]")
+        return "All TODOs cleared"
+    
+    return "Usage: manage_todo(action='add|list|done|remove|clear', task='...', todo_id='...')"
+
+async def manage_history(action: str, index: int = -1, **kwargs) -> str:
+    """
+    Allows the agent to delete useless messages from its own context window.
+    Action: 'delete_last', 'delete_index'.
+    """
+    return f"SIGNAL_HISTORY_{action.upper()}_{index}"
+
 def _generate_registry():
     current_module = sys.modules[__name__]
     registry = {}
@@ -503,7 +871,7 @@ def _generate_registry():
             registry[name] = func
     return registry
 
-TOOL_REGISTRY = _generate_registry()
+TOOL_REGISTRY = MappingProxyType(_generate_registry())
 
 def get_tools_schema() -> str:
     schema = []

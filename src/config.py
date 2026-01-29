@@ -42,6 +42,13 @@ class GeminiSettings(BaseModel):
     model: str = "gemini-2.0-flash"
     temperature: float = 0.7
 
+    def model_post_init(self, __context):
+        # Load API key from environment variable if not set in config
+        if not self.api_key:
+            env_key = os.environ.get("GEMINI_API_KEY")
+            if env_key:
+                self.api_key = env_key
+
 class OpenRouterSettings(BaseModel):
     api_key: Optional[str] = None
     model: str = "google/gemini-2.0-flash-exp:free"
@@ -49,13 +56,48 @@ class OpenRouterSettings(BaseModel):
     site_url: str = "https://github.com/LeLeLeonid/ZervGen"
     app_name: str = "ZervGen"
 
+    def model_post_init(self, __context):
+        # Load API key from environment variable if not set in config
+        if not self.api_key:
+            env_key = os.environ.get("OPENROUTER_API_KEY")
+            if env_key:
+                self.api_key = env_key
+
 class OpenAISettings(BaseModel):
     api_key: Optional[str] = None
     model: str = "gpt-5.2"
 
+    def model_post_init(self, __context):
+        # Load API key from environment variable if not set in config
+        if not self.api_key:
+            env_key = os.environ.get("OPENAI_API_KEY")
+            if env_key:
+                self.api_key = env_key
+
 class AnthropicSettings(BaseModel):
     api_key: Optional[str] = None
     model: str = "claude-sonnet-4.5"
+
+    def model_post_init(self, __context):
+        # Load API key from environment variable if not set in config
+        if not self.api_key:
+            env_key = os.environ.get("ANTHROPIC_API_KEY")
+            if env_key:
+                self.api_key = env_key
+
+class GroqSettings(BaseModel):
+    api_key: Optional[str] = None
+    model: str = "llama-3.1-70b-versatile"
+    temperature: float = 0.7
+    max_tokens: int = 4096
+    top_p: float = 0.9
+
+    def model_post_init(self, __context):
+        # Load API key from environment variable if not set in config
+        if not self.api_key:
+            env_key = os.environ.get("GROQ_API_KEY")
+            if env_key:
+                self.api_key = env_key
 
 DEFAULT_MCP_SERVERS = {
     "filesystem": MCPServerConfig(
@@ -95,7 +137,7 @@ DEFAULT_MCP_SERVERS = {
 }
 
 class GlobalSettings(BaseModel):
-    provider: Literal["pollinations", "gemini", "openrouter", "openai", "anthropic"] = "pollinations"
+    provider: Literal["pollinations", "gemini", "openrouter", "openai", "anthropic", "groq"] = "pollinations"
     max_steps: int = 500
     history_limit: int = 50
     log_truncation: bool = True
@@ -111,7 +153,9 @@ class GlobalSettings(BaseModel):
     openrouter: OpenRouterSettings = Field(default_factory=OpenRouterSettings)
     openai: OpenAISettings = Field(default_factory=OpenAISettings)
     anthropic: AnthropicSettings = Field(default_factory=AnthropicSettings)
+    groq: GroqSettings = Field(default_factory=GroqSettings)
     mode: str = "BUILD"
+    show_prompts: bool = False  # When True, outputs full prompts to console
     
     def get_mcp_health_report(self) -> Dict[str, Any]:
         report = {}
@@ -195,6 +239,8 @@ def validate_config(config: GlobalSettings) -> tuple[bool, List[str]]:
         issues.append("OpenAI API key is missing")
     elif config.provider == "anthropic" and not config.anthropic.api_key:
         issues.append("Anthropic API key is missing")
+    elif config.provider == "groq" and not config.groq.api_key:
+        issues.append("Groq API key is missing. Get one at https://console.groq.com")
     
     health = config.get_mcp_health_report()
     for name, status in health.items():

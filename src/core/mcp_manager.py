@@ -12,10 +12,22 @@ class MCPManager:
     def __init__(self, settings: GlobalSettings):
         self.settings = settings
         self.sessions: Dict[str, ClientSession] = {}
-        self.tools_map: Dict[str, Any] = {} 
+        self.tools_map: Dict[str, Any] = {}
         self.exit_stack = None
         self.failed_servers: Dict[str, str] = {}
         self.enabled = settings.mcp_enabled
+        self.is_connected = False
+
+    async def cleanup(self):
+        """Cleanup all MCP sessions and resources."""
+        if self.exit_stack:
+            try:
+                await self.exit_stack.aclose()
+            except Exception:
+                pass
+        self.sessions.clear()
+        self.tools_map.clear()
+        self.is_connected = False
 
     async def connect_all(self):
         if not self.enabled:

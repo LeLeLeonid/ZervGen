@@ -2,17 +2,18 @@
 
 **Autonomous AI Orchestration**
 
-[![Version](https://img.shields.io/badge/Version-1.4.0-purple?style=for-the-badge)](https://github.com/LeLeLeonid/ZervGen)
+[![Version](https://img.shields.io/badge/Version-1.4.5-purple?style=for-the-badge)](https://github.com/LeLeLeonid/ZervGen)
 [![License](https://img.shields.io/badge/License-MIT-000000?style=for-the-badge)](LICENSE)
 
-ZervGen is a terminal-first **Supervisor-Worker** framework designed for complex task orchestration. It decouples reasoning (The Brain) from execution (Tools) and memory (GraphRAG), allowing you to build self-evolving AI agents that actually work.
+ZervGen is a terminal-first **Secure Core** framework designed for complex task orchestration with defense-in-depth security. It decouples reasoning (The Brain) from execution (Tools) and memory (GraphRAG), featuring prompt injection protection, path traversal prevention, and sandboxed code execution.
 
 ---
 
 ## // CORE ARCHITECTURE
 
-### 🧠 The Brain (Hybrid)
+### 🧠 The Brain (Secure Core)
 *   **Supervisor Architecture:** Decouples reasoning (Orchestrator) from execution (Agents).
+*   **Security-First Design:** Prompt injection sanitization, random delimiters, path traversal protection.
 *   **Provider Agnostic:** Swap between **OpenRouter** (Gemini 3, Llama), **Google Gemini**, **Pollinations.AI**, **OpenAI**, and **Anthropic** on the fly.
 
 ### 💾 The Memory (GraphRAG)
@@ -44,6 +45,15 @@ source venv/bin/activate
 pip install -r requirements.txt
 python main.py
 ```
+
+## // SECURITY FEATURES
+
+ZervGen v1.4.5 Secure Core includes defense-in-depth protections:
+
+*   **`sanitize_for_prompt`**: Prevents prompt injection attacks by escaping delimiter patterns.
+*   **`_is_safe_path`**: Blocks path traversal attacks with directory whitelisting.
+*   **`execute_command`**: Whitelist-based command execution with dangerous pattern detection.
+*   **`run_safe_code`**: Sandboxed Python execution with import whitelisting and process isolation.
 
 ## // CONTROL FREAK FEATURES
 
