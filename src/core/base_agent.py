@@ -9,7 +9,7 @@ from src.core.provider import AIProvider
 from src.tools import TOOL_REGISTRY, get_tools_schema
 from src.config import GlobalSettings
 from src.core.mcp_manager import MCPManager
-from src.utils import get_system_context, extract_json_from_text
+from src.utils import get_system_context, extract_json_from_text, sanitize_for_prompt
 from src.core.memory import memory_core
 
 console = Console()
@@ -45,13 +45,12 @@ class BaseAgent(ABC):
                 self.history = [self.history[0]] + self.history[-limit:]
 
     async def run(self, task: str) -> str:
-        # await self._ensure_mcp()
-
         if self.system_prompt == "You are a ZervGen Agent." and self.settings.debug_mode:
             console.print(f"[yellow]⚠️ Warning: Agent {self.name} has default prompt.[/yellow]")
 
-        self.history.append({"role": "user", "content": f"TASK: {task}"})
-        memory_core.log_event(f"agent:{self.name}", f"Started task: {task}", "subtask_start")
+        sanitized_task = sanitize_for_prompt(task)
+        self.history.append({"role": "user", "content": f"TASK: {sanitized_task}"})
+        memory_core.log_event(f"agent:{self.name}", f"Started task: {sanitized_task}", "subtask_start")
         step = 0
         last_json = None
         context = get_system_context()
@@ -65,7 +64,12 @@ class BaseAgent(ABC):
             allowed_tools_schema.append(f"- {name}{sig}: {doc}")
         
         local_desc = "\n".join(allowed_tools_schema)
-        mcp_desc = self.mcp.get_tools_schema() if self.mcp_initialized else "None"
+        mcp_desc = ""
+        if self.mcp and self.mcp_initialized:
+            try:
+                mcp_desc = self.mcp.get_tools_schema()
+            except:
+                mcp_desc = "MCP tools unavailable"
         all_tools = f"{local_desc}\n\n--- MCP TOOLS ---\n{mcp_desc}" if mcp_desc else local_desc
 
         full_prompt = (
@@ -88,10 +92,28 @@ class BaseAgent(ABC):
         for _ in range(20):
             self._trim_history()
             
+            # Output full prompt for inspection
+            if self.settings.debug_mode or getattr(self.settings, 'show_prompts', False):
+                from rich.panel import Panel
+                from rich.syntax import Syntax
+                console.print(Panel(
+                    Syntax(full_prompt, "markdown", theme="monokai", line_numbers=True),
+                    title=f"[bold cyan]FULL PROMPT SENT TO LLM ({self.name})[/bold cyan]",
+                    border_style="cyan"
+                ))
+            
             try:
                 response_text = await self.provider.generate_text(self.history, full_prompt)
                 from src.utils import print_token_usage
                 print_token_usage(self.history + [{"content": full_prompt}], response_text)
+                
+                # Output LLM response in debug mode
+                if self.settings.debug_mode or getattr(self.settings, 'show_prompts', False):
+                    console.print(Panel(
+                        Syntax(response_text, "json", theme="monokai", line_numbers=False),
+                        title=f"[bold green]LLM OUTPUT ({self.name})[/bold green]",
+                        border_style="green"
+                    ))
             except Exception as e:
                 error_msg = f"Agent Brain Error: {e}"
                 memory_core.log_event(f"agent:{self.name}", error_msg, "error")
@@ -119,9 +141,9 @@ class BaseAgent(ABC):
 
                 if self.settings.debug_mode:
                     thought_text = "\n".join([f"- {t}" for t in thoughts])
-                    console.print(Panel(thought_text, title=f"[dim]🧠 [{self.name}] {title}[/dim]", border_style="dim magenta"))
+                    console.print(Panel(thought_text, title=f"[dim]🧠 [{self.name}] Step {step}/20: {title}[/dim]", border_style="dim magenta"))
                 else:
-                    console.print(f"[dim magenta]  ↳ [{self.name}] {title}[/dim magenta]")
+                    console.print(f"[dim magenta]  ↳ [{self.name}] Step {step}/20: {title}[/dim magenta]")
                 
                 if tool_name == "response" or tool_name is None:
                     final_text = args.get("text") or args.get("content") or args.get("answer") or args.get("response")
@@ -131,9 +153,10 @@ class BaseAgent(ABC):
                         final_text = ". ".join(thoughts) if thoughts else response_text
                     self.history.append({"role": "assistant", "content": json_str})
                     return str(final_text)
+                
+                step += 1
                 result = ""
 
-                # --- TOOL DISPATCHER ---
                 if tool_name in TOOL_REGISTRY:
                     import inspect
                     func = TOOL_REGISTRY[tool_name]
@@ -141,7 +164,7 @@ class BaseAgent(ABC):
                         result = await func(**args)
                     else:
                         result = func(**args)
-                elif self.mcp_initialized and tool_name in self.mcp.tools_map:
+                elif self.mcp and self.mcp_initialized and tool_name in self.mcp.tools_map:
                     result = await self.mcp.execute_tool(tool_name, args)
                 else:
                     result = f"Error: Tool {tool_name} not found."
@@ -157,5 +180,6 @@ class BaseAgent(ABC):
             except Exception as e:
                 self.history.append({"role": "user", "content": f"Error: {e}"})
                 memory_core.log_event(f"agent:{self.name}", str(e), "tool_error")
+                step += 1
 
         return "Agent stopped: Max steps reached."

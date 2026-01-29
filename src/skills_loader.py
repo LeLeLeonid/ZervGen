@@ -11,6 +11,9 @@ class RoleConfig:
         self.prompt = content
         self.description = meta.get("description", "No description provided.")
         self.tools = meta.get("tools", [])
+    
+    def __str__(self):
+        return self.prompt
 
 def load_role(name: str) -> Optional[RoleConfig]:
     path = SKILLS_DIR / f"{name}.md"

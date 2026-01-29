@@ -39,7 +39,8 @@ class MemoryManager:
         self.stats = {
             "total_memories": len(self.kg_data.get("facts", [])),
             "successful_queries": 0,
-            "vector_enabled": self.collection is not None
+            "vector_enabled": self.collection is not None,
+            "evolution_events": 0
         }
         
     def _load_kg(self) -> Dict[str, Any]:
@@ -104,6 +105,9 @@ class MemoryManager:
         valid_lines = 0
         errors = 0
 
+        # Valid roles for LLM APIs
+        VALID_ROLES = {"system", "user", "assistant"}
+
         try:
             with open(path, "r", encoding="utf-8") as f:
                 for line in f:
@@ -120,6 +124,15 @@ class MemoryManager:
                              content = data["content"]
                         else:
                              content = str(data)
+
+                        # Map non-standard roles to valid ones
+                        if role and role not in VALID_ROLES:
+                            if role.startswith("agent:") or role.startswith("delegate:"):
+                                role = "assistant"
+                            elif role == "system_event":
+                                continue  # Skip system events
+                            else:
+                                role = "assistant"  # Default fallback
 
                         if event in ["message", "tool_result", "thought", "final_answer", "input"]:
                             reconstructed_history.append({"role": role, "content": content})
@@ -209,4 +222,85 @@ class MemoryManager:
     def get_stats(self) -> str:
         return str(self.stats)
 
+
+class TodoManager:
+    """Manages TODO items for the orchestrator."""
+    
+    def __init__(self):
+        self.todo_file = Path("tmp") / "todos.json"
+        self.todos = self._load_todos()
+    
+    def _load_todos(self) -> List[Dict]:
+        if self.todo_file.exists():
+            try:
+                with open(self.todo_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except:
+                return []
+        return []
+    
+    def _save_todos(self):
+        self.todo_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.todo_file, "w", encoding="utf-8") as f:
+            json.dump(self.todos, f, indent=2)
+    
+    def add(self, task: str) -> str:
+        todo = {
+            "id": str(uuid.uuid4())[:8],
+            "task": task,
+            "done": False,
+            "created_at": time.time()
+        }
+        self.todos.append(todo)
+        self._save_todos()
+        return f"Added TODO: {task}"
+    
+    def list(self) -> str:
+        if not self.todos:
+            return "No TODOs."
+        lines = []
+        for t in self.todos:
+            status = "[x]" if t.get("done") else "[ ]"
+            lines.append(f"{status} {t.get('task', '')}")
+        return "\n".join(lines)
+    
+    def done(self, todo_id: str) -> str:
+        for t in self.todos:
+            if t.get("id") == todo_id:
+                t["done"] = True
+                self._save_todos()
+                return f"Marked done: {t.get('task')}"
+        return "TODO not found"
+    
+    def remove(self, todo_id: str) -> str:
+        original_len = len(self.todos)
+        self.todos = [t for t in self.todos if t.get("id") != todo_id]
+        self._save_todos()
+        if len(self.todos) < original_len:
+            return "TODO removed"
+        return "TODO not found"
+    
+    def clear(self) -> str:
+        self.todos = []
+        self._save_todos()
+        return "All TODOs cleared"
+    
+    def get_orchestrator_view(self) -> str:
+        """Returns formatted TODO list for orchestrator system prompt."""
+        if not self.todos:
+            return "No active TODOs."
+        active = [t for t in self.todos if not t.get("done")]
+        completed = [t for t in self.todos if t.get("done")]
+        
+        lines = []
+        if active:
+            lines.append("ACTIVE:")
+            for t in active:
+                lines.append(f"  - [{t.get('id', '???')}] {t.get('task', '')}")
+        if completed:
+            lines.append(f"COMPLETED: {len(completed)}")
+        return "\n".join(lines) if lines else "No active TODOs."
+
+
 memory_core = MemoryManager()
+todo_manager = TodoManager()

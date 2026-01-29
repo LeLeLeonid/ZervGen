@@ -1,5 +1,7 @@
 ﻿import sys
 import asyncio
+import signal
+import threading
 from pathlib import Path
 from rich.console import Console
 from rich.panel import Panel
@@ -14,10 +16,18 @@ from src.providers.gemini import GeminiProvider, fetch_available_models
 from src.providers.openrouter import OpenRouterProvider
 from src.providers.openai import OpenAIProvider
 from src.providers.anthropic import AnthropicProvider
+from src.providers.groq import GroqProvider
 from src.core.orchestrator import Orchestrator
 from src.core.memory import memory_core
 
 console = Console()
+_interrupt_event = threading.Event()
+
+def _signal_handler(signum, frame):
+    _interrupt_event.set()
+    console.print("\n[yellow]⚠️ Interrupt signal received...[/yellow]")
+
+signal.signal(signal.SIGINT, _signal_handler)
 
 class CC:
     @staticmethod
@@ -29,15 +39,27 @@ class ZervGenCLI:
     def __init__(self):
         self.config = load_config()
         self.orchestrator = None
+        self._current_task = None
+
+    async def _init_system_async(self):
+        """Async initialization of the system with proper MCP setup."""
+        provider = self._get_provider()
+        self.orchestrator = Orchestrator(provider, self.config)
+
+        if self.config.mcp_enabled:
+            await self.orchestrator._ensure_mcp()
+        
+        # Connect global interrupt event to orchestrator
+        self._sync_interrupt_events()
+
+    def _sync_interrupt_events(self):
+        """Synchronize global interrupt event with orchestrator's event."""
+        if self.orchestrator and _interrupt_event.is_set():
+            self.orchestrator.request_interrupt()
 
     def _init_system(self):
         try:
-            provider = self._get_provider()
-            self.orchestrator = Orchestrator(provider, self.config)
-
-            if self.config.mcp_enabled:
-                loop = asyncio.get_event_loop()
-                loop.create_task(self.orchestrator.mcp.connect_all())
+            pass
 
         except Exception as e:
             CC.print(f"\n[bold red]SYSTEM INITIALIZATION ERROR: {e}[/bold red]")
@@ -58,6 +80,8 @@ class ZervGenCLI:
             return OpenAIProvider(self.config.openai)
         elif self.config.provider == "anthropic":
             return AnthropicProvider(self.config.anthropic)
+        elif self.config.provider == "groq":
+            return GroqProvider(self.config.groq)
         else:
             return PollinationsProvider(self.config.pollinations)
 
@@ -70,7 +94,7 @@ class ZervGenCLI:
 [bold blue] ███╔╝  ██╔══╝  ██╔══██╗╚██╗ ██╔╝██║   ██║██╔══╝  ██║╚██╗██║[/bold blue]
 [bold purple]███████╗███████╗██║  ██║ ╚████╔╝ ╚██████╔╝███████╗██║ ╚████║[/bold purple]
 [bold purple]╚══════╝╚══════╝╚═╝  ╚═╝  ╚═══╝   ╚═════╝ ╚══════╝╚═╝  ╚═══╝[/bold purple]
-[dim]v1.4.1 - Lightning Core[/dim]
+[dim]v1.4.5 - Secure Core[/dim]
         """
 
         try:
@@ -183,8 +207,7 @@ back     - Return to main menu
             
             if self.orchestrator.set_role(args):
                 CC.print(f"[bold green]⚡ ROLE UPDATED: {args.upper()}[/bold green]")
-                if hasattr(self.orchestrator, 'current_worker'):
-                    delattr(self.orchestrator, 'current_worker')
+
             else:
                 CC.print(f"[bold red]❌ ERROR:[/bold red] Role '{args}' not found in src/skills/")
             return True
@@ -197,8 +220,7 @@ back     - Return to main menu
             mode_key = args.upper()
             if self.orchestrator.set_mode(mode_key):
                 CC.print(f"[bold green]⚡ MODE SHIFTED: {mode_key}[/bold green]")
-                if hasattr(self.orchestrator, 'current_worker'):
-                    delattr(self.orchestrator, 'current_worker')
+
             else:
                 CC.print(f"[bold red]❌ ERROR:[/bold red] Mode '{mode_key}' invalid. Check /help")
             return True
@@ -293,6 +315,12 @@ back     - Return to main menu
                 table.add_row("5", "Model", cfg.model)
                 table.add_row("6", "API Key", key_display)
 
+            elif self.config.provider == "groq":
+                cfg = self.config.groq
+                key_display = "********" if cfg.api_key else "NOT SET"
+                table.add_row("5", "Model", cfg.model)
+                table.add_row("6", "API Key", key_display)
+
             else:
                 cfg = self.config.pollinations
                 key_display = "********" if cfg.api_key else "NOT SET"
@@ -340,8 +368,8 @@ back     - Return to main menu
                 break
 
     def _handle_provider_selection(self):
-        CC.print("\n[1] Pollinations\n[2] Gemini\n[3] OpenRouter\n[4] OpenAI\n[5] Anthropic")
-        p_choice = IntPrompt.ask("Select", choices=["1", "2", "3", "4", "5"])
+        CC.print("\n[1] Pollinations\n[2] Gemini\n[3] OpenRouter\n[4] OpenAI\n[5] Anthropic\n[6] Groq")
+        p_choice = IntPrompt.ask("Select", choices=["1", "2", "3", "4", "5", "6"])
 
         if p_choice == 1:
             self.config.provider = "pollinations"
@@ -361,6 +389,10 @@ back     - Return to main menu
             self.config.provider = "anthropic"
             if not self.config.anthropic.api_key:
                 self.config.anthropic.api_key = Prompt.ask("Enter Anthropic API Key")
+        elif p_choice == 6:
+            self.config.provider = "groq"
+            if not self.config.groq.api_key:
+                self.config.groq.api_key = Prompt.ask("Enter Groq API Key")
 
         self.config.save()
 
@@ -380,6 +412,9 @@ back     - Return to main menu
         elif self.config.provider == "anthropic":
             CC.print("[dim]Enter Anthropic model (e.g. 'claude-3-5-sonnet-20240620')[/dim]")
             self.config.anthropic.model = Prompt.ask("Model", default="claude-3-5-sonnet-20240620")
+        elif self.config.provider == "groq":
+            CC.print("[dim]Enter Groq model (e.g. 'llama3-8b-8192')[/dim]")
+            self.config.groq.model = Prompt.ask("Model", default="llama3-8b-8192")
         else:
             self.config.pollinations.text_model = Prompt.ask("Model", choices=["openai", "mistral", "searchgpt"], default="openai")
 
@@ -392,6 +427,8 @@ back     - Return to main menu
             self.config.openai.api_key = Prompt.ask("API Key")
         elif self.config.provider == "anthropic":
             self.config.anthropic.api_key = Prompt.ask("API Key")
+        elif self.config.provider == "groq":
+            self.config.groq.api_key = Prompt.ask("API Key")
         else:
             self.config.pollinations.api_key = Prompt.ask("API Key")
 
@@ -434,13 +471,20 @@ back     - Return to main menu
                 pass
 
     async def chat_loop(self):
+        global _interrupt_event
+        
         if not self.orchestrator:
-            self._init_system()
+            await self._init_system_async()
 
         self.print_banner()
         CC.print("\n[dim]Ready. Commands: /help. Ctrl+C to cancel generation.[/dim]\n")
 
         while True:
+            # Reset interrupt state at the start of each iteration
+            _interrupt_event.clear()
+            if self.orchestrator:
+                self.orchestrator.interrupt_event.clear()
+            
             try:
                 try:
                     user_input = Prompt.ask("[bold purple]USER[/bold purple]")
@@ -460,26 +504,63 @@ back     - Return to main menu
                     if self.handle_system_command(user_input):
                         continue
 
+                # Create and track the processing task
+                self._current_task = asyncio.create_task(self.orchestrator.process(user_input))
+                
                 try:
-                    task = asyncio.create_task(self.orchestrator.process(user_input))
-                    response = await task
+                    # Wait for completion while checking for interrupts
+                    while not self._current_task.done():
+                        # Check if interrupt was requested via signal
+                        if _interrupt_event.is_set():
+                            self.orchestrator.request_interrupt()
+                            _interrupt_event.clear()
+                        
+                        # Wait a short time for task completion
+                        try:
+                            await asyncio.wait_for(asyncio.shield(self._current_task), timeout=0.1)
+                            break  # Task completed
+                        except asyncio.TimeoutError:
+                            continue  # Check for interrupt again
+                    
+                    # Get the result
+                    response = await self._current_task
+                    self._current_task = None
 
                     if response and response.strip():
-                        CC.print(Panel(Markdown(response), border_style="purple"))
+                        if "interrupted" in response.lower():
+                            CC.print(Panel(Markdown(response), border_style="yellow"))
+                        else:
+                            CC.print(Panel(Markdown(response), border_style="purple"))
 
                 except asyncio.CancelledError:
                     CC.print("\n[bold red]Generation Cancelled.[/bold red]")
+                    self._current_task = None
                 except KeyboardInterrupt:
-                    task.cancel()
+                    # Handle keyboard interrupt during processing
+                    CC.print("\n[yellow]Stopping generation...[/yellow]")
+                    self.orchestrator.request_interrupt()
+                    
+                    # Give the orchestrator a chance to finish gracefully
                     try:
-                        await task
+                        response = await asyncio.wait_for(self._current_task, timeout=2.0)
+                        if response and response.strip():
+                            CC.print(Panel(Markdown(response), border_style="yellow"))
+                    except asyncio.TimeoutError:
+                        CC.print("\n[red]Force stopping...[/red]")
+                        self._current_task.cancel()
+                        try:
+                            await self._current_task
+                        except asyncio.CancelledError:
+                            pass
                     except asyncio.CancelledError:
                         pass
-                    CC.print("\n[bold red]✋ Stopped.[/bold red]")
+                    self._current_task = None
+                    
             except EOFError:
                 return
             except Exception as e:
                 CC.print(f"[bold red]System Error:[/bold red] {e}")
+                self._current_task = None
 
     async def run(self):
         while True:
