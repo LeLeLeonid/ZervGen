@@ -913,7 +913,8 @@ async def scan_tools(**kwargs) -> str:
     return "\n".join([f"- {name}" for name in TOOL_REGISTRY.keys()])
 
 
-async def find_skill(tags, **kwargs) -> str:
+async def find_skill(tags, agent=None, **kwargs) -> str:
+    """Find skill by tags and inject tools into calling agent."""
     from src.skills_loader import skill_index
     
     if tags is None:
@@ -933,11 +934,26 @@ async def find_skill(tags, **kwargs) -> str:
     if not skill:
         return f"No skill found for tags: {tags}"
     
-    return json.dumps({
+    # Extract tool names from skill context
+    import re
+    tool_pattern = r'(\w+)\s*\('
+    mentioned_tools = set(re.findall(tool_pattern, skill.context))
+    
+    # Inject tools into agent if provided
+    injected = []
+    if agent and hasattr(agent, 'tools'):
+        for tool_name in mentioned_tools:
+            if tool_name in TOOL_REGISTRY and tool_name not in agent.tools:
+                agent.tools[tool_name] = TOOL_REGISTRY[tool_name]
+                injected.append(tool_name)
+    
+    result = {
         "skill": skill.name,
         "description": skill.description,
-        "context": skill.context
-    }, ensure_ascii=False)
+        "context": skill.context,
+        "tools_injected": injected
+    }
+    return json.dumps(result, ensure_ascii=False)
 
 
 async def add_memory(content: str, category: str = "general", **kwargs) -> str:

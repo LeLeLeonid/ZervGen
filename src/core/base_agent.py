@@ -164,6 +164,9 @@ class BaseAgent:
             func = self.tools[tool_name]
             try:
                 tool_timeout = getattr(self.settings, 'tool_timeout', 60)
+                # Pass agent reference to find_skill for tool injection
+                if tool_name == "find_skill":
+                    args["agent"] = self
                 if asyncio.iscoroutinefunction(func):
                     result = await asyncio.wait_for(func(**args), timeout=tool_timeout)
                 else:
