@@ -13,3 +13,5 @@ mss>=9.0.1
 pillow>=10.0.0
 chromadb>=1.4.1
 aiofiles>=23.0.0
+openai>=1.0.0
+nest-asyncio>=1.6.0

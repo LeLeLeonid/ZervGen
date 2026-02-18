@@ -5,41 +5,66 @@ import signal
 from pathlib import Path
 from rich.console import Console
 
-sys.path.append(str(Path(__file__).parent))
-
-from src.cli import main
-
 console = Console()
 
-def handle_exit(sig, frame):
-    os._exit(0)
 
-async def main_with_cleanup():
-    """Main entry point with proper MCP cleanup."""
+async def graceful_shutdown(sig):
+    console.print("\n[dim]Shutting down gracefully...[/dim]")
+    try:
+        from src.core.memory import memory_core
+        if memory_core and hasattr(memory_core, '_save_kg'):
+            memory_core._save_kg()
+        from src.core.provider import close_http_client
+        await close_http_client()
+        console.print("[dim]Session saved.[/dim]")
+    except Exception as e:
+        console.print(f"[dim]Warning: Could not save session: {e}[/dim]")
+    sys.exit(0)
+
+
+def handle_exit(sig, frame):
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.create_task(graceful_shutdown(sig))
+        else:
+            os._exit(0)
+    except RuntimeError:
+        os._exit(0)
+
+
+async def main():
     from src.cli import ZervGenCLI
     cli = ZervGenCLI()
     try:
         await cli.run()
     finally:
-        if cli.orchestrator and cli.orchestrator.mcp:
-            try:
-                await cli.orchestrator.mcp.cleanup()
-            except Exception:
-                pass
+        pass
 
-if __name__ == "__main__":
-    signal.signal(signal.SIGINT, handle_exit)
-    signal.signal(signal.SIGTERM, handle_exit)
 
-    if sys.platform == 'win32':
+def run_app():
+    is_windows = sys.platform == 'win32'
+    
+    if is_windows:
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    else:
+        signal.signal(signal.SIGINT, handle_exit)
+        signal.signal(signal.SIGTERM, handle_exit)
 
     try:
-        asyncio.run(main_with_cleanup())
+        asyncio.run(main())
     except KeyboardInterrupt:
-        os._exit(0)
-    except Exception as e:
-        if "RuntimeError" in str(e) or "CancelledError" in str(e):
+        if is_windows:
+            try:
+                asyncio.run(graceful_shutdown(signal.SIGINT))
+            except Exception:
+                os._exit(0)
+        else:
             os._exit(0)
-        console.print(f"\n[bold red]CRITICAL ERROR:[/bold red] {e}")
+    except Exception as e:
+        console.print(f"\n[bold red]Error:[/bold red] {str(e).replace('[', '\\[')}")
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    run_app()

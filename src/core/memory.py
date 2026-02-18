@@ -1,306 +1,260 @@
+import asyncio
 import json
+import logging
+import threading
 import time
 import uuid
-import os
+from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Tuple
+
+logger = logging.getLogger(__name__)
+
+try:
+    import aiofiles
+except ImportError:
+    aiofiles = None
 
 try:
     import chromadb
-    CHROMA_AVAILABLE = True
 except ImportError:
-    CHROMA_AVAILABLE = False
-    print("[Memory] Warning: 'chromadb' not found. Semantic search disabled.")
+    chromadb = None
 
-MEMORY_DIR = Path("tmp") / "memory"
-SESSIONS_DIR = MEMORY_DIR / "sessions"
-KG_FILE = MEMORY_DIR / "knowledge_graph.json"
-VECTOR_DIR = MEMORY_DIR / "vector_store"
 
-MEMORY_DIR.mkdir(parents=True, exist_ok=True)
-SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+class MemoryCore:
+    _instance = None
+    _lock = threading.Lock()
 
-class MemoryManager:
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
+
     def __init__(self):
-        self.kg_data = self._load_kg()
-        self.current_session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        self.session_file = SESSIONS_DIR / f"{self.current_session_id}.jsonl"
-        self.history_buffer = [] 
+        if self._initialized:
+            return
+        self._initialized = True
+        
+        self._memory_dir = Path("tmp/memory")
+        self._sessions_dir = self._memory_dir / "sessions"
+        self._kg_file = self._memory_dir / "knowledge_graph.json"
+        self._vector_dir = self._memory_dir / "vector_store"
+        
+        self._memory_dir.mkdir(parents=True, exist_ok=True)
+        self._sessions_dir.mkdir(parents=True, exist_ok=True)
+        
+        self._short_term: deque = deque(maxlen=100)
+        self._kg_data = self._load_kg()
+        
         self.chroma_client = None
         self.collection = None
-        if CHROMA_AVAILABLE:
+        if chromadb:
             try:
-                self.chroma_client = chromadb.PersistentClient(path=str(VECTOR_DIR))
-                self.collection = self.chroma_client.get_or_create_collection(name="zervgen_facts")
+                self.chroma_client = chromadb.PersistentClient(path=str(self._vector_dir))
+                self.collection = self.chroma_client.get_or_create_collection("zervgen_facts")
             except Exception as e:
-                print(f"[Memory] Vector DB Init Error: {e}")
-
-        self.stats = {
-            "total_memories": len(self.kg_data.get("facts", [])),
-            "successful_queries": 0,
-            "vector_enabled": self.collection is not None,
-            "evolution_events": 0
-        }
+                logger.warning(f"Vector DB init failed: {e}")
         
+        self._session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._session_file = self._sessions_dir / f"session_{self._session_id}.jsonl"
+        self._async_lock = asyncio.Lock()
+
     def _load_kg(self) -> Dict[str, Any]:
-        if KG_FILE.exists():
+        if self._kg_file.exists():
             try:
-                with open(KG_FILE, "r", encoding="utf-8") as f:
+                with open(self._kg_file, "r", encoding="utf-8") as f:
                     return json.load(f)
-            except:
-                return {"facts": []}
+            except Exception:
+                pass
         return {"facts": []}
 
     def _save_kg(self):
-        with open(KG_FILE, "w", encoding="utf-8") as f:
-            json.dump(self.kg_data, f, indent=2, ensure_ascii=False)
-        self.stats["total_memories"] = len(self.kg_data["facts"])
+        with open(self._kg_file, "w", encoding="utf-8") as f:
+            json.dump(self._kg_data, f, indent=2, ensure_ascii=False)
 
-    def log_event(self, role: str, content: Any = "", event_type: str = "message"):
-        try:
-            from src.config import load_config
-            cfg = load_config()
-            truncate = cfg.log_truncation
-        except:
-            truncate = True
-
-        disk_data = content
-        
-        if truncate and isinstance(content, dict) and "result" in content:
-            disk_data = content.copy()
-            tool = disk_data.get("tool")
-            args = disk_data.get("args", {})
-            result_str = str(disk_data.get("result", ""))
-
-            if tool == "read_files":
-                paths = args.get("paths", args.get("path", "unknown"))
-                disk_data["result"] = f"File(s) read: {paths}"
-            elif len(result_str) > 1000:
-                disk_data["result"] = result_str[:200] + f" ... [TRUNCATED {len(result_str)} chars] ..."
-
-        entry = {
-            "timestamp": datetime.now().isoformat(),
-            "role": role,
-            "event": event_type,
-            "data": disk_data
-        }
-        
-        try:
-            with open(self.session_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        except: pass
-
-        if event_type in ["message", "tool_result", "thought", "final_answer"]:
-            if isinstance(content, dict) and "result" in content:
-                obs = f"\nTool: {content.get('tool')}\nResult: {content.get('result')}"
-                self.history_buffer.append({"role": role, "content": obs})
-            else:
-                self.history_buffer.append({"role": role, "content": str(content)})
-
-    def load_session_from_file(self, filename: str) -> List[Dict]:
-        path = SESSIONS_DIR / filename
-        if not path.exists(): return []
-        reconstructed_history = []
-        valid_lines = 0
-        errors = 0
-
-        # Valid roles for LLM APIs
-        VALID_ROLES = {"system", "user", "assistant"}
-
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        entry = json.loads(line)
-                        role = entry.get("role")
-                        event = entry.get("event")
-                        data = entry.get("data")
-                        
-                        content = ""
-                        if isinstance(data, dict) and "result" in data:
-                             content = f"\nTool: {data.get('tool')}\nResult: {data.get('result')}"
-                        elif isinstance(data, dict) and "content" in data:
-                             content = data["content"]
-                        else:
-                             content = str(data)
-
-                        # Map non-standard roles to valid ones
-                        if role and role not in VALID_ROLES:
-                            if role.startswith("agent:") or role.startswith("delegate:"):
-                                role = "assistant"
-                            elif role == "system_event":
-                                continue  # Skip system events
-                            else:
-                                role = "assistant"  # Default fallback
-
-                        if event in ["message", "tool_result", "thought", "final_answer", "input"]:
-                            reconstructed_history.append({"role": role, "content": content})
-                        
-                        valid_lines += 1
-                    except json.JSONDecodeError:
-                        errors += 1
-                        continue
-            
-            self.session_file = path
-            self.current_session_id = path.stem
-            self.history_buffer = reconstructed_history
-            
-            self.log_event("system", "Session Resumed From Log", "system_event")
-            
-            if errors > 0:
-                print(f"[Memory] Loaded {valid_lines} lines. Skipped {errors} corrupted lines.")
-                
-            return reconstructed_history
-        except Exception as e:
-            print(f"Error loading session: {e}")
-            return []
-
-    def get_recent_memories(self, limit=5) -> str:
-        facts = self.kg_data.get("facts", [])
-        if not facts: return "No long-term memories."
-        recents = facts[-limit:]
-        return "RECENT MEMORIES:\n" + "\n".join([f"- {r.get('content')}" for r in recents])
-
-    def add_memory(self, content: str, category: str = "general", *args, **kwargs):
+    def add_memory(self, content: str, category: str = "general") -> str:
         fact = {
             "id": str(uuid.uuid4())[:8],
             "timestamp": time.time(),
             "content": str(content),
             "category": str(category)
         }
-        self.kg_data.setdefault("facts", []).append(fact)
+        self._kg_data.setdefault("facts", []).append(fact)
         self._save_kg()
-
-        # Vector DB
+        
+        self._short_term.append({
+            "id": fact["id"], "content": content, "category": category,
+            "timestamp": datetime.now().isoformat()
+        })
+        
         if self.collection:
             try:
                 self.collection.add(
-                    documents=[str(content)],
+                    documents=[content],
                     metadatas=[{"category": category, "timestamp": fact["timestamp"]}],
                     ids=[fact["id"]]
                 )
-                return f"Memory stored (Vectorized): [{category}] {content}"
-            except Exception as e:
-                return f"Memory stored (JSON only, Vector failed): {e}"
+            except Exception:
+                pass
         
-        return f"Memory stored (JSON only): [{category}] {content}"
+        return f"Memory stored: [{category}] {content[:100]}"
 
-    def search_memory(self, query: str, mode: str = "semantic", *args, **kwargs) -> str:
+    def search_memory(self, query: str, limit: int = 5) -> List[Dict]:
+        K = 60
+        semantic, keyword = [], []
+        
         if self.collection:
             try:
-                results = self.collection.query(
-                    query_texts=[query],
-                    n_results=5
-                )
-                found = results['documents'][0]
-                if found:
-                    self.stats["successful_queries"] += 1
-                    return "RELEVANT MEMORIES (Semantic):\n" + "\n".join([f"- {doc}" for doc in found])
-            except Exception as e:
-                print(f"Vector search failed: {e}")
+                results = self.collection.query(query_texts=[query], n_results=limit * 2)
+                if results["documents"] and results["documents"][0]:
+                    semantic = [{"content": d, "rank": i + 1} for i, d in enumerate(results["documents"][0])]
+            except Exception:
+                pass
+        
+        query_lower = query.lower()
+        for i, fact in enumerate(self._kg_data.get("facts", [])):
+            content = fact.get("content", "")
+            if query_lower in content.lower():
+                keyword.append({"content": content, "rank": i + 1})
+        
+        rrf_scores: Dict[str, float] = {}
+        for r in semantic:
+            rrf_scores[r["content"]] = rrf_scores.get(r["content"], 0) + 1 / (K + r["rank"])
+        for r in keyword:
+            rrf_scores[r["content"]] = rrf_scores.get(r["content"], 0) + 1 / (K + r["rank"])
+        
+        sorted_results = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+        return [{"content": c, "score": s} for c, s in sorted_results[:limit]]
 
-        # Old way
-        results = []
-        for fact in self.kg_data.get("facts", []):
-            if query.lower() in fact.get("content", "").lower():
-                results.append(f"- [{fact.get('category', 'general')}] {fact.get('content')}")
-        return "FOUND MEMORIES (Text Match):\n" + "\n".join(results[-10:]) if results else "No relevant memories found."
+    def get_recent_memories(self, limit: int = 10) -> List[Dict]:
+        return list(self._short_term)[-limit:]
 
     def evolve(self) -> str:
-        self.stats["evolution_events"] += 1
-        facts = self.kg_data.get("facts", [])
-        if len(facts) < 5: return "Not enough data."
-        unique = {f["content"]: f for f in facts}.values()
-        removed = len(facts) - len(unique)
+        facts = self._kg_data.get("facts", [])
+        if len(facts) < 5:
+            return "Not enough data."
+        
+        seen = {f.get("content", ""): f for f in facts}
+        removed = len(facts) - len(seen)
         if removed > 0:
-            self.kg_data["facts"] = list(unique)
+            self._kg_data["facts"] = list(seen.values())
             self._save_kg()
-            return f"Cleaned {removed} duplicates."
+            return f"Removed {removed} duplicates."
         return "Memory optimal."
 
-    def get_stats(self) -> str:
-        return str(self.stats)
-
-
-class TodoManager:
-    """Manages TODO items for the orchestrator."""
-    
-    def __init__(self):
-        self.todo_file = Path("tmp") / "todos.json"
-        self.todos = self._load_todos()
-    
-    def _load_todos(self) -> List[Dict]:
-        if self.todo_file.exists():
-            try:
-                with open(self.todo_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except:
-                return []
-        return []
-    
-    def _save_todos(self):
-        self.todo_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.todo_file, "w", encoding="utf-8") as f:
-            json.dump(self.todos, f, indent=2)
-    
-    def add(self, task: str) -> str:
-        todo = {
-            "id": str(uuid.uuid4())[:8],
-            "task": task,
-            "done": False,
-            "created_at": time.time()
+    async def log_event(self, role: str, content: str, event_type: str = "message"):
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "role": role, "content": content, "type": event_type
         }
-        self.todos.append(todo)
-        self._save_todos()
-        return f"Added TODO: {task}"
+        async with self._async_lock:
+            try:
+                if aiofiles:
+                    async with aiofiles.open(self._session_file, "a", encoding="utf-8") as f:
+                        await f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                else:
+                    self._write_entry(entry)
+            except Exception as e:
+                logger.error(f"Log error: {e}")
+
+    def log_event_sync(self, role: str, content: str, event_type: str = "message"):
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "role": role, "content": content, "type": event_type
+        }
+        self._write_entry(entry)
     
-    def list(self) -> str:
-        if not self.todos:
-            return "No TODOs."
-        lines = []
-        for t in self.todos:
-            status = "[x]" if t.get("done") else "[ ]"
-            lines.append(f"{status} {t.get('task', '')}")
-        return "\n".join(lines)
+    def log_full(self, role: str, content: str, tool: str = "", args: dict = None, title: str = ""):
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "agent": role,
+            "output": content[:2000] if content else "",
+            "tool": tool,
+            "input": args or {},
+            "title": title,
+        }
+        self._write_entry(entry)
     
-    def done(self, todo_id: str) -> str:
-        for t in self.todos:
-            if t.get("id") == todo_id:
-                t["done"] = True
-                self._save_todos()
-                return f"Marked done: {t.get('task')}"
-        return "TODO not found"
-    
-    def remove(self, todo_id: str) -> str:
-        original_len = len(self.todos)
-        self.todos = [t for t in self.todos if t.get("id") != todo_id]
-        self._save_todos()
-        if len(self.todos) < original_len:
-            return "TODO removed"
-        return "TODO not found"
-    
-    def clear(self) -> str:
-        self.todos = []
-        self._save_todos()
-        return "All TODOs cleared"
-    
-    def get_orchestrator_view(self) -> str:
-        """Returns formatted TODO list for orchestrator system prompt."""
-        if not self.todos:
-            return "No active TODOs."
-        active = [t for t in self.todos if not t.get("done")]
-        completed = [t for t in self.todos if t.get("done")]
+    def _write_entry(self, entry: Dict):
+        try:
+            with open(self._session_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.error(f"Log error: {e}")
+
+    def _parse_entry_to_history(self, entry: Dict, history: List[Dict]) -> str:
+        if entry.get("type") == "task" or entry.get("role") == "user":
+            history.append({"role": "user", "content": entry.get("content", "")})
+        elif entry.get("role") == "assistant":
+            history.append({"role": "assistant", "content": entry.get("content", "")})
+        elif entry.get("agent") and entry.get("tool"):
+            agent_name = entry.get("agent", "Agent")
+            tool_name = entry.get("tool", "")
+            output = entry.get("output", "")
+            title = entry.get("title", "")
+            args = entry.get("input", {})
+            
+            if tool_name in ["start", "delegate_to"]:
+                return entry.get("mode", "")
+            
+            if tool_name == "response":
+                history.append({"role": "assistant", "content": output})
+            else:
+                json_action = json.dumps({"title": title, "tool": tool_name, "args": args})
+                history.append({"role": "assistant", "content": json_action})
+                history.append({"role": "user", "content": output})
         
-        lines = []
-        if active:
-            lines.append("ACTIVE:")
-            for t in active:
-                lines.append(f"  - [{t.get('id', '???')}] {t.get('task', '')}")
-        if completed:
-            lines.append(f"COMPLETED: {len(completed)}")
-        return "\n".join(lines) if lines else "No active TODOs."
+        return entry.get("mode", "")
+
+    async def load_session(self, filename: str) -> Tuple[List[Dict], str]:
+        filepath = self._sessions_dir / filename
+        if not filepath.exists():
+            return [], "build"
+        
+        history, mode = [], "build"
+        
+        try:
+            if aiofiles:
+                async with aiofiles.open(filepath, "r", encoding="utf-8") as f:
+                    async for line in f:
+                        line = line.strip()
+                        if line:
+                            entry = json.loads(line)
+                            entry_mode = self._parse_entry_to_history(entry, history)
+                            if entry_mode:
+                                mode = entry_mode
+            else:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            entry = json.loads(line)
+                            entry_mode = self._parse_entry_to_history(entry, history)
+                            if entry_mode:
+                                mode = entry_mode
+            
+            self._session_file = filepath
+            self._session_id = filename.replace("session_", "").replace(".jsonl", "")
+                            
+        except Exception as e:
+            logger.error(f"Load session error: {e}")
+        
+        return history, mode
+
+    def get_stats(self) -> Dict[str, Any]:
+        return {
+            "short_term_count": len(self._short_term),
+            "kg_facts": len(self._kg_data.get("facts", [])),
+            "vector_enabled": self.collection is not None,
+            "session_id": self._session_id,
+        }
+
+    def clear_short_term(self):
+        self._short_term.clear()
 
 
-memory_core = MemoryManager()
-todo_manager = TodoManager()
+memory_core = MemoryCore()

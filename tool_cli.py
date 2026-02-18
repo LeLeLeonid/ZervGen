@@ -8,10 +8,9 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.syntax import Syntax
+from src.tools import TOOL_REGISTRY
 
 sys.path.append(str(Path(__file__).parent))
-
-from src.tools import TOOL_REGISTRY, debug_system_prompt
 
 console = Console()
 
@@ -41,45 +40,36 @@ async def run_tool_session():
             
             if choice.lower() in ['q', 'exit']:
                 break
-            
-            # --- BRAIN SIMULATION MODE ---
-            if choice == "0":
-                console.print("\n[bold cyan]--- STEP 1: INJECT USER INPUT ---[/bold cyan]")
-                mock_user_input = Prompt.ask("User says")
-                
-                # 1. Get the Real Context
-                with console.status("Constructing Context..."):
-                    sys_prompt = await debug_system_prompt()
-                
-                # 2. Show what the AI sees
-                full_view = f"{sys_prompt}\n\n=== CHAT HISTORY ===\nUser: {mock_user_input}\nAssistant: (WAITING FOR YOU)"
-                console.print(Panel(Syntax(full_view, "markdown", theme="monokai"), title="[bold yellow]WHAT THE AI SEES (CONTEXT WINDOW)[/bold yellow]"))
-                
-                # 3. You act as the AI
-                console.print("\n[bold cyan]--- STEP 2: YOU ARE THE MODEL ---[/bold cyan]")
-                console.print("[dim]Type the JSON to execute a tool. Example: {\"tool\": \"web_search\", \"args\": {\"query\": \"news\"}}[/dim]")
-                
-                json_input = Prompt.ask("Your Output")
-                
-                # 4. Execute logic
+
+            # Handle SIMULATE BRAIN mode (option 0)
+            if choice.strip() == "0":
+                console.print("\n[bold yellow]SIMULATE BRAIN MODE[/bold yellow]")
+                console.print("[dim]Enter JSON with 'tool' and 'args' keys[/dim]")
+                json_input = Prompt.ask("[bold cyan]JSON Input[/bold cyan]")
+
                 try:
                     data = json.loads(json_input)
                     tool_name = data.get("tool")
                     args = data.get("args", {})
-                    
+
+                    if not tool_name:
+                        console.print("[bold red]Error: 'tool' key missing in JSON[/bold red]")
+                        await asyncio.sleep(2)
+                        continue
+
                     if tool_name not in TOOL_REGISTRY:
                         console.print(f"[bold red]Error:[/bold red] Tool '{tool_name}' not found.")
                         await asyncio.sleep(2)
                         continue
-                        
+
                     func = TOOL_REGISTRY[tool_name]
-                    
+
                     with console.status(f"[bold green]Executing {tool_name}...[/bold green]"):
                         if inspect.iscoroutinefunction(func):
                             result = await func(**args)
                         else:
                             result = func(**args)
-                            
+
                     console.print(Panel(str(result), title=f"[bold green]OBSERVATION (System Output)[/bold green]"))
                     Prompt.ask("\n[dim]Press Enter to return...[/dim]")
                     continue
