@@ -22,7 +22,7 @@ from src.core.memory import memory_core
 from src.core.orchestrator import Orchestrator
 from src.core.provider import get_provider, get_model_name, list_providers
 from src.skills_loader import get_all_roles
-from src.utils import format_token_display, get_global_tokens, reset_global_tokens, count_tokens
+from src.utils import format_token_display, get_global_tokens, reset_global_tokens, count_tokens, add_global_tokens
 
 console = Console()
 _interrupt_event = threading.Event()
@@ -296,7 +296,6 @@ class ZervGenCLI:
         return True
 
     async def _load_session(self) -> bool:
-        from src.utils import add_global_tokens
         sessions_dir = Path("tmp/memory/sessions")
         if not sessions_dir.exists():
             CC.print("[red]No sessions found.[/red]")
