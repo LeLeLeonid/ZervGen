@@ -33,8 +33,7 @@ class Provider(AIProvider):
             "messages": messages,
             "temperature": self.settings.temperature,
             "max_tokens": self.settings.max_tokens,
-            "top_p": self.settings.top_p,
-            "stream": False
+            "top_p": self.settings.top_p
         }
         
         client = get_http_client()

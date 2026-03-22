@@ -1,7 +1,6 @@
-import asyncio
+import importlib
 import logging
 import time
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
@@ -10,62 +9,82 @@ from src.config import GlobalSettings
 
 logger = logging.getLogger(__name__)
 
-HTTP_CLIENT: Optional[httpx.AsyncClient] = None
+
+class CircuitBreakerError(Exception):
+    pass
+
+
 CIRCUIT_BREAKER_THRESHOLD = 5
-CIRCUIT_BREAKER_RESET = 60.0
-_provider_failures: Dict[str, int] = {}
-_circuit_open: Dict[str, float] = {}
+CIRCUIT_BREAKER_RESET_SECONDS = 10.0
+
+class CircuitBreaker:
+    def __init__(self, threshold: int = CIRCUIT_BREAKER_THRESHOLD, reset_seconds: float = CIRCUIT_BREAKER_RESET_SECONDS):
+        self._threshold = threshold
+        self._reset_seconds = reset_seconds
+        self._failures: Dict[str, int] = {}
+        self._open_at: Dict[str, float] = {}
+
+    def is_available(self, provider: str) -> bool:
+        if provider not in self._open_at:
+            return True
+        if time.time() - self._open_at[provider] > self._reset_seconds:
+            del self._open_at[provider]
+            self._failures[provider] = 0
+            return True
+        return False
+
+    def record_failure(self, provider: str) -> None:
+        self._failures[provider] = self._failures.get(provider, 0) + 1
+        if self._failures[provider] >= self._threshold:
+            self._open_at[provider] = time.time()
+            logger.warning(f"Circuit breaker OPEN for {provider}")
+
+    def record_success(self, provider: str) -> None:
+        self._failures[provider] = 0
+        self._open_at.pop(provider, None)
+
+    def get_health(self, providers: List[str]) -> Dict[str, Dict[str, Any]]:
+        return {
+            name: {
+                "failures": self._failures.get(name, 0),
+                "circuit_open": name in self._open_at,
+                "available": self.is_available(name)
+            }
+            for name in providers
+        }
 
 
-def get_http_client() -> httpx.AsyncClient:
-    global HTTP_CLIENT
-    if HTTP_CLIENT is None or HTTP_CLIENT.is_closed:
-        HTTP_CLIENT = httpx.AsyncClient(
-            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
-            timeout=httpx.Timeout(120.0, connect=30.0)
-        )
-    return HTTP_CLIENT
+class HttpClientManager:
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._client = None
+        return cls._instance
+
+    def get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+                timeout=httpx.Timeout(120.0, connect=30.0)
+            )
+        return self._client
+
+    async def close(self) -> None:
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+        self._client = None
 
 
-async def close_http_client() -> None:
-    global HTTP_CLIENT
-    if HTTP_CLIENT and not HTTP_CLIENT.is_closed:
-        await HTTP_CLIENT.aclose()
-    HTTP_CLIENT = None
-
-
-def _check_circuit(provider: str) -> bool:
-    if provider not in _circuit_open:
-        return True
-    if time.time() - _circuit_open[provider] > CIRCUIT_BREAKER_RESET:
-        del _circuit_open[provider]
-        _provider_failures[provider] = 0
-        return True
-    return False
-
-
-def _record_failure(provider: str) -> None:
-    _provider_failures[provider] = _provider_failures.get(provider, 0) + 1
-    if _provider_failures[provider] >= CIRCUIT_BREAKER_THRESHOLD:
-        _circuit_open[provider] = time.time()
-        logger.warning(f"Circuit breaker OPEN for {provider}")
-
-
-def _record_success(provider: str) -> None:
-    _provider_failures[provider] = 0
-    if provider in _circuit_open:
-        del _circuit_open[provider]
+_circuit_breaker = CircuitBreaker()
+_http_manager = HttpClientManager()
 
 
 @runtime_checkable
 class AIProvider(Protocol):
-    @abstractmethod
-    async def generate_text(self, history: List[Dict[str, str]], system_prompt: str) -> str:
-        ...
-
-    @abstractmethod
-    def get_model_name(self) -> str:
-        ...
+    async def generate_text(self, history: List[Dict[str, str]], system_prompt: str) -> str: ...
+    def get_model_name(self) -> str: ...
 
 
 @dataclass
@@ -94,7 +113,6 @@ def _load_provider_class(name: str) -> Optional[type]:
     if not meta:
         return None
     try:
-        import importlib
         module = importlib.import_module(meta.module)
         return getattr(module, "Provider", None)
     except Exception as e:
@@ -103,13 +121,12 @@ def _load_provider_class(name: str) -> Optional[type]:
 
 
 def get_provider(name: str, settings: GlobalSettings) -> Any:
-    if not _check_circuit(name):
-        raise Exception(f"Circuit breaker OPEN for {name}. Provider temporarily unavailable.")
-    
+    if not _circuit_breaker.is_available(name):
+        logger.warning(f"Circuit breaker OPEN for {name}")
+        raise CircuitBreakerError(f"Circuit breaker OPEN for {name}. Provider temporarily unavailable.")
     provider_class = _load_provider_class(name)
     if not provider_class:
         raise ValueError(f"Provider '{name}' not found")
-    
     provider_settings = getattr(settings, name.lower(), None)
     return provider_class(provider_settings or settings)
 
@@ -130,11 +147,20 @@ def clear_provider_cache() -> None:
 
 
 def get_provider_health() -> Dict[str, Dict[str, Any]]:
-    return {
-        name: {
-            "failures": _provider_failures.get(name, 0),
-            "circuit_open": name in _circuit_open,
-            "available": _check_circuit(name)
-        }
-        for name in PROVIDERS
-    }
+    return _circuit_breaker.get_health(list(PROVIDERS.keys()))
+
+
+def get_http_client() -> httpx.AsyncClient:
+    return _http_manager.get_client()
+
+
+async def close_http_client() -> None:
+    await _http_manager.close()
+
+
+def _record_failure(provider: str) -> None:
+    _circuit_breaker.record_failure(provider)
+
+
+def _record_success(provider: str) -> None:
+    _circuit_breaker.record_success(provider)
