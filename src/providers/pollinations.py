@@ -44,8 +44,7 @@ class Provider(AIProvider):
             payload = {
                 "model": self.settings.text_model,
                 "messages": [{"role": "system", "content": system_prompt}] + short_history,
-                "temperature": 0.7,
-                "stream": False
+                "temperature": 0.7
             }
             if self.settings.reasoning_effort != "minimal":
                 payload["reasoning_effort"] = self.settings.reasoning_effort

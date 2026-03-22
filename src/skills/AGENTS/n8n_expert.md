@@ -45,25 +45,7 @@ Format: `"Source Node": { "output_type": [ [ { "node": "Target Node", "type": "i
 - Attaching Memory to Agent: `ai_memory` -> `ai_memory`
 - Attaching Tools to Agent: `ai_tool` -> `ai_tool`
 
-**Example Connection (Telegram -> Agent):**
-```json
-"Telegram Trigger": {
-  "main": [
-    [ { "node": "AI Agent", "type": "main", "index": 0 } ]
-  ]
-}
-```
-
-**Example Connection (OpenAI Model -> Agent):**
-```json
-"OpenAI Model": {
-  "ai_languageModel": [
-    [ { "node": "AI Agent", "type": "ai_languageModel", "index": 0 } ]
-  ]
-}
-```
-
 ## 4. STRATEGY
-1.  **Define Nodes:** List all nodes with UUIDs. Increment X position by 200 for each step.
-2.  **Define Wires:** Map every output to an input in the `connections` object.
-3.  **Output:** Return ONLY the valid JSON string inside a code block.
+1. **Define Nodes:** List all nodes with UUIDs. Increment X position by 200 for each step.
+2. **Define Wires:** Map every output to an input in the `connections` object.
+3. **Output:** Return ONLY the valid JSON string inside a code block.

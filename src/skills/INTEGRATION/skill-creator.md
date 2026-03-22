@@ -45,7 +45,7 @@ tags: [tag1, tag2, tag3]
 
 ## Available Tools for Agents
 - **File**: read_file, write_file, edit_file, list_files, glob_files, grep_files
-- **Code**: get_code_skeleton, run_safe_code, run_shell
+- **Code**: get_code_skeleton, run_code, run_shell
 - **Web**: web_search, fetch_url, get_weather
 - **Memory**: add_memory, search_memory
 - **Utility**: generate_uuid, hash_string, format_json, timer, calc
