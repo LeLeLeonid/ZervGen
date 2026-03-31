@@ -12,8 +12,8 @@ async def graceful_shutdown(sig):
     console.print("\n[dim]Shutting down gracefully...[/dim]")
     try:
         from src.core.memory import memory_core
-        if memory_core and hasattr(memory_core, '_save_kg'):
-            memory_core._save_kg()
+        if memory_core:
+            memory_core._kg.save()
         from src.core.provider import close_http_client
         await close_http_client()
         console.print("[dim]Session saved.[/dim]")

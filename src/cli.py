@@ -1,4 +1,5 @@
 ﻿import asyncio
+import json
 import os
 import signal
 import sys
@@ -14,6 +15,13 @@ from rich.prompt import Prompt, IntPrompt
 from rich.align import Align
 from rich.table import Table
 
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.history import FileHistory
+    PT_AVAILABLE = True
+except ImportError:
+    PT_AVAILABLE = False
+
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=ResourceWarning)
 
@@ -22,15 +30,15 @@ from src.core.memory import memory_core
 from src.core.orchestrator import Orchestrator
 from src.core.provider import get_provider, get_model_name, list_providers
 from src.skills_loader import get_all_roles
-from src.utils import format_token_display, get_global_tokens, reset_global_tokens, count_tokens, add_global_tokens
+from src.utils import get_global_tokens, reset_global_tokens, count_tokens, add_global_tokens
 
 console = Console()
 _interrupt_event = threading.Event()
+C = "purple"
 
 
-def _signal_handler(signum, frame):
-    _interrupt_event.set()
-    console.print("\n[yellow]Exit requested...[/yellow]")
+def _acm(text: str) -> str:
+    return f"[bold][{C}]{text}[/{C}][/bold]"
 
 
 class CC:
@@ -42,22 +50,30 @@ class CC:
 
 class ZervGenCLI:
     def __init__(self, config=None):
+        global C
         self.config = config or load_config()
+        C = self.config.accent_color
         self.orchestrator: Optional[Orchestrator] = None
         self._current_task: Optional[asyncio.Task] = None
         self._user_active: bool = False
         self._active_lock = threading.Lock()
         self._show_usage: bool = True
+        self._pt_session = PromptSession(history=FileHistory("tmp/.zervgen_history")) if PT_AVAILABLE else None
 
     async def _init_system(self) -> None:
         try:
             provider = get_provider(self.config.provider, self.config)
             self.orchestrator = Orchestrator(provider, self.config)
-            if self.config.auto_mode and not self.orchestrator._auto_mode:
-                asyncio.create_task(self.orchestrator.auto_loop())
         except Exception as e:
-            console.print(f"[bold red]Failed to initialize system:[/bold red] {self._escape(str(e))}")
-            raise
+            console.print(f"[yellow]Provider '{self.config.provider}' failed: {e}[/yellow]")
+            console.print("[yellow]Falling back to pollinations (free, no key needed)...[/yellow]")
+            try:
+                provider = get_provider("pollinations", self.config)
+                self.config.provider = "pollinations"
+                self.orchestrator = Orchestrator(provider, self.config)
+            except Exception as e2:
+                console.print(f"[bold red]All providers failed:[/bold red] {self._escape(str(e2))}")
+                raise
 
     def print_banner(self) -> None:
         console.clear()
@@ -68,7 +84,7 @@ class ZervGenCLI:
 [bold blue] ███╔╝  ██╔══╝  ██╔══██╗╚██╗ ██╔╝██║   ██║██╔══╝  ██║╚██╗██║[/bold blue]
 [bold purple]███████╗███████╗██║  ██║ ╚████╔╝ ╚██████╔╝███████╗██║ ╚████║[/bold purple]
 [bold purple]╚══════╝╚══════╝╚═╝  ╚═╝  ╚═══╝   ╚═════╝ ╚══════╝╚═╝  ╚═══╝[/bold purple]
-[dim]v1.5.0 - Hierarchical Core[/dim]
+[dim]v1.5.0 - Stable Core[/dim]
         """
         try:
             mem_count = memory_core.get_stats().get('now_count', 0)
@@ -78,7 +94,7 @@ class ZervGenCLI:
         stats_text = f"[dim]🧠 Memory: [cyan]{mem_count}[/cyan] | 🔌 Provider: [cyan]{self.config.provider.upper()}[/cyan] | 🤖 Model: [cyan]{get_model_name(self.config.provider, self.config)}[/cyan][/dim]"
 
         menu = Table(box=None, show_header=False, padding=(0, 2))
-        menu.add_column(justify="right", style="bold purple")
+        menu.add_column(justify="right", style=f"bold {C}")
         menu.add_column(justify="left")
         menu.add_row("[1]", "💬  Start Chat\n")
         menu.add_row("[2]", "⚙️  Configuration")
@@ -86,22 +102,12 @@ class ZervGenCLI:
 
         layout = Table.grid(padding=1, expand=True)
         layout.add_column(justify="center")
-        layout.add_row(Panel(banner, border_style="purple", expand=False))
+        layout.add_row(Panel(banner, border_style=C, expand=False))
         layout.add_row(stats_text)
         layout.add_row("")
         layout.add_row(menu)
 
         console.print(Align.center(layout, vertical="middle"))
-
-    def _toggle_auto(self, enable: bool) -> None:
-        if not self.orchestrator:
-            return
-        current = self.orchestrator._auto_mode
-        self.orchestrator.toggle_auto(enable)
-        if enable and not current:
-            asyncio.create_task(self.orchestrator.auto_loop())
-        elif not enable:
-            self.orchestrator.interrupt_event.set()
 
     async def handle_system_command(self, cmd: str) -> bool:
         if not self.orchestrator:
@@ -124,16 +130,18 @@ class ZervGenCLI:
             "/compact": self._compact_memory,
             "/load": self._load_session,
             "/status": lambda: CC.print(Panel(str(self.orchestrator.get_mode_status()), title="Status", border_style="cyan")),
-            "/stop": lambda: CC.print(f"[yellow]{self.orchestrator.stop_auto()}[/yellow]"),
+            "/stop": lambda: CC.print("[yellow]Use Ctrl+C to interrupt.[/yellow]"),
         }
 
         if command in commands:
-            return await commands[command]()
+            handler = commands[command]
+            if asyncio.iscoroutinefunction(handler):
+                return await handler()
+            else:
+                return handler()
 
-        if command == "/auto":
-            enable = not self.orchestrator._auto_mode if args is None else args.lower() in ("on", "true", "1")
-            self._toggle_auto(enable)
-            CC.print(f"[bold {'green' if enable else 'yellow'}]Auto mode {'ON' if enable else 'OFF'}[/bold {'green' if enable else 'yellow'}]")
+        if command == "/dream":
+            await self._toggle_dream()
             return True
 
         if command == "/provider":
@@ -169,19 +177,29 @@ class ZervGenCLI:
         CC.print("[yellow]Session cleared.[/yellow]")
         return True
 
+    async def _toggle_dream(self) -> bool:
+        from src.core.memory import Dreamer
+        if not self.orchestrator:
+            await self._init_system()
+        if not hasattr(self, '_dreamer'):
+            self._dreamer = Dreamer(self.orchestrator.provider, memory_core, self.config.dream_interval)
+        if self._dreamer._running:
+            await self._dreamer.stop()
+            CC.print("[yellow]Dreaming OFF.[/yellow]")
+        else:
+            self._dreamer.interval = self.config.dream_interval
+            await self._dreamer.start()
+            CC.print("[green]Dreaming ON.[/green]")
+        return True
+
     def _toggle_usage(self) -> bool:
         self._show_usage = not self._show_usage
-        CC.print(f"[bold cyan]Token Counter: {'ON' if self._show_usage else 'OFF'}[/bold cyan]")
+        CC.print(f"[bold][{C}]Token Counter: {'ON' if self._show_usage else 'OFF'}[/{C}][/bold]")
         return True
 
     def _handle_provider(self, args: Optional[str]) -> bool:
-        if not args:
-            CC.print(f"[bold]Current Provider:[/bold] {self.config.provider.upper()}")
-            return True
-        if self.orchestrator.switch_provider(args):
-            CC.print(f"[bold green][+] Provider switched to: {args.upper()}[/bold green]")
-        else:
-            CC.print(f"[bold red][!] Failed to switch provider to: {args}[/bold red]")
+        model = get_model_name(self.config.provider, self.config)
+        CC.print(f"[bold]Provider:[/bold] {self.config.provider.upper()}  [dim]Model: {model}[/dim]")
         return True
 
     def _handle_role(self, args: Optional[str]) -> bool:
@@ -197,15 +215,15 @@ class ZervGenCLI:
     async def _handle_mode(self, args: Optional[str]) -> bool:
         if not args:
             status = self.orchestrator.get_mode_status()
-            CC.print(f"\n[bold]Current Mode:[/bold] {status['mode']} | Auto: {'ON' if self.orchestrator._auto_mode else 'OFF'}")
-            CC.print("\n[bold cyan]SELECT MODE:[/bold cyan]")
+            CC.print(f"\n[bold]Current Mode:[/bold] {status['mode']}")
+            CC.print(f"\n{_acm('SELECT MODE')}")
             CC.print("  [1] ASK    - Questions & explanations")
             CC.print("  [2] PLAN   - Architecture & planning")
             CC.print("  [3] BUILD   - Code generation")
             CC.print("  [4] DEBUG  - Troubleshooting")
             CC.print("  [b] Back")
 
-            choice = Prompt.ask("[bold purple]Mode[/bold purple]")
+            choice = Prompt.ask(_acm("Mode"))
             mode_map = {'1': 'ASK', '2': 'PLAN', '3': 'BUILD', '4': 'DEBUG'}
             if choice.lower() in ('b', 'back'):
                 return True
@@ -232,12 +250,12 @@ class ZervGenCLI:
             return True
 
         console.clear()
-        CC.print("[bold purple]SELECT AGENT[/bold purple]\n")
+        CC.print(f"{_acm('SELECT AGENT')}\n")
         for i, (name, cfg) in enumerate(role_list, 1):
             marker = " [cyan](current)[/cyan]" if name == self.orchestrator.skill_name else ""
             CC.print(f"  [{i}] {name}{marker}")
 
-        choice = Prompt.ask("[bold purple]Choice[/bold purple]")
+        choice = Prompt.ask(_acm("Choice"))
         try:
             idx = int(choice) - 1
             if 0 <= idx < len(role_list):
@@ -250,7 +268,7 @@ class ZervGenCLI:
         return True
 
     def _show_help(self) -> bool:
-        roles = "\n".join(f"- [purple]{k}[/purple]: {v.description}" for k, v in get_all_roles().items())
+        roles = "\n".join(f"- [{C}]{k}[/{C}]: {v.description}" for k, v in get_all_roles().items())
         modes = "\n".join(f"- [green]{k}[/green]: {v['description']}" for k, v in MODES.items())
 
         help_text = f"""[b]System Commands:[/b]
@@ -265,13 +283,13 @@ class ZervGenCLI:
 /compact - Compact short-term memory into long-term storage
 /q       - Quit application
 
-[bold cyan]PROVIDER:[/bold cyan]
-/provider [name] - Show your provider
+[bold][{C}]PROVIDER:[/{C}][/bold]
+/provider - Show current provider & model
 
-[bold cyan]MODE:[/bold cyan]
+[bold][{C}]MODE:[/{C}][/bold]
 /mode    - Show selection menu (BUILD, ASK, DEBUG, PLAN)
 
-[bold cyan]TOGGLES:[/bold cyan]
+[bold][{C}]TOGGLES:[/{C}][/bold]
 /critic on|off   - Toggle Critic (Self-Interrogation) [dim]({'on' if self.config.critic_enabled else 'off'})[/dim]
 /trim on|off     - Toggle History Trimming [dim]({'on' if self.config.history_trim_enabled else 'off'})[/dim]
 
@@ -285,20 +303,26 @@ class ZervGenCLI:
 
     def _show_history(self) -> bool:
         if self.orchestrator and self.orchestrator.history:
-            CC.print(Panel(str(self.orchestrator.history), title="Recent History"))
+            summary = self.orchestrator.get_history_summary()
+            CC.print(Panel(summary, title="Recent History"))
         else:
             CC.print("[dim]No history yet.[/dim]")
         return True
 
     def _show_todos(self) -> bool:
-        if self.orchestrator and hasattr(self.orchestrator, '_active_todos'):
-            todos = self.orchestrator._active_todos
-            if todos:
-                CC.print(Panel("\n".join(f"- {t}" for t in todos), title="[bold yellow]Active TODOs[/bold yellow]", border_style="yellow"))
-            else:
-                CC.print("[dim]No active TODOs.[/dim]")
-        else:
-            CC.print("[dim]No orchestrator available.[/dim]")
+        todo_file = Path("tmp/todos.json")
+        if not todo_file.exists():
+            CC.print("[dim]No TODOs yet.[/dim]")
+            return True
+        try:
+            todos = json.loads(todo_file.read_text())
+            if not todos:
+                CC.print("[dim]No TODOs yet.[/dim]")
+                return True
+            lines = [f"{'[x]' if t.get('done') else '[ ]'} {t.get('task', '?')}" for t in todos]
+            CC.print(Panel("\n".join(lines), title="[bold yellow]TODOs[/bold yellow]", border_style="yellow"))
+        except Exception:
+            CC.print("[dim]Could not read TODOs.[/dim]")
         return True
 
     async def _load_session(self) -> bool:
@@ -312,7 +336,7 @@ class ZervGenCLI:
             CC.print("[dim]No session logs found.[/dim]")
             return True
 
-        CC.print("\n[bold purple]AVAILABLE SESSIONS:[/bold purple]")
+        CC.print(f"\n{_acm('AVAILABLE SESSIONS')}:")
         for i, f in enumerate(files[:10]):
             CC.print(f"[{i+1}] {f}")
 
@@ -320,8 +344,7 @@ class ZervGenCLI:
             choice = IntPrompt.ask("Load Session #", choices=[str(i+1) for i in range(len(files[:10]))])
             selected = files[choice-1]
 
-            memory_core.clear_current_session()
-            memory_core._short_term.clear()
+            memory_core.clear_short_term()
             loaded_hist, loaded_mode, last_role, short_term_items = memory_core.load_session(selected)
 
             self.orchestrator.history = loaded_hist
@@ -349,12 +372,6 @@ class ZervGenCLI:
             in_tok, _ = count_tokens(loaded_hist, "")
             add_global_tokens(in_tok)
 
-            if loaded_mode and loaded_mode != "orchestrator":
-                self.orchestrator.set_mode(loaded_mode.upper())
-                CC.print(f"[bold cyan][+] Mode restored: {loaded_mode.upper()}[/bold cyan]")
-            if last_role and last_role != "system":
-                self.orchestrator.skill_name = last_role
-                CC.print(f"[bold cyan][+] Last agent restored: {last_role.capitalize()}[/bold cyan]")
             CC.print(f"[green]Session '{selected}' loaded ({len(loaded_hist)} msgs).[/green]")
         except Exception as e:
             CC.print(f"[red]Load error: {self._escape(str(e))}[/red]")
@@ -365,23 +382,58 @@ class ZervGenCLI:
             CC.print("[red]System not initialized.[/red]")
             return True
 
-        recent = memory_core.get_recent_memories(limit=50)
-        if not recent:
-            CC.print("[yellow]No short-term memories to compact.[/yellow]")
+        history = self.orchestrator.history
+        if len(history) <= 10:
+            CC.print("[yellow]Not enough history to compact.[/yellow]")
             return True
 
-        summary = f"Compacted {len(recent)} memories from session {memory_core._session_id}"
-        memory_core.add_memory(summary, category="compacted")
-        memory_core.clear_short_term()
-        CC.print(f"[bold green][+] Memory compacted: {len(recent)} items -> long-term storage[/bold green]")
+        summary = self.orchestrator.get_history_summary(max_messages=8)
+        CC.print(Panel(summary, title="History Summary", border_style="cyan"))
+
+        system_msgs = [m for m in history if m.get("role") == "system"]
+        recent = history[-6:]
+        to_summarize = history[len(system_msgs):-6]
+
+        CC.print(f"[cyan]Compacting {len(to_summarize)} messages...[/cyan]")
+
+        transcript = "\n".join(
+            f"{m.get('role', '?')}: {str(m.get('content', ''))[:500]}"
+            for m in to_summarize
+        )
+
+        prompt = (
+            "Summarize this conversation in under 500 words. "
+            "Preserve: key decisions, file paths, tool results, errors, current task state. "
+            "Be specific and concise.\n\n" + transcript
+        )
+
+        try:
+            provider = self.orchestrator.provider
+            result = await provider.generate_text(
+                [{"role": "user", "content": prompt}],
+                "You are a precise conversation summarizer. Output only the summary."
+            )
+            if isinstance(result, dict):
+                summary = result.get("content", "Summary unavailable")
+            else:
+                summary = str(result)
+
+            summary_msg = {"role": "user", "content": f"[CONTEXT SUMMARY]\n{summary[:2000]}"}
+            self.orchestrator.history = system_msgs + [summary_msg] + recent
+
+            memory_core.add_memory(summary[:500], category="compacted", tier="recent")
+            CC.print(f"[bold green]Compacted {len(to_summarize)} messages into 1 summary.[/bold green]")
+        except Exception as e:
+            CC.print(f"[red]Compaction failed: {e}[/red]")
+
         return True
 
     def settings_menu(self) -> None:
         while True:
             console.clear()
-            table = Table(title="CONFIGURATION", border_style="purple")
+            table = Table(title="CONFIGURATION", border_style=C)
             table.add_column("ID", style="cyan", no_wrap=True)
-            table.add_column("Parameter", style="magenta")
+            table.add_column("Parameter", style=C)
             table.add_column("Value", style="green")
 
             table.add_row("1", "Provider", self.config.provider.upper())
@@ -391,14 +443,17 @@ class ZervGenCLI:
             table.add_row("5", "Critic Enabled", str(self.config.critic_enabled))
             table.add_row("6", "History Trim", f"{'ON' if self.config.history_trim_enabled else 'OFF'} (max: {self.config.history_trim_size})")
             table.add_row("7", "Memory Enabled", str(self.config.memory_enabled))
-            table.add_row("8", "Auto Mode", f"{'ON' if self.orchestrator._auto_mode else 'OFF'} ({self.config.auto_interval // 60} min)")
+            dream_status = "ON" if (hasattr(self, '_dreamer') and self._dreamer._running) else "OFF"
+            table.add_row("8", "Dreaming", f"{dream_status} ({self.config.dream_interval // 60}min)")
             table.add_row("9", "MCP Servers", "Manage...")
+            table.add_row("10", "Path Whitelist", "Manage...")
+            table.add_row("11", "Accent Color", C)
 
             CC.print(table)
             CC.print("\n[dim]ID to edit, 'b' to return[/dim]")
 
             try:
-                choice = Prompt.ask("[bold purple]Config[/bold purple]")
+                choice = Prompt.ask(_acm("Config"))
                 if choice.lower() in ['back', 'b', 'q', '/q', '/exit']:
                     break
 
@@ -410,8 +465,10 @@ class ZervGenCLI:
                     '5': lambda: self._toggle_config('critic_enabled'),
                     '6': self._history_trim_menu,
                     '7': lambda: self._toggle_config('memory_enabled'),
-                    '8': self._auto_interval_menu,
+                    '8': self._dream_menu,
                     '9': self._mcp_menu,
+                    '10': self._whitelist_menu,
+                    '11': self._select_accent_color,
                 }
 
                 if choice in handlers:
@@ -425,6 +482,26 @@ class ZervGenCLI:
         setattr(self.config, attr, not current)
         self.config.save()
 
+    def _select_accent_color(self) -> None:
+        global C
+        colors = ["purple", "blue", "green", "red", "yellow", "cyan", "magenta", "white"]
+        current = C
+        CC.print("\n[bold]ACCENT COLOR[/bold]")
+        for i, c in enumerate(colors, 1):
+            marker = " ← current" if c == current else ""
+            CC.print(f"  [{i}] [{c}]■■■[/{c}] {c}{marker}")
+        try:
+            default_idx = colors.index(current) + 1 if current in colors else 1
+            choice = IntPrompt.ask("Color", default=default_idx)
+            idx = choice - 1
+            if 0 <= idx < len(colors):
+                C = colors[idx]
+                self.config.accent_color = colors[idx]
+                self.config.save()
+                CC.print(f"[{colors[idx]}]Accent: {colors[idx]}[/{colors[idx]}]")
+        except (ValueError, IndexError):
+            pass
+
     def _run_menu(self, title: str, items: List[tuple]) -> None:
         while True:
             console.clear()
@@ -433,7 +510,7 @@ class ZervGenCLI:
                 CC.print(f"  [{i}] {label}")
             CC.print("  [b] Back")
 
-            choice = Prompt.ask("[bold purple]Choice[/bold purple]")
+            choice = Prompt.ask(_acm("Choice"))
             if choice.lower() in ('b', 'back'):
                 break
             try:
@@ -446,12 +523,15 @@ class ZervGenCLI:
     def _history_trim_menu(self) -> None:
         def toggle():
             self._toggle_config('history_trim_enabled')
+            state = 'ON' if self.config.history_trim_enabled else 'OFF'
+            CC.print(f"[green]History Trim: {state}[/green]")
 
         def set_size():
             try:
                 size = IntPrompt.ask("Trim size", default=self.config.history_trim_size)
                 self.config.history_trim_size = max(5, min(100, size))
                 self.config.save()
+                CC.print(f"[green]Trim size set to {self.config.history_trim_size}[/green]")
             except ValueError:
                 pass
 
@@ -461,21 +541,47 @@ class ZervGenCLI:
             [("Toggle Enable/Disable", toggle), ("Set Trim Size", set_size)]
         )
 
-    def _auto_interval_menu(self) -> None:
-        def set_interval():
+    def _dream_menu(self) -> None:
+        from src.core.memory import Dreamer
+        while True:
+            running = hasattr(self, '_dreamer') and self._dreamer._running
+            CC.print(f"\n{_acm('DREAMING')}")
+            CC.print(f"  Status: [{'green' if running else 'red'}]{'ON' if running else 'OFF'}[/{'green' if running else 'red'}]")
+            CC.print(f"  Interval: {self.config.dream_interval // 60} minutes")
+            CC.print("[dim]1=Toggle ON/OFF  2=Set interval  b=Back[/dim]")
             try:
-                current_min = self.config.auto_interval // 60
-                minutes = IntPrompt.ask("Interval (minutes)", default=current_min, show_default=True)
-                self.config.auto_interval = max(60, min(3600, minutes * 60))
-                self.config.save()
-                CC.print(f"[green]Auto interval set to {self.config.auto_interval // 60} minutes[/green]")
-            except ValueError:
-                pass
+                choice = Prompt.ask(_acm("Dream")).strip()
+                if choice.lower() in ('b', 'back', 'q'):
+                    break
+                elif choice == '1':
+                    if not self.orchestrator:
+                        self._run_async(self._init_system())
+                    if not hasattr(self, '_dreamer'):
+                        self._dreamer = Dreamer(self.orchestrator.provider, memory_core, self.config.dream_interval)
+                    if self._dreamer._running:
+                        self._run_async(self._dreamer.stop())
+                        CC.print("[yellow]Dreaming OFF.[/yellow]")
+                    else:
+                        self._dreamer.interval = self.config.dream_interval
+                        self._run_async(self._dreamer.start())
+                        CC.print("[green]Dreaming ON.[/green]")
+                elif choice == '2':
+                    minutes = IntPrompt.ask("Interval (minutes)", default=self.config.dream_interval // 60)
+                    self.config.dream_interval = max(60, minutes * 60)
+                    self.config.save()
+                    if hasattr(self, '_dreamer'):
+                        self._dreamer.interval = self.config.dream_interval
+                    CC.print(f"[green]Interval set to {self.config.dream_interval // 60} minutes[/green]")
+            except (KeyboardInterrupt, EOFError):
+                break
 
-        self._run_menu(
-            f"Auto Interval Settings (Current: {self.config.auto_interval // 60} minutes)",
-            [("Set interval (minutes)", set_interval)]
-        )
+    def _run_async(self, coro):
+        try:
+            loop = asyncio.get_running_loop()
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
+            return future.result(timeout=30)
+        except RuntimeError:
+            return asyncio.run(coro)
 
     def _has_api_key(self) -> bool:
         provider_settings = getattr(self.config, self.config.provider, None)
@@ -484,7 +590,7 @@ class ZervGenCLI:
     def _select_provider(self) -> None:
         providers = list_providers()
         console.clear()
-        CC.print("[bold purple]SELECT PROVIDER:[/bold purple]\n")
+        CC.print(f"{_acm('SELECT PROVIDER')}\n")
         for i, meta in enumerate(providers, 1):
             CC.print(f"[{i}] {meta.display_name}")
 
@@ -497,7 +603,7 @@ class ZervGenCLI:
             self.config.provider = selected.name
             self.config.save()
 
-        if selected.name not in ("pollinations", "local"):
+        if selected.name not in ("pollinations", "local") and not self._has_api_key():
             self._input_api_key()
 
     def _select_model(self) -> None:
@@ -525,10 +631,10 @@ class ZervGenCLI:
             return
 
         try:
-            with console.status("[bold purple]Fetching models...[/bold purple]"):
+            with console.status(_acm("Fetching models...")):
                 models = fetch_available_models(self.config.gemini.api_key)
             console.clear()
-            CC.print("[bold purple]Available Models:[/bold purple]\n")
+            CC.print(f"{_acm('Available Models')}\n")
             for i, m in enumerate(models, 1):
                 CC.print(f"[{i}] {m}")
             choice = IntPrompt.ask("Select", choices=[str(i) for i in range(1, len(models)+1)])
@@ -539,39 +645,110 @@ class ZervGenCLI:
 
     def _input_api_key(self) -> None:
         provider_settings = getattr(self.config, self.config.provider, None)
-        if provider_settings and hasattr(provider_settings, "api_key"):
-            provider_settings.api_key = Prompt.ask(f"{self.config.provider.title()} API Key")
+        if not provider_settings or not hasattr(provider_settings, "api_key"):
+            return
+        current = provider_settings.api_key
+        key = Prompt.ask(f"{self.config.provider.title()} API Key")
+        if not key and current:
+            return
+        if not key:
+            return
+        provider_settings.api_key = key
+        from src.config import save_env_key
+        save_env_key(self.config.provider, key)
+        self.config.save()
+
+    def _check_server_installed(self, cfg) -> bool:
+        import shutil
+        if cfg.command == "internal":
+            from src.tools import TOOL_REGISTRY
+            return bool(TOOL_REGISTRY)
+        if cfg.args and cfg.args[0] == "-m" and len(cfg.args) > 1:
+            try:
+                __import__(cfg.args[1])
+                return True
+            except ImportError:
+                return False
+        if cfg.command == "npx":
+            return bool(shutil.which("npx") or shutil.which("npx.cmd"))
+        return bool(shutil.which(cfg.command) or shutil.which(f"{cfg.command}.exe"))
+
+    def _install_server(self, name: str, cfg) -> bool:
+        import subprocess
+        if cfg.args and cfg.args[0] == "-m" and len(cfg.args) > 1:
+            module = cfg.args[1]
+            CC.print(f"\n[yellow]Installing {module}...[/yellow]")
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", module],
+                    capture_output=True, text=True, timeout=120
+                )
+                if result.returncode == 0:
+                    CC.print(f"[green]{name} installed![/green]")
+                    return True
+                else:
+                    CC.print(f"[red]Install failed:[/red] {result.stderr[:200]}")
+                    return False
+            except Exception as e:
+                CC.print(f"[red]Install error:[/red] {e}")
+                return False
+        elif cfg.command == "npx":
+            CC.print(f"\n[yellow]npx packages auto-install on first run via 'npx -y'. Enabling instead.[/yellow]")
+            cfg.enabled = True
             self.config.save()
+            return True
+        else:
+            CC.print(f"[red]Unknown install method for {cfg.command}[/red]")
+            return False
 
     def _mcp_menu(self) -> None:
         while True:
             console.clear()
-            table = Table(title="MCP SERVERS", border_style="purple")
+            table = Table(title="MCP SERVERS", border_style=C)
             table.add_column("ID", style="dim", width=4)
-            table.add_column("Server", style="bold green")
-            table.add_column("Status", style="magenta")
+            table.add_column("Server", style="bold")
+            table.add_column("Status", style=C)
+            table.add_column("Installed", style=C)
             table.add_column("Command", style="dim")
 
             servers = list(self.config.mcp_servers.keys())
             for i, name in enumerate(servers, 1):
                 cfg = self.config.mcp_servers[name]
-                status = "[green]ON[/green]" if cfg.enabled else "[red]OFF[/red]"
+                status = "[green]ON[/green]" if cfg.enabled else "[dim]OFF[/dim]"
+                installed = self._check_server_installed(cfg)
+                inst_display = "[green]Yes[/green]" if installed else "[red]No[/red]"
                 cmd = "[cyan](internal)[/cyan]" if cfg.command == "internal" else cfg.command
-                table.add_row(str(i), name, status, cmd)
+                if not cfg.enabled:
+                    display_name = f"[dim]{name}[/dim]"
+                elif installed:
+                    display_name = f"[green]{name}[/green]"
+                else:
+                    display_name = f"[red]{name}[/red]"
+                table.add_row(str(i), display_name, status, inst_display, cmd)
 
             CC.print(table)
-            CC.print("\n[dim]ID to toggle, 'b' to back[/dim]")
+            CC.print("\n[dim]ID to toggle/install, 'b' to back[/dim]")
+            CC.print("[dim]Red = not installed. Select it to install.[/dim]")
 
-            choice = Prompt.ask("[bold purple]MCP[/bold purple]")
+            choice = Prompt.ask(_acm("MCP"))
             if choice.lower() in ('b', 'back'):
                 break
             try:
                 idx = int(choice) - 1
                 if 0 <= idx < len(servers):
                     name = servers[idx]
-                    self.config.mcp_servers[name].enabled = not self.config.mcp_servers[name].enabled
-                    self.config.save()
-                    CC.print(f"[yellow]Toggled {name}[/yellow]")
+                    cfg = self.config.mcp_servers[name]
+                    installed = self._check_server_installed(cfg)
+                    if not installed and cfg.command != "internal":
+                        if self._install_server(name, cfg):
+                            cfg.enabled = True
+                            self.config.save()
+                            CC.print(f"[green]{name} enabled![/green]")
+                        Prompt.ask("[dim]Press Enter[/dim]")
+                    else:
+                        cfg.enabled = not cfg.enabled
+                        self.config.save()
+                        CC.print(f"[yellow]Toggled {name}: {'ON' if cfg.enabled else 'OFF'}[/yellow]")
             except ValueError:
                 pass
 
@@ -580,7 +757,7 @@ class ZervGenCLI:
             await self._init_system()
 
         self.print_banner()
-        CC.print("\n[dim]Ready. Commands: /help. Ctrl+C to interrupt.[/dim]\n")
+        CC.print(f"\n[{C}]Ready. Commands: /help. Ctrl+C to interrupt.[/{C}]\n")
 
         while True:
             _interrupt_event.clear()
@@ -588,10 +765,16 @@ class ZervGenCLI:
                 self.orchestrator.interrupt_event.clear()
 
             try:
-                user_input = Prompt.ask(f"[dim]📊 Tokens {get_global_tokens()}[/dim]") if self._show_usage else Prompt.ask("")
+                if self._pt_session:
+                    prompt_str = f"[{get_global_tokens()}] > " if self._show_usage else "> "
+                    user_input = await self._pt_session.prompt_async(prompt_str)
+                else:
+                    user_input = Prompt.ask(f"[dim]📊 Tokens {get_global_tokens()}[/dim]") if self._show_usage else Prompt.ask("")
             except KeyboardInterrupt:
                 CC.print("\n[yellow]Returning to menu...[/yellow]")
                 return
+            except EOFError:
+                raise SystemExit(0)
 
             if not user_input.strip():
                 continue
@@ -616,7 +799,7 @@ class ZervGenCLI:
         try:
             response = await self.orchestrator.process(user_input)
             if response and response.strip():
-                CC.print(Panel(Markdown(response), border_style="purple"))
+                CC.print(Panel(Markdown(response), border_style=C))
         except KeyboardInterrupt:
             console.print("\n[yellow]Stopping task...[/yellow]")
             self.orchestrator.request_interrupt()
@@ -634,7 +817,7 @@ class ZervGenCLI:
         while True:
             self.print_banner()
             try:
-                choice = Prompt.ask("[bold purple]Enter[/bold purple]", default="1")
+                choice = Prompt.ask(_acm("Enter"), default="1")
 
                 if choice.lower() in ('q', '/q', 'exit', 'quit', '3'):
                     await self._cleanup()
@@ -656,21 +839,37 @@ class ZervGenCLI:
 
     async def _cleanup(self) -> None:
         if self.orchestrator:
-            self.orchestrator._auto_mode = False
             try:
                 await self.orchestrator.cleanup()
             except RuntimeError:
                 pass
 
+    def _whitelist_menu(self) -> None:
+        from src.config import get_allowed_roots, add_allowed_root, remove_allowed_root
+        while True:
+            console.clear()
+            roots = get_allowed_roots()
+            table = Table(title="PATH WHITELIST", border_style=C)
+            table.add_column("#", style="cyan", width=4)
+            table.add_column("Path", style="green")
+            table.add_row("0", str(Path.cwd().resolve()) + " [dim](auto)[/dim]")
+            for i, r in enumerate(roots):
+                table.add_row(str(i + 1), r)
+            CC.print(table)
+            CC.print("\n[dim]add <path>  |  remove <#>  |  'b' to return[/dim]")
+            try:
+                choice = Prompt.ask(_acm("Whitelist")).strip()
+                if choice.lower() in ('b', 'back', 'q'):
+                    break
+                if choice.lower().startswith("add "):
+                    result = add_allowed_root(choice[4:].strip())
+                    CC.print(f"[green]{result}[/green]" if "✓" in result else f"[red]{result}[/red]")
+                elif choice.lower().startswith("remove "):
+                    try:
+                        idx = int(choice[7:].strip()) - 1
+                        CC.print(f"[green]{remove_allowed_root(idx)}[/green]")
+                    except ValueError:
+                        CC.print("[red]Invalid number.[/red]")
+            except (KeyboardInterrupt, EOFError):
+                break
 
-def main():
-    signal.signal(signal.SIGINT, _signal_handler)
-    cli = ZervGenCLI()
-    try:
-        asyncio.run(cli.run())
-    except SystemExit:
-        pass
-
-
-if __name__ == "__main__":
-    main()

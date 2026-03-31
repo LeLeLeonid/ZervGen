@@ -7,9 +7,14 @@ tags: [weather, forecast, temperature, rain, sunny, cloudy, humidity, wind, clim
 Use `get_weather(location)` to get weather information.
 
 ## Usage
+```python
+result = await get_weather(location="Minsk")
+return await response(text=result)
 ```
-get_weather(location="Minsk")
-get_weather(location="London", forecast=true)
+
+```python
+result = await get_weather(location="London", forecast=true)
+return await response(text=result)
 ```
 
 ## Features
