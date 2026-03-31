@@ -9,7 +9,7 @@ try:
 except ImportError:
     GEMINI_AVAILABLE = False
 
-META = ProviderMeta(name="gemini", display_name="Google Gemini", module="src.providers.gemini")
+META = ProviderMeta(name="gemini", display_name="Google Gemini")
 
 
 def fetch_available_models(api_key: str) -> List[str]:
@@ -44,7 +44,7 @@ class Provider(AIProvider):
         return config.gemini.model
 
     @async_retry()
-    async def generate_text(self, history: List[Dict], system_prompt: str) -> str:
+    async def generate_text(self, history: List[Dict], system_prompt: str, on_token=None) -> str:
         try:
             gemini_history = []
             for msg in history:
@@ -53,6 +53,9 @@ class Provider(AIProvider):
 
             chat = self.model.start_chat(history=gemini_history)
             response = await chat.send_message_async(f"System Instruction: {system_prompt}\n\nTask: Generate response.")
+            if not response.candidates or not response.candidates[0].content.parts:
+                _record_failure("gemini")
+                return "Error: Gemini blocked the response (safety filter)."
             _record_success("gemini")
             return response.text
         except Exception as e:

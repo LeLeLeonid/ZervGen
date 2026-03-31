@@ -39,10 +39,21 @@ class Orchestrator(BaseAgent):
         )
         self.agents: Dict[str, BaseAgent] = {}
         self._last_agent_id: Optional[str] = None
+        self._load_tools()
 
         last_role = _parse_history_role(self.history)
         if last_role:
             self.skill_name = last_role
+
+    def _load_tools(self) -> None:
+        from src.tools import TOOL_REGISTRY
+        allowed = {
+            "delegate_to", "response", "search_memory", "add_memory",
+            "promote_memory", "manage_todo", "find_skill", "list_skills",
+            "scan_tools", "web_search", "fetch_url", "get_weather",
+            "calc", "format_json"
+        }
+        self.tools = {k: v for k, v in TOOL_REGISTRY.items() if k in allowed}
 
     def _log_state(self, key: str, value: str) -> None:
         if self.memory:
@@ -52,6 +63,7 @@ class Orchestrator(BaseAgent):
         if load_role(role):
             self.skill_name = role
             self._load_tools()
+            self.invalidate_cache()
             self._log_state("ROLE", role)
             return True
         return False
@@ -60,6 +72,7 @@ class Orchestrator(BaseAgent):
         mode_upper = mode.upper()
         if mode_upper in MODES:
             self.mode = mode_upper
+            self.invalidate_cache()
             self._log_state("MODE", mode_upper)
             return True
         return False
@@ -68,21 +81,13 @@ class Orchestrator(BaseAgent):
         key_points = []
         for msg in log:
             content = msg.get("content", "")
-            if msg.get("role") == "system":
-                key_points.append(content[:300])
-            elif content.startswith("Error"):
+            role = msg.get("role", "")
+            if role in ("system", "assistant"):
+                if content and len(content) > 10:
+                    key_points.append(content[:300])
+            elif content and content.startswith("Error"):
                 key_points.append(f"[ERROR] {content[:150]}")
         return f"Context from {from_agent}: No results." if not key_points else f"=== CONTEXT FROM {from_agent.upper()} ===\n" + "\n---\n".join(key_points[-5:])
-
-    @property
-    def auto_mode(self) -> bool:
-        return self._auto_mode
-
-    def toggle_auto(self, enabled: bool = None) -> bool:
-        self._auto_mode = not self._auto_mode if enabled is None else enabled
-        self.settings.auto_mode = self._auto_mode
-        self.settings.save()
-        return self._auto_mode
 
     def switch_provider(self, provider_name: str) -> bool:
         from src.core.provider import get_provider, list_providers
@@ -99,14 +104,12 @@ class Orchestrator(BaseAgent):
             return False
 
     def get_mode_status(self) -> Dict[str, Any]:
-        return {"auto": self._auto_mode, "mode": self.mode, "role": self.skill_name}
-
-    def stop_auto(self) -> str:
-        self._auto_mode = False
-        return "Auto mode stopped."
+        return {"mode": self.mode, "role": self.skill_name}
 
     async def _spawn_agent(self, role_name: str, context: Optional[Dict] = None, max_steps: Optional[int] = None) -> BaseAgent:
         target_role = role_name if role_name != "system" else self.skill_name
+        if not role_exists(target_role):
+            target_role = self.skill_name
         initial_history = context.get("history", []) if context else []
         agent_id = f"{target_role}_{uuid.uuid4().hex[:8]}"
         target_name = target_role.capitalize()
@@ -140,32 +143,46 @@ class Orchestrator(BaseAgent):
         agent_name = spec.get("name", "code")
         task = spec.get("task", "")
         max_steps = spec.get("max_steps")
-        context = {"history": self.history.copy(), "parent_task": task}
+        system_msgs = [m for m in self.history if m.get("role") == "system"]
+        user_msgs = [m for m in self.history if m.get("role") != "system"]
+        filtered_history = system_msgs + user_msgs[-5:]
+        context = {"history": filtered_history, "parent_task": task}
         agent = await self._spawn_agent(agent_name, context, max_steps=max_steps)
         agent._log(agent.name, f"Delegating task: {task[:100]}...", "delegation_start")
         result = await agent.run(task)
         casted_context = self.narrative_cast(agent_name, self.name, agent.history)
         self._log(agent.name, casted_context, "context")
-        self._last_agent_id = list(self.agents.keys())[-1] if self.agents else None
-        self._log(agent.name, f"AGENT: {self._last_agent_id}", "state")
-        self.history.append({"role": agent.name, "content": result})
+        self.history.append({"role": "assistant", "content": result})
         self.skill_name = agent_name
         return result, agent.history, agent_name
 
     def _compute_waves(self, agents_spec: List[Dict]) -> List[List[Dict]]:
         indexed = {i: spec for i, spec in enumerate(agents_spec)}
-        deps = {i: set(spec.get("depends_on", [])) for i, spec in enumerate(agents_spec)}
+        name_to_indices: Dict[str, List[int]] = {}
+        for i, spec in enumerate(agents_spec):
+            name_to_indices.setdefault(spec.get("name", str(i)), []).append(i)
+
+        dep_indices = {}
+        for i, spec in enumerate(agents_spec):
+            dep_names = spec.get("depends_on", [])
+            deps = set()
+            for dn in dep_names:
+                deps.update(name_to_indices.get(dn, []))
+            dep_indices[i] = deps
+
         waves = []
         completed: Set[int] = set()
         remaining = set(indexed.keys())
+        safety = len(agents_spec) + 1
 
-        while remaining:
-            ready = [i for i in remaining if deps[i].issubset(completed)]
+        while remaining and safety > 0:
+            safety -= 1
+            ready = [i for i in remaining if dep_indices[i].issubset(completed)]
             if not ready:
                 ready = list(remaining)
             waves.append([indexed[i] for i in ready])
             completed.update(ready)
-            remaining.discard(i for i in ready)
+            remaining.difference_update(ready)
 
         return waves
 
@@ -242,8 +259,6 @@ class Orchestrator(BaseAgent):
         user_input = user_input.strip()
         if not user_input:
             return "Error: Empty input"
-
-        await self._init_mcp()
 
         last_role = _parse_history_role(self.history)
         if last_role:

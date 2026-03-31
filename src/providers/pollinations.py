@@ -4,7 +4,7 @@ from src.core.provider import AIProvider, ProviderMeta, get_http_client, _record
 from src.config import PollinationsSettings
 from src.utils import async_retry
 
-META = ProviderMeta(name="pollinations", display_name="Pollinations (Default)", module="src.providers.pollinations", requires_key=False)
+META = ProviderMeta(name="pollinations", display_name="Pollinations (Default)", requires_key=False)
 
 
 class Provider(AIProvider):
@@ -25,8 +25,8 @@ class Provider(AIProvider):
     def _clean_response(self, text: str) -> str:
         ad_marker = "Support Pollinations.AI:"
         if ad_marker in text:
-            return text.split(ad_marker)[0].strip()
-        return text
+            text = text.split(ad_marker)[0].strip()
+        return text.strip()
 
     def _check_errors(self, response):
         if response.status_code in [500, 502, 503, 504]:
@@ -36,7 +36,7 @@ class Provider(AIProvider):
             raise Exception(f"Gateway Error: {text[:100]}...")
 
     @async_retry(retries=5, delays=[1, 2, 5, 10, 20])
-    async def generate_text(self, history: List[Dict], system_prompt: str) -> str:
+    async def generate_text(self, history: List[Dict], system_prompt: str, on_token=None) -> str:
         short_history = history[-10:] if len(history) > 10 else history
         client = get_http_client()
         
@@ -58,10 +58,11 @@ class Provider(AIProvider):
             
             json_resp = resp.json()
             content = json_resp['choices'][0]['message']['content']
-            if not content or not content.strip():
-                raise Exception("API returned empty content")
             _record_success("pollinations")
-            return self._clean_response(content)
+            cleaned = self._clean_response(content)
+            if not cleaned:
+                raise Exception("API returned empty content after ad strip")
+            return cleaned
             
         except Exception as e:
             if "Tier Restriction" in str(e):

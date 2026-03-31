@@ -1,3 +1,4 @@
+import re
 import threading
 import yaml
 from pathlib import Path
@@ -21,6 +22,14 @@ class SkillConfig:
         self.tags = [t.lower() for t in tags]
         self.context = context
         self.description = description
+
+    def match_trigger(self, message: str) -> Optional[str]:
+        msg_lower = message.lower()
+        msg_words = set(re.findall(r'\w+', msg_lower))
+        for tag in self.tags:
+            if tag in msg_words:
+                return tag
+        return None
 
 
 class SkillIndex:

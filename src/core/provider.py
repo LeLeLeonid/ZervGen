@@ -1,11 +1,8 @@
-import importlib
 import logging
 import time
 from dataclasses import dataclass
-from functools import lru_cache
-from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
+from typing import Any, Dict, List, Protocol, runtime_checkable
 import httpx
-from src.config import GlobalSettings
 
 logger = logging.getLogger(__name__)
 
@@ -14,11 +11,8 @@ class CircuitBreakerError(Exception):
     pass
 
 
-CIRCUIT_BREAKER_THRESHOLD = 5
-CIRCUIT_BREAKER_RESET_SECONDS = 10.0
-
 class CircuitBreaker:
-    def __init__(self, threshold: int = CIRCUIT_BREAKER_THRESHOLD, reset_seconds: float = CIRCUIT_BREAKER_RESET_SECONDS):
+    def __init__(self, threshold: int = 5, reset_seconds: float = 30.0):
         self._threshold = threshold
         self._reset_seconds = reset_seconds
         self._failures: Dict[str, int] = {}
@@ -83,7 +77,7 @@ _http_manager = HttpClientManager()
 
 @runtime_checkable
 class AIProvider(Protocol):
-    async def generate_text(self, history: List[Dict[str, str]], system_prompt: str) -> str: ...
+    async def generate_text(self, history: List[Dict[str, str]], system_prompt: str, on_token=None) -> str: ...
     def get_model_name(self) -> str: ...
 
 
@@ -91,63 +85,69 @@ class AIProvider(Protocol):
 class ProviderMeta:
     name: str
     display_name: str
-    module: str
     requires_key: bool = True
 
 
-PROVIDERS: Dict[str, ProviderMeta] = {
-    "openai": ProviderMeta("openai", "OpenAI", "src.providers.openai"),
-    "anthropic": ProviderMeta("anthropic", "Anthropic", "src.providers.anthropic"),
-    "gemini": ProviderMeta("gemini", "Google Gemini", "src.providers.gemini"),
-    "groq": ProviderMeta("groq", "Groq", "src.providers.groq"),
-    "openrouter": ProviderMeta("openrouter", "OpenRouter", "src.providers.openrouter"),
-    "siliconflow": ProviderMeta("siliconflow", "SiliconFlow", "src.providers.siliconflow"),
-    "pollinations": ProviderMeta("pollinations", "Pollinations (Free)", "src.providers.pollinations", requires_key=False),
-    "local": ProviderMeta("local", "Local Model", "src.providers.local", requires_key=False),
-}
-
-
-@lru_cache(maxsize=32)
-def _load_provider_class(name: str) -> Optional[type]:
-    meta = PROVIDERS.get(name.lower())
-    if not meta:
-        return None
-    try:
-        module = importlib.import_module(meta.module)
-        return getattr(module, "Provider", None)
-    except Exception as e:
-        logger.error(f"Failed to load provider {name}: {e}")
-        return None
-
-
-def get_provider(name: str, settings: GlobalSettings) -> Any:
+def get_provider(name: str, settings) -> Any:
+    from src.config import COMPATIBLE_PRESETS
     if not _circuit_breaker.is_available(name):
-        logger.warning(f"Circuit breaker OPEN for {name}")
-        raise CircuitBreakerError(f"Circuit breaker OPEN for {name}. Provider temporarily unavailable.")
-    provider_class = _load_provider_class(name)
-    if not provider_class:
-        raise ValueError(f"Provider '{name}' not found")
-    provider_settings = getattr(settings, name.lower(), None)
-    return provider_class(provider_settings or settings)
+        raise CircuitBreakerError(f"{name} circuit open")
+    if name == "openrouter":
+        from src.providers.openrouter import Provider
+        return Provider(getattr(settings, 'openrouter', settings))
+    if name == "openai":
+        from src.providers.openai import Provider
+        return Provider(getattr(settings, 'openai', settings))
+    if name == "anthropic":
+        from src.providers.anthropic import Provider
+        return Provider(getattr(settings, 'anthropic', settings))
+    if name == "gemini":
+        from src.providers.gemini import Provider
+        return Provider(getattr(settings, 'gemini', settings))
+    if name == "pollinations":
+        from src.providers.pollinations import Provider
+        return Provider(getattr(settings, 'pollinations', settings))
+    preset = COMPATIBLE_PRESETS.get(name)
+    if preset:
+        from src.providers.base import OpenAIProvider
+        provider_settings = getattr(settings, name.lower(), None)
+        api_key = getattr(provider_settings, 'api_key', '') if provider_settings else ''
+        model = getattr(provider_settings, 'model', None) if provider_settings else None
+        if not model:
+            model = preset.get('default_model', 'default')
+        headers = preset["headers_fn"](api_key)
+        headers["Content-Type"] = "application/json"
+        return OpenAIProvider(name=name, base_url=preset["base_url"], headers=headers, model=model)
+    raise ValueError(f"Provider '{name}' not found")
 
 
-def get_model_name(provider_name: str, settings: GlobalSettings) -> str:
+def get_model_name(provider_name: str, settings) -> str:
     provider_settings = getattr(settings, provider_name.lower(), None)
     if provider_settings and hasattr(provider_settings, "model"):
         return provider_settings.model
     return "default"
 
 
-def list_providers() -> List[ProviderMeta]:
-    return list(PROVIDERS.values())
-
-
-def clear_provider_cache() -> None:
-    _load_provider_class.cache_clear()
-
-
-def get_provider_health() -> Dict[str, Dict[str, Any]]:
-    return _circuit_breaker.get_health(list(PROVIDERS.keys()))
+def list_providers() -> list:
+    results = []
+    provider_modules = {
+        "pollinations": "src.providers.pollinations",
+        "openrouter": "src.providers.openrouter",
+        "openai": "src.providers.openai",
+        "anthropic": "src.providers.anthropic",
+        "gemini": "src.providers.gemini",
+    }
+    for name, module_path in provider_modules.items():
+        try:
+            mod = __import__(module_path, fromlist=["META"])
+            if hasattr(mod, "META"):
+                results.append(mod.META)
+        except Exception:
+            pass
+    from src.config import COMPATIBLE_PRESETS
+    for name in COMPATIBLE_PRESETS:
+        results.append(ProviderMeta(name=name, display_name=name.capitalize(), requires_key=True))
+    return results
 
 
 def get_http_client() -> httpx.AsyncClient:

@@ -6,7 +6,6 @@ venv/
 env/
 .venv/
 .env
-les
 .idea/
 .vscode/
 tmp/
