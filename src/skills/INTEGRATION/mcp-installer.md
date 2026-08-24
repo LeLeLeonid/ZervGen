@@ -1,6 +1,7 @@
 ---
+name: mcp-installer
 description: "Add and install MCP servers to ZervGen"
-tags: [mcp, install, server, add, tool, model-context-protocol]
+tags: [mcp, mcps, install, server, model-context-protocol]
 ---
 # MCP Server Installer
 
@@ -21,7 +22,7 @@ result = await add_mcp_server(
     command="python",
     args='["-m", "mcp_server_fetch"]'
 )
-return await response(text=result)
+print(result)
 ```
 
 ```python
@@ -30,6 +31,7 @@ result = await add_mcp_server(
     command="npx",
     args='["-y", "@modelcontextprotocol/server-brave-search"]',
     env='{"BRAVE_API_KEY": "YOUR_KEY_HERE"}'
+    default=True # Add MCP as default
 )
 return await response(text=result)
 ```
@@ -37,9 +39,12 @@ return await response(text=result)
 ## Install Dependencies First
 
 ```python
-result = await run_shell("pip install mcp_server_fetch")
+result = await shell("pip install mcp_server_fetch")
 return await response(text=result)
 ```
 
-### Node.js packages (auto-installed by npx -y)
-No manual install needed when using `npx -y`.
+## Call a tool (arguments = JSON object string)
+```python
+result = await mcp_execute(server="time", tool="get_current_time", arguments='{"timezone": "Europe/Minsk"}')
+print(result)
+```

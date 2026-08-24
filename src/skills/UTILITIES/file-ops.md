@@ -1,61 +1,52 @@
 ---
-description: "File operations guide - reading, writing, exploring files and directories"
-tags: [file, read, write, edit, explore, codebase, directory, glob, grep, search, find]
+name: file-ops
+description: "Read, write, edit, search files and codebases"
+tags: [file, read, write, edit, explore, codebase, directory, glob, grep, search, find, skeleton, structure]
 ---
-# File Operations Guide
+# File Operations
 
-## Exploring a Codebase
-Always start by discovering what exists before reading.
+All tools return strings. Check for "Error:" prefix.
 
+## Explore → Analyze → Respond
+
+Scanning Codebase...
 ```python
-# List all files recursively
-files = await list_files(".", recursive=True)
+# 1. Explore structure without reading full files
+listing = await list_files("src/core", recursive=True)
 
-# Find specific file patterns
-py_files = await glob_files("**/*.py", path="src")
+skeleton = await get_code_skeleton("src/core/base_agent.py")
 
-# Search file contents
 matches = await grep_files("class.*Agent", path="src", use_regex=True)
-return await response(text=matches)
+
+# 2. Read what matters
+content = await read_file("src/core/base_agent.py")
+
+# 3. Do your analysis in code
+lines = content.split("\n")
+classes = [l.strip() for l in lines if l.strip().startswith("class ")]
 ```
 
-## Reading Files
+## Quick reference
+
 ```python
-# Read a single file
-content = await read_file("src/main.py")
-return await response(text=content[:500])
+# Explore
+await list_files("src", recursive=False, ignore_dir=True)
+await glob_files("**/*.py", path=".")
+await grep_files("pattern", path="src", file_type=".py", use_regex=False)
+await get_code_skeleton("path/to/file.py")
 
-# Read multiple files
-results = []
-for f in ["src/config.py", "src/main.py"]:
-    content = await read_file(f)
-    results.append(f"--- {f} ---\n{content[:200]}")
-return await response(text="\n".join(results))
+# Read
+await read_file(path="path/to/file.py", offset=0, max_chars=8000)
+
+# Write (BUILD mode only)
+await write_file("path/to/file.py", content="...")
+await append_file("log.txt", content="new line\n")
+await edit_file("path.py", find="old_text", replace="new_text")
 ```
 
-## Writing Files
-```python
-# Write new file
-await write_file("output/result.txt", content="Hello World")
-
-# Append to existing
-await append_file("log.txt", content="New entry\n")
-
-# Edit existing file (read first!)
-original = await read_file("src/config.py")
-result = await edit_file("src/config.py", find="old_line", replace="new_line")
-return await response(text=result)
-```
-
-## File Structure
-```python
-# Search for class/function definitions
-matches = await grep_files("class ", path="src", use_regex=False)
-return await response(text=matches)
-```
-
-## Common Patterns
-1. **Explore first**: `glob_files` → `read_file` (never read blindly)
-2. **Edit safely**: `read_file` → `edit_file` (always read before edit)
-3. **Search then read**: `grep_files` → `read_file` on matching files
-4. **Verify changes**: `read_file` after `write_file` to confirm
+## Rules
+- Never call response() after every tool. Scan everything first, analyze, then respond ONCE.
+- edit_file uses EXACT string match, not regex. Read first, copy exact text.
+- read_file returns full file. Slice in Python: content[1000:3000].
+- list_files excludes .git, __pycache__, venv, node_modules by default (ignore_dir=True).
+- grep_files default is literal search. Pass use_regex=True for regex.

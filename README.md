@@ -1,15 +1,28 @@
 # ZervGen
 
-**Autonomous AI Agent Framework**
+**Autonomous AI Agent Framework — v1.6.0 (alpha)**
 
-[![Version](https://img.shields.io/badge/Version-1.5.0-purple?style=for-the-badge)](https://github.com/LeLeLeonid/ZervGen)
+[![Version](https://img.shields.io/badge/Version-1.6.0-purple?style=for-the-badge)](https://github.com/LeLeLeonid/ZervGen)
 [![License](https://img.shields.io/badge/License-MIT-000000?style=for-the-badge)](LICENSE)
 
-ZervGen orchestrates multiple AI agents through a provider-agnostic layer with persistent memory, tool execution, and MCP integration. The Orchestrator delegates tasks to specialized sub-agents (coder, researcher, architect) with wave-based parallel execution.
+> ⚠️ **Alpha software.** v1.6.0 is a major rewrite and is **buggy**. Expect crashes, rough edges, and breaking changes. Use at your own risk.
 
-## Providers
+ZervGen is a multi-agent AI framework. It spins up specialized agents (coder, researcher, architect) that work together on your tasks, with persistent memory, tool execution, and Model Context Protocol (MCP) integration.
 
-OpenAI, Anthropic, Gemini, Groq, OpenRouter, SiliconFlow, Pollinations (free, default), Local (Ollama/LM Studio)
+## Features
+
+- **Multi-agent orchestration** — a supervisor decomposes tasks and spawns agents to work on them in parallel
+- **Provider-agnostic** — works with Anthropic, OpenAI, OpenRouter, Gemini, and Pollinations
+- **Persistent memory** — three-tier storage (knowledge graph, vector DB, session log)
+- **Tool execution** — 27 built-in tools: web search, file ops, shell, weather, git, and more
+- **MCP support** — connect external MCP servers for additional tools
+- **Skill system** — YAML-defined skills with pre/post validation contracts
+- **Slash commands** — control the agent from the terminal (role, mode, provider, memory, etc.)
+
+## Requirements
+
+- Python 3.10+
+- An API key for at least one provider (Anthropic, OpenAI, OpenRouter, Gemini, or Pollinations)
 
 ## Install
 
@@ -22,87 +35,54 @@ venv\Scripts\activate
 # Linux/Mac:
 source venv/bin/activate
 
-pip install httpx pydantic rich ddgs beautifulsoup4 fake_useragent aiofiles pyyaml
+pip install httpx pydantic rich ddgs beautifulsoup4 fake_useragent aiofiles pyyaml dirtyjson chromadb tiktoken simpleeval prompt_toolkit
 python main.py
-```
-
-## Usage
-
-Chat directly or use slash commands:
-
-- `/role` — Check agent role (code, architect, researcher, etc.)
-- `/mode` — Switch mode (ASK, PLAN, BUILD, DEBUG)
-- `/auto` — Toggle autonomous execution
-- `/provider [name]` — Switch AI provider
-- `/memory` — View memory
-- `/compact` — Compact memory
-- `/load` — Load previous session
-- `/history` — View conversation history
-- `/help` — Show all commands
-
-The orchestrator auto-delegates to specialized agents:
-> **User:** "Research the latest Python web frameworks and build a comparison table"
-> **ZervGen:** Spawns researcher → spawns coder → combines results
-
-## Architecture
-
-```
-main.py                      → Entry point
-src/
-├── cli.py                   → Rich CLI, menus, chat loop
-├── config.py                → Pydantic settings, config.json
-├── tools.py                 → 40+ tool functions, auto-registry
-├── utils.py                 → Token counting, retry, sanitization
-├── skills_loader.py         → Markdown role/skill loading
-├── core/
-│   ├── base_agent.py        → Agent execution loop
-│   ├── orchestrator.py      → Delegation, wave execution
-│   ├── memory.py            → Three-tier memory, ChromaDB
-│   ├── mcp_manager.py       → MCP server lifecycle
-│   └── provider.py          → Provider abstraction, circuit breaker
-├── providers/               → 8 provider implementations
-└── skills/                  → Agent roles (markdown + YAML)
-    ├── AGENTS/              → code, architect, researcher, game_dev, n8n
-    ├── INTEGRATION/         → github, skill-creator
-    └── UTILITIES/           → weather
-tmp/
-├── memory/
-│   ├── sessions/            → Session logs (JSONL)
-│   ├── knowledge_graph.json → Persistent facts
-│   └── vector_store/        → ChromaDB data
 ```
 
 ## Configuration
 
-Edit `config.json` or use the Settings menu (option 2 from main menu):
+Create a `.env` file in `~/.zervgen/` with your API keys:
 
-```json
-{
-  "provider": "openrouter",
-  "max_steps": 50,
-  "mode": "BUILD",
-  "auto_mode": true,
-  "memory_enabled": true,
-  "mcp_enabled": true,
-  "mcp_servers": {
-    "filesystem": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem"], "enabled": true }
-  }
-}
+```
+ANTHROPIC_API_KEY=sk-ant-...
+OPENAI_API_KEY=sk-...
+OPENROUTER_API_KEY=sk-or-...
+GEMINI_API_KEY=...
 ```
 
-Provider settings are in the same file under provider name keys.
+## Usage
 
-## Skills
+Run `python main.py`, then chat directly or use slash commands:
 
-Create agent roles by adding markdown files to `src/skills/AGENTS/`:
+- `/role` — Switch agent role (code, architect, researcher, etc.)
+- `/mode` — Switch mode (ASK, PLAN, BUILD)
+- `/provider [name]` — Switch AI provider
+- `/memory` — View memory
+- `/compact` — Compact memory
+- `/load` — Load a previous session
+- `/history` — View conversation history
+- `/help` — Show all commands
 
-```markdown
----
-description: "A security auditor"
-tools: ["read_file", "grep_files", "web_search", "response"]
----
-# Security Auditor
-You analyze code for vulnerabilities...
+## Project Layout
+
+```
+ZervGen/
+├── main.py             # Entry point
+├── src/
+│   ├── cli.py          # Terminal UI, chat loop, commands
+│   ├── config.py       # Settings + secret redaction
+│   ├── skills_loader.py# Skill validation + registry
+│   ├── tools.py        # 27 tool functions
+│   ├── utils.py        # Token counting, context, retry logic
+│   ├── core/
+│   │   ├── base_agent.py   # StemAgent execution engine
+│   │   ├── memory.py       # Three-tier memory (KG, vector, sessions)
+│   │   ├── orchestrator.py # Metacognitive supervisor
+│   │   ├── provider.py     # Provider wrappers
+│   │   └── mcp_manager.py  # MCP client
+│   ├── providers/       # Anthropic, OpenAI, OpenRouter, Gemini, Pollinations
+│   └── skills/          # Skill definitions (AGENTS, UTILITIES, INTEGRATION)
+└── requirements.txt
 ```
 
 ## License

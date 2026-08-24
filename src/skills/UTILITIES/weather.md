@@ -1,4 +1,5 @@
 ---
+name: weather
 description: "Get weather information for any location"
 tags: [weather, forecast, temperature, rain, sunny, cloudy, humidity, wind, climate]
 ---
@@ -13,7 +14,7 @@ return await response(text=result)
 ```
 
 ```python
-result = await get_weather(location="London", forecast=true)
+result = await get_weather(location="London", forecast=True)
 return await response(text=result)
 ```
 

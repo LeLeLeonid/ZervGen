@@ -24,7 +24,7 @@ class Provider(AIProvider):
     def get_model_name(cls, config) -> str:
         return config.openai.model
 
-    @async_retry(retries=3, delays=[2, 5, 10])
+    @async_retry(retries=5, delays=[2, 5, 10, 25, 60])
     async def generate_text(self, history: List[Dict], system_prompt: str, on_token: Optional[Callable[[str], None]] = None) -> str:
         messages = [{"role": "system", "content": system_prompt}] + history
         payload = {"model": self.settings.model, "messages": messages, "temperature": 0.7, "stream": on_token is not None}

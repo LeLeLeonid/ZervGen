@@ -25,7 +25,7 @@ class Provider(AIProvider):
     def get_model_name(cls, config) -> str:
         return config.anthropic.model
 
-    @async_retry(retries=3, delays=[2, 5, 10])
+    @async_retry(retries=5, delays=[2, 5, 10, 25, 60])
     async def generate_text(self, history: List[Dict], system_prompt: str, on_token: Optional[Callable[[str], None]] = None) -> str:
         messages = [{"role": m.get("role"), "content": m.get("content", "")} for m in history]
         payload = {

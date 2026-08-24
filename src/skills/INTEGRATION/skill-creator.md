@@ -1,10 +1,39 @@
 ---
-description: "Create and modify ZervGen skills/agents"
-tags: [skill, agent, new, make, generate, template, skill-creator]
+name: skill-creator
+description: "Create and modify ZervGen skills/agents with minimal frontmatter"
+tags: [skill, meta, skill-creator, template, agent]
+contract:
+  pre: {}
+  post: {}
+procedure:
+  - Parse intent & skill type
+  - Generate YAML frontmatter + Markdown body
+  - Write to correct directory
+  - Verify syntax & reload index
+dependencies: [write_file, list_files, skill_index.reload]
+verification: checklist
 ---
 # Skill Creator
 
-You create new ZervGen skills/agents by writing `.md` files to specific directories.
+You create new ZervGen skills/agents by writing `.md` files.
+
+## Important Rule
+**For standard skills, use:** `name`, `description`, `tags`.
+Everything else lives in the Markdown body. The loader ignores extra fields unless explicitly wired.
+
+## Advanced Fields
+Reserved for orchestrated, multi-step, or safety-critical workflows. If implemented in the runtime, they function as:
+- `contract.pre/post` → Python-level guards. Fails fast if required args are missing (`pre`) or output lacks expected keys/format (`post`). Bypasses critic on hard failures.
+- `procedure` → Machine-readable step list. Used by the critic as a deterministic grading rubric instead of freeform evaluation.
+- `dependencies` → Topological injection. Forces dependent skills/tools to load first. Prevents context race conditions in chained workflows.
+- `verification` → Critic mode switch. `checklist` grades against `procedure`. Future modes: `heavy` (parallel reasoning), `code_test` (unit execution), `rubric` (custom scoring).
+
+**Do not add these unless building state-chaining, auto-graded, or contract-bound agents.** They add zero overhead to standard skills.
+
+## Directory Map
+- `src/skills/AGENTS/` — Full agents. Requires `tools: [...]`. Spawned via `delegate_to()`.
+- `src/skills/UTILITIES/` — Context hints, routing triggers, PTC patterns. No `tools` list.
+- `src/skills/INTEGRATION/` — External APIs, webhooks, MCP bridges.
 
 ## How to Create a Skill
 
@@ -15,8 +44,10 @@ Use `write_file()` to create the skill file:
 result = await write_file(
     path="src/skills/AGENTS/my_agent.md",
     content='''---
+name: my_agent
 description: "Short description of what this agent does"
-tools: ["read_file", "write_file", "run_shell", "response"]
+tags: [agent, domain]
+tools: ["read_file", "write_file", "shell", "response"]
 ---
 # My Agent
 
@@ -37,6 +68,7 @@ return await response(text=result)
 result = await write_file(
     path="src/skills/UTILITIES/my_skill.md",
     content='''---
+name: my_skill
 description: "What this skill helps with"
 tags: [tag1, tag2, tag3]
 ---
@@ -49,27 +81,10 @@ Always do Y before Z.
 return await response(text=result)
 ```
 
-## File Locations
-- `src/skills/AGENTS/` — Full agents with tools list (spawned via delegate_to)
-- `src/skills/INTEGRATION/` — External integrations
-- `src/skills/UTILITIES/` — Simple utility skills (context hints only)
-
-## YAML Frontmatter Rules
-- `description` — One sentence, in quotes
-- `tools` — Array of tool names the agent can use. MUST include "response".
-- `tags` — Array of lowercase keywords for find_skill() matching
-- Agent files have tools: [...], skill files have tags: [...]
-
-## Available Tools for Agents
-- **File**: read_file, write_file, append_file, edit_file, list_files, glob_files, grep_files, get_code_skeleton
-- **Shell**: run_shell
-- **Web**: web_search, fetch_url, get_weather
-- **Memory**: add_memory, search_memory, promote_memory
-- **Delegation**: delegate_to, response
-- **Utility**: generate_uuid, hash_string, format_json, calc, manage_todo
-
-## After Creating
-- The skill/agent is available immediately (skills are loaded on demand)
-- Test with delegate_to(agent_name="my_agent", task="test task") for agents
-- Test with find_skill(tags=["tag1"]) for utility skills
-- Use list_skills() to verify it appears
+## Validation Checklist
+- Frontmatter is valid YAML with ONLY `name`, `description`, `tags` (+ `tools` for agents)
+- `name` matches filename (lowercase, hyphens)
+- Markdown body contains triggers, steps, constraints
+- Call `skill_index.reload()` after writing
+- Test agents: `delegate_to(agent_name="name", task="test")`
+- Test utilities: `find_skill(tags=["tag"])`
