@@ -1,5 +1,6 @@
 import json
 import logging
+import httpx
 from typing import List, Dict, Callable, Optional
 from src.core.provider import get_http_client, _record_failure, _record_success
 
@@ -12,13 +13,20 @@ class OpenAIProvider:
         self.base_url = base_url
         self.headers = headers
         self.model = model
+        self._cached_prefix_hash = None
 
     def get_model_name(self, config=None):
         return self.model
 
-    async def _non_stream(self, payload: dict) -> str:
+    def _is_reasoning_model(self) -> bool:
+        return any(k in self.model.lower() for k in ["o1", "o3", "r1", "reasoning", "deepseek-r", "deepseek-reasoner"])
+
+    async def _non_stream(self, payload: dict, timeout=None) -> str:
         client = get_http_client()
-        resp = await client.post(self.base_url, headers=self.headers, json=payload)
+        kwargs = {"headers": self.headers, "json": payload}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        resp = await client.post(self.base_url, **kwargs)
         if resp.status_code == 429:
             raise Exception(f"{self.name} rate limited (429)")
         if resp.status_code != 200:
@@ -36,12 +44,18 @@ class OpenAIProvider:
         if not content:
             finish = choices[0].get("finish_reason", "unknown")
             raise Exception(f"{self.name} empty content (finish_reason={finish})")
+        usage = data.get("usage", {})
+        if usage:
+            self._last_usage = usage
         return content
 
-    async def _stream(self, payload: dict, on_token: Callable) -> str:
+    async def _stream(self, payload: dict, on_token: Callable, timeout=None) -> str:
         client = get_http_client()
+        kwargs = {"headers": self.headers, "json": payload}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
         full = ""
-        async with client.stream("POST", self.base_url, headers=self.headers, json=payload) as resp:
+        async with client.stream("POST", self.base_url, **kwargs) as resp:
             if resp.status_code != 200:
                 body = await resp.aread()
                 raise Exception(f"{self.name} HTTP {resp.status_code}: {body.decode()[:500]}")
@@ -69,17 +83,22 @@ class OpenAIProvider:
         messages = [{"role": "system", "content": system_prompt}] + history
         payload = {"model": self.model, "messages": messages, "temperature": 0.7}
 
+        reasoning_timeout = None
+        if self._is_reasoning_model():
+            payload["temperature"] = 0.0
+            reasoning_timeout = httpx.Timeout(90.0, connect=10.0)
+
         if on_token:
             try:
-                result = await self._stream(payload, on_token)
+                result = await self._stream(payload, on_token, timeout=reasoning_timeout)
                 if result.strip():
                     _record_success(self.name)
                     return result
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"{self.name} stream failed, fallback to non-stream: {e}")
 
         try:
-            result = await self._non_stream(payload)
+            result = await self._non_stream(payload, timeout=reasoning_timeout)
             _record_success(self.name)
             return result
         except Exception as e:

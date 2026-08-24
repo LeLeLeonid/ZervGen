@@ -1,0 +1,120 @@
+{
+    "provider": "openrouter",
+    "max_steps": 50,
+    "tool_timeout": 60,
+    "delegation_timeout": 300,
+    "provider_timeout": 120,
+    "debug_mode": true,
+    "mcp_enabled": true,
+    "mcp_servers": {
+        "filesystem": {
+            "command": "npx",
+            "args": [
+                "-y",
+                "@modelcontextprotocol/server-filesystem",
+                "."
+            ],
+            "env": {},
+            "enabled": true
+        },
+        "git": {
+            "command": "python",
+            "args": [
+                "-m",
+                "mcp_server_git"
+            ],
+            "env": {},
+            "enabled": true
+        },
+        "fetch": {
+            "command": "python",
+            "args": [
+                "-m",
+                "mcp_server_fetch"
+            ],
+            "env": {},
+            "enabled": true
+        },
+        "sequential-thinking": {
+            "command": "npx",
+            "args": [
+                "-y",
+                "@modelcontextprotocol/server-sequential-thinking"
+            ],
+            "env": {},
+            "enabled": true
+        },
+        "everything": {
+            "command": "npx",
+            "args": [
+                "-y",
+                "@modelcontextprotocol/server-everything"
+            ],
+            "env": {},
+            "enabled": true
+        },
+        "puppeteer": {
+            "command": "npx",
+            "args": [
+                "-y",
+                "@modelcontextprotocol/server-puppeteer"
+            ],
+            "env": {},
+            "enabled": true
+        },
+        "roblox_studio": {
+            "command": "cmd.exe",
+            "args": [
+                "/c",
+                "cd /d %LOCALAPPDATA%\\Roblox && mcp.bat"
+            ],
+            "env": {},
+            "enabled": true
+        }
+    },
+    "allowed_directories": [
+        "./tmp",
+        "C:/Users/Public"
+    ],
+    "pollinations": {
+        "text_model": "openai",
+        "image_model": "flux",
+        "audio_model": "openai-audio",
+        "voice": "nova",
+        "reasoning_effort": "minimal",
+        "image_width": 1024,
+        "image_height": 1024,
+        "output_path": "tmp"
+    },
+    "gemini": {
+        "model": "gemini-2.0-flash",
+        "temperature": 0.7
+    },
+    "openrouter": {
+        "model": "~deepseek/deepseek-v4-flash-latest",
+        "vision_model": "allenai/molmo-2-8b:free",
+        "site_url": "https://github.com/LeLeLeonid/ZervGen",
+        "app_name": "ZervGen"
+    },
+    "openai": {
+        "model": "gpt-5.2"
+    },
+    "anthropic": {
+        "model": "claude-sonnet-4.5"
+    },
+    "compatible_presets": {},
+    "mode": "BUILD",
+    "memory_enabled": true,
+    "dream_enabled": true,
+    "dream_interval": 1200,
+    "accent_color": "red",
+    "history_trim_enabled": true,
+    "history_trim_size": 20,
+    "critic_enabled": true,
+    "critic_gate_threshold": 4.0,
+    "min_session_grade": 3.0,
+    "max_refine_rounds": 3,
+    "checkpoints_enabled": false,
+    "checkpoint_max_snapshots": 30,
+    "trace_enabled": true
+}

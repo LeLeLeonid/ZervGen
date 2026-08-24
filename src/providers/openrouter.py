@@ -22,11 +22,7 @@ class Provider(AIProvider):
             "X-Title": self.settings.app_name
         }
 
-    @classmethod
-    def get_model_name(cls, config) -> str:
-        return config.openrouter.model.split("/")[-1]
-
-    @async_retry(retries=3, delays=[2, 5, 10])
+    @async_retry(retries=5, delays=[2, 5, 10, 25, 60])
     async def generate_text(self, history: List[Dict], system_prompt: str, on_token=None) -> str:
         messages = [{"role": "system", "content": system_prompt}] + history
         payload = {"model": self.settings.model, "messages": messages, "temperature": 0.7}

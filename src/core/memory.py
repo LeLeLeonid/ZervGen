@@ -1,29 +1,268 @@
 import asyncio
 import json
 import logging
-import random
+import os
 import re
 import sqlite3
-import threading
+import tempfile
 import time
 import uuid
+import random
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from queue import Queue
+from threading import Lock
 
-MAX_SHORT_TERM = 100
+import yaml
+from src.config import MAX_SHORT_TERM, EVOLUTION_DIR
 
 logger = logging.getLogger(__name__)
 chromadb = None
+
+
+class SessionDB:
+    """SQLite-backed session storage with FTS5 search, WAL mode, and retry logic."""
+    MAX_RETRIES = 15
+
+    def __init__(self, db_path: Path = None):
+        self._db_path = db_path or Path("tmp/memory/sessions.db")
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = Lock()
+        self._init_db()
+
+    def _run_sync(self, func, *args):
+        return asyncio.get_running_loop().run_in_executor(self._executor, func, *args)
+
+    def _init_db(self) -> None:
+        conn = sqlite3.connect(str(self._db_path))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA cache_size=10000")
+        conn.execute("PRAGMA mmap_size=30000000000")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                provider TEXT,
+                model TEXT,
+                title TEXT,
+                started_at REAL,
+                ended_at REAL,
+                message_count INTEGER DEFAULT 0
+            )
+        """)
+        # Ensure last_grade column exists for session quality tracking
+        try:
+            conn.execute("ALTER TABLE sessions ADD COLUMN last_grade REAL DEFAULT 0.0")
+        except sqlite3.OperationalError:
+            pass
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT,
+                role TEXT,
+                content TEXT,
+                tool_name TEXT,
+                timestamp REAL,
+                FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            )
+        """)
+        try:
+            conn.execute("SELECT 1 FROM messages_fts LIMIT 1")
+        except sqlite3.OperationalError:
+            conn.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                    content,
+                    role,
+                    content='messages',
+                    content_rowid='rowid'
+                )
+            """)
+            conn.execute("""
+                CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+                    INSERT INTO messages_fts(rowid, content, role) VALUES (new.rowid, new.content, new.role);
+                END
+            """)
+            conn.execute("""
+                CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+                    INSERT INTO messages_fts(messages_fts, rowid, content, role) VALUES('delete', old.rowid, old.content, old.role);
+                END
+            """)
+            conn.execute("""
+                CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+                    INSERT INTO messages_fts(messages_fts, rowid, content, role) VALUES('delete', old.rowid, old.content, old.role);
+                    INSERT INTO messages_fts(rowid, content, role) VALUES (new.rowid, new.content, new.role);
+                END
+            """)
+        conn.commit()
+
+    def _retry(self, func, *args, **kwargs):
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                with self._lock:
+                    conn = sqlite3.connect(str(self._db_path))
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    conn.execute("PRAGMA synchronous=NORMAL")
+                    result = func(conn, *args, **kwargs)
+                    conn.commit()
+                    conn.close()
+                    return result
+            except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
+                if attempt >= self.MAX_RETRIES - 1 or "lock" not in str(e).lower():
+                    raise
+                delay = random.uniform(0.01, 0.05) * (2 ** attempt)
+                time.sleep(delay)
+        raise RuntimeError(f"Failed after {self.MAX_RETRIES} retries")
+
+    def create_session(self, provider: str = "", model: str = "") -> str:
+        session_id = str(uuid.uuid4())
+        now = time.time()
+        def _create(conn):
+            conn.execute(
+                "INSERT INTO sessions (id, provider, model, started_at) VALUES (?, ?, ?, ?)",
+                (session_id, provider, model, now)
+            )
+            conn.commit()
+        self._retry(_create)
+        return session_id
+
+    def delete_session(self, session_id: str) -> None:
+        def _del(conn):
+            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            conn.commit()
+        self._retry(_del)
+
+    def delete_all_sessions(self) -> None:
+        def _del(conn):
+            conn.execute("DELETE FROM messages")
+            conn.execute("DELETE FROM sessions")
+            conn.commit()
+        self._retry(_del)
+
+    def end_session(self, session_id: str) -> None:
+        def _update(conn):
+            conn.execute("UPDATE sessions SET ended_at = ? WHERE id = ?", (time.time(), session_id))
+            conn.commit()
+        self._retry(_update)
+
+    def set_session_title(self, session_id: str, title: str) -> None:
+        def _update(conn):
+            conn.execute("UPDATE sessions SET title = ? WHERE id = ?", (title, session_id))
+            conn.commit()
+        self._retry(_update)
+
+    def update_session_grade(self, session_id: str, grade: float) -> None:
+        def _update(conn):
+            conn.execute("UPDATE sessions SET last_grade = ? WHERE id = ?", (grade, session_id))
+            conn.commit()
+        self._retry(_update)
+
+    def save_message(self, session_id: str, role: str, content: str, tool_name: str = "", msg_id: str = None) -> str:
+        msg_id = msg_id or str(uuid.uuid4())
+        timestamp = time.time()
+        def _insert(conn):
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO messages (id, session_id, role, content, tool_name, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                (msg_id, session_id, role, content, tool_name, timestamp)
+            )
+            conn.execute("UPDATE sessions SET message_count = message_count + 1 WHERE id = ?", (session_id,))
+            conn.commit()
+            return cursor.lastrowid
+        self._retry(_insert)
+        return msg_id
+
+    def search(self, query: str, limit: int = 20) -> List[Dict]:
+        terms = [t for t in query.lower().split() if t]
+        if not terms:
+            return []
+        match_expr = " OR ".join(f'"{t}"' for t in terms)
+        def _search(conn):
+            try:
+                rows = conn.execute("""
+                    SELECT m.id, m.session_id, m.role, m.content, m.timestamp, s.title
+                    FROM messages_fts f
+                    JOIN messages m ON m.rowid = f.rowid
+                    JOIN sessions s ON m.session_id = s.id
+                    WHERE messages_fts MATCH ?
+                    ORDER BY rank LIMIT ?
+                """, (match_expr, limit)).fetchall()
+            except sqlite3.OperationalError:
+                return []
+            return [{"id": r[0], "session_id": r[1], "role": r[2],
+                     "content": (r[3] or "")[:300], "timestamp": r[4], "title": r[5]} for r in rows]
+        return self._retry(_search)
+
+    def load_session(self, session_id: str) -> Dict:
+        def _load(conn):
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id, provider, model, title, started_at, ended_at, message_count, last_grade 
+                FROM sessions WHERE id = ?
+            """, (session_id,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            #TODO: fix last_grade madness
+            session = {"id": row[0], "provider": row[1], "model": row[2], "title": row[3], "started_at": row[4], "ended_at": row[5], "message_count": row[6], "last_grade": row[7] if len(row) > 7 else 0.0}
+            cursor.execute("SELECT role, content, tool_name, timestamp FROM messages WHERE session_id = ? ORDER BY timestamp ASC", (session_id,))
+            session["messages"] = [{"role": r, "content": c, "tool_name": t, "timestamp": ts} for r, c, t, ts in cursor.fetchall()]
+            return session
+        return self._retry(_load)
+
+    def list_sessions(self, limit: int = 20, min_grade: float = 0.0) -> List[Dict]:
+        def _list(conn):
+            cursor = conn.cursor()
+            if min_grade and min_grade > 0:
+                cursor.execute("""
+                    SELECT s.id, s.provider, s.model, s.title, s.started_at, s.ended_at, s.message_count, s.last_grade
+                    FROM sessions s
+                    WHERE s.last_grade >= ?
+                    ORDER BY s.started_at DESC
+                    LIMIT ?
+                """, (min_grade, limit))
+                rows = cursor.fetchall()
+                return [{"id": r[0], "provider": r[1], "model": r[2], "title": r[3],
+                         "started_at": r[4], "ended_at": r[5], "message_count": r[6],
+                         "avg_grade": r[7]} for r in rows]
+            else:
+                cursor.execute("""
+                    SELECT s.id, s.provider, s.model, s.title, s.started_at, s.ended_at, s.message_count
+                    FROM sessions s
+                    ORDER BY s.started_at DESC
+                    LIMIT ?
+                """, (limit,))
+                rows = cursor.fetchall()
+                return [{"id": r[0], "provider": r[1], "model": r[2], "title": r[3],
+                         "started_at": r[4], "ended_at": r[5], "message_count": r[6]} for r in rows]
+        return self._retry(_list)
+
+    def get_stats(self) -> Dict[str, Any]:
+        def _stats(conn):
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM sessions")
+            sess = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM messages")
+            msgs = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM messages WHERE role = 'user'")
+            user_msgs = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM messages WHERE role = 'assistant'")
+            asst_msgs = cursor.fetchone()[0]
+            return {"sessions": sess, "messages": msgs, "user_messages": user_msgs, "assistant_messages": asst_msgs}
+        return self._retry(_stats)
+
+    def close(self) -> None:
+        pass  # WAL mode handles checkpoints automatically
 
 
 class KnowledgeGraph:
     def __init__(self, kg_file: Path):
         self._kg_file = kg_file
         self._data: Dict[str, Any] = {"facts": []}
-        self._lock = threading.Lock()
         self._load()
 
     def _load(self) -> None:
@@ -36,35 +275,37 @@ class KnowledgeGraph:
                 self._data = {"facts": []}
 
     def save(self) -> None:
-        with self._lock:
-            try:
-                self._kg_file.parent.mkdir(parents=True, exist_ok=True)
-                with open(self._kg_file, "w", encoding="utf-8") as f:
-                    json.dump(self._data, f, indent=2, ensure_ascii=False)
-            except Exception as e:
-                logger.error(f"Failed to save KG: {e}")
+        try:
+            self._kg_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._kg_file, "w", encoding="utf-8") as f:
+                json.dump(self._data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"Failed to save KG: {e}")
 
     def add_fact(self, fact: Dict) -> None:
-        with self._lock:
-            self._data.setdefault("facts", []).append(fact)
+        self._data.setdefault("facts", []).append(fact)
 
     def get_facts(self, tier: Optional[str] = None) -> List[Dict]:
-        with self._lock:
-            facts = self._data.get("facts", [])
-            return [f for f in facts if f.get("tier") == tier] if tier else list(facts)
+        facts = self._data.get("facts", [])
+        return [f for f in facts if f.get("tier") == tier] if tier else list(facts)
+
+    def remove_fact(self, fact_id: str) -> bool:
+        facts = self._data.get("facts", [])
+        original_len = len(facts)
+        self._data["facts"] = [f for f in facts if f.get("id") != fact_id]
+        return len(self._data["facts"]) < original_len
 
     def dedupe(self) -> int:
-        with self._lock:
-            seen = set()
-            unique = []
-            for f in self._data.get("facts", []):
-                content = f.get("content")
-                if content not in seen:
-                    seen.add(content)
-                    unique.append(f)
-            removed = len(self._data.get("facts", [])) - len(unique)
-            self._data["facts"] = unique
-            return removed
+        seen = set()
+        unique = []
+        for f in self._data.get("facts", []):
+            content = f.get("content")
+            if content not in seen:
+                seen.add(content)
+                unique.append(f)
+        removed = len(self._data.get("facts", [])) - len(unique)
+        self._data["facts"] = unique
+        return removed
 
 
 class VectorStore:
@@ -72,7 +313,6 @@ class VectorStore:
         self._vector_dir = vector_dir
         self._client = None
         self._collection = None
-        self._lock = threading.Lock()
         self._init()
 
     def _init(self) -> None:
@@ -82,7 +322,6 @@ class VectorStore:
                 import chromadb as _chromadb
                 chromadb = _chromadb
             except ImportError:
-                logger.warning("ChromaDB not installed")
                 return
         try:
             self._vector_dir.mkdir(parents=True, exist_ok=True)
@@ -92,25 +331,64 @@ class VectorStore:
             logger.warning(f"VectorStore init failed: {e}")
 
     def add(self, documents: List[str], metadatas: List[Dict], ids: List[str]) -> None:
-        if not self._collection:
-            return
-        with self._lock:
-            try:
-                self._collection.add(documents=documents, metadatas=metadatas, ids=ids)
-            except Exception as e:
-                logger.debug(f"Vector add failed: {e}")
+        if not self._collection: return
+        try: self._collection.add(documents=documents, metadatas=metadatas, ids=ids)
+        except Exception as e: logger.debug(f"Vector add failed: {e}")
 
     def search(self, query: str, n: int = 10) -> List[Dict]:
-        if not self._collection:
-            return []
-        with self._lock:
-            try:
-                results = self._collection.query(query_texts=[query], n_results=n)
-                if results["documents"] and results["documents"][0]:
-                    return [{"content": d, "rank": i + 1} for i, d in enumerate(results["documents"][0])]
-            except Exception as e:
-                logger.debug(f"Vector search failed: {e}")
+        if not self._collection: return []
+        try:
+            results = self._collection.query(query_texts=[query], n_results=n)
+            if results["documents"] and results["documents"][0]:
+                return [{"content": d, "rank": i + 1} for i, d in enumerate(results["documents"][0])]
+        except Exception as e: logger.debug(f"Vector search failed: {e}")
         return []
+
+
+class BM25Index:
+    def __init__(self, k1: float = 1.5, b: float = 0.75):
+        self.k1 = k1
+        self.b = b
+        self._docs: List[tuple] = []
+        self._idf: Dict[str, float] = {}
+        self._avg_len: float = 0
+
+    def add(self, doc_id: str, text: str) -> None:
+        self._docs.append((doc_id, text.lower().split()))
+        N = len(self._docs)
+        self._avg_len = sum(len(t) for _, t in self._docs) / max(N, 1)
+        df: Dict[str, int] = {}
+        for _, tokens in self._docs:
+            for t in set(tokens):
+                df[t] = df.get(t, 0) + 1
+        self._idf = {t: ((N - f + 0.5) / (f + 0.5) + 1) for t, f in df.items()}
+
+    def index(self, documents: List[tuple]):
+        self._docs = [(did, text.lower().split()) for did, text in documents]
+        N = len(self._docs)
+        self._avg_len = sum(len(t) for _, t in self._docs) / max(N, 1)
+        df: Dict[str, int] = {}
+        for _, tokens in self._docs:
+            for t in set(tokens):
+                df[t] = df.get(t, 0) + 1
+        self._idf = {t: ((N - f + 0.5) / (f + 0.5) + 1) for t, f in df.items()}
+
+    def search(self, query: str, limit: int = 10) -> List[Dict]:
+        qtokens = query.lower().split()
+        scores = []
+        for did, dtokens in self._docs:
+            score = 0.0
+            dl = len(dtokens)
+            for qt in qtokens:
+                if qt not in self._idf: continue
+                tf = dtokens.count(qt)
+                score += self._idf[qt] * (tf * (self.k1 + 1)) / (tf + self.k1 * (1 - self.b + self.b * dl / max(self._avg_len, 1)))
+            if score > 0:
+                scores.append({"id": did, "score": score, "rank": 0})
+        scores.sort(key=lambda x: -x["score"])
+        for i, s in enumerate(scores[:limit]):
+            s["rank"] = i + 1
+        return scores[:limit]
 
 
 class MemoryCore:
@@ -128,74 +406,131 @@ class MemoryCore:
         self._initialized = True
 
         self._memory_dir = Path("tmp/memory")
-        self._sessions_dir = self._memory_dir / "sessions"
         self._kg_file = self._memory_dir / "knowledge_graph.json"
         self._vector_dir = self._memory_dir / "vector_store"
-
+        self._blocks_file = self._memory_dir / "runtime_blocks.json"
         self._memory_dir.mkdir(parents=True, exist_ok=True)
-        self._sessions_dir.mkdir(parents=True, exist_ok=True)
 
         self._short_term: deque = deque(maxlen=MAX_SHORT_TERM)
-        self._session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._session_file = self._sessions_dir / f"session_{self._session_id}.jsonl"
-        self._file_lock = threading.Lock()
-
         self._kg = KnowledgeGraph(self._kg_file)
         self._vector = VectorStore(self._vector_dir)
+        self._bm25 = BM25Index()
+        self._session_db = SessionDB()
+        self._active_session_id: Optional[str] = None
+        self._triggered_this_session: set = set()  # track auto-injected skills per session
+        self._rebuild_bm25()
 
-        self._save_queue: Queue = Queue()
-        self._save_thread = threading.Thread(target=self._save_worker, daemon=True)
-        self._save_thread.start()
+    def _rebuild_bm25(self):
+        docs = [(f.get("id", ""), f.get("content", "")) for f in self._kg.get_facts()]
+        self._bm25.index(docs)
 
-    def _save_worker(self) -> None:
-        while True:
-            try:
-                item = self._save_queue.get()
-                if item is None:
-                    break
-                while True:
-                    try:
-                        self._save_queue.get_nowait()
-                    except Exception:
-                        break
-                self._kg.save()
-            except Exception as e:
-                logger.error(f"Save worker error: {e}")
+    def search_memory(self, query: str, limit: int = 10) -> List[Dict]:
+        if not query.strip():
+            return []
+        vector_results = self._vector.search(query, n=limit * 2)
+        bm25_results = self._bm25.search(query, limit=limit * 2)
+        merged_scores = self._rrf_rank(vector_results + bm25_results, k=60)
+        sorted_items = sorted(merged_scores.items(), key=lambda x: -x[1])[:limit]
+        results = []
+        for content, score in sorted_items:
+            fact = next((f for f in self._kg.get_facts() if f.get("content") == content), None)
+            results.append({"content": content, "score": score, "fact": fact})
+        return results
 
-    def _enqueue_save(self) -> None:
-        self._save_queue.put(True)
+    def inject_context(self, query: str, limit: int = 5, trusted_sources=None) -> str:
+        if not query.strip():
+            return ""
+        pinned = [f.get("content", "") for f in self._kg.get_facts() if f.get("category") == "context"]
+        lessons = [f.get("content", "") for f in self._kg.get_facts() if f.get("category") == "lesson"]
+        return "\n".join(pinned[:2] + lessons[:3]).strip()
 
-    def shutdown(self) -> None:
-        self._save_queue.put(None)
+    def search_tgs(self, query: str, limit: int = 3) -> str:
+        facts = self._kg.get_facts()
+        if len(facts) < 500 and facts:
+            text_hits = self.search_memory(query, limit=limit*2)
+            if not text_hits:
+                return ""
+            import re
+            term_pat = re.compile(r'\b[A-Z][a-z]{2,}\b|"[^"]+"|\'[^\']+\'|\b[a-z]{4,}\b')
+            adj, fact_terms = {}, {}
+            for f in facts:
+                content = f.get("content", "")
+                terms = list(set(term_pat.findall(content)))
+                fact_terms[f.get("id", id(f))] = terms
+                for t in terms:
+                    adj.setdefault(t, set()).update(terms)
+                    adj[t].discard(t)
+            query_terms = set(term_pat.findall(query))
+            seeds = [t for t in query_terms if t in adj][:3]
+            if seeds:
+                paths, visited = [], set()
+                queue = [(s, [s]) for s in seeds]
+                while queue and len(paths) < 5:
+                    node, path = queue.pop(0)
+                    if len(path) > 2:
+                        visited.add(node)
+                        continue
+                    for nb in adj.get(node, []):
+                        if nb not in path:
+                            new_path = path + [nb]
+                            if len(new_path) == 2:
+                                paths.append(new_path)
+                            else:
+                                queue.append((nb, new_path))
+                path_entities = {e for p in paths for e in p}
+                scored = []
+                for h in text_hits:
+                    content = h.get("content", "")
+                    overlap = sum(1 for e in path_entities if e in content)
+                    final_score = h.get("score", 0) * 0.7 + overlap * 0.3
+                    scored.append((final_score, h))
+                scored.sort(key=lambda x: x[0], reverse=True)
+                ranked_text = [h for _, h in scored[:limit]]
+                text_entities = set()
+                for h in ranked_text:
+                    text_entities.update(term_pat.findall(h.get("content", "")))
+                orphans = text_entities - path_entities
+                rescued = []
+                for o in list(orphans)[:2]:
+                    if o in adj and adj[o]:
+                        rescued.append([o, list(adj[o])[0]])
+                path_str = "\n".join(" -> ".join(p) for p in paths + rescued)
+                text_str = "\n".join(h.get("content", "") for h in ranked_text)
+                raw = f"[GRAPH PATHS]\n{path_str}\n[/GRAPH PATHS]\n[TEXT EVIDENCE]\n{text_str}\n[/TEXT EVIDENCE]"
+                return raw
+            return "\n".join(h.get("content", "") for h in text_hits[:limit])
+        return self.inject_context(query, limit=limit)
 
     def _create_fact(self, content: str, category: str, tier: str) -> Dict:
-        return {
-            "id": str(uuid.uuid4())[:8],
-            "timestamp": time.time(),
-            "content": str(content),
-            "category": str(category),
-            "tier": tier
-        }
+        return {"id": str(uuid.uuid4())[:8], "timestamp": time.time(), "content": str(content), "category": str(category), "tier": tier}
 
-    def add_memory(self, content: str, category: str = "general", tier: str = "now") -> str:
+    async def add_memory(self, content: str, category: str = "general", tier: str = "now", critic_score: float = 0.0, source: str = "user") -> str:
+        GRADED_AND_FAILED = 0 < critic_score < 4.0
+        if GRADED_AND_FAILED:
+            return "Memory rejected: graded below threshold"
+        if len(content) < 10 or len(content) > 2000:
+            return "Memory rejected: invalid length"
+        if any(kw in content.lower() for kw in ("error:", "traceback", "syntaxerror", "nameerror", "ptc result:", "occurred:")):
+            return "Memory rejected: probable error dump"
+        
         fact = self._create_fact(content, category, tier)
+        fact["source"] = source
+        self._kg.add_fact(fact)
+        self._vector.add([content], [fact], [fact["id"]])
+        self._bm25.add(fact["id"], content)
+        self._short_term.append(fact)
+        self._kg.save()
+        return f"Stored blueprint (grade:{critic_score})"
 
-        self._short_term.append({
-            "id": fact["id"], "content": content, "category": category,
-            "timestamp": datetime.now().isoformat(), "tier": tier
-        })
-
-        if tier in ("recent", "long_term"):
-            self._kg.add_fact(fact)
-            self._enqueue_save()
-
-        self._vector.add(
-            documents=[content],
-            metadatas=[{"category": category, "timestamp": fact["timestamp"], "tier": tier}],
-            ids=[fact["id"]]
-        )
-
-        return f"Memory stored: [{tier}] {content[:100]}"
+    def prune_toxic(self, threshold_hits: int = 5, success_rate: float = 0.5) -> int:
+        # Auto-drop blueprints recalled often but failing
+        removed = 0
+        for f in list(self._kg.get_facts()):
+            if f.get("hits", 0) >= threshold_hits and f.get("success_rate", 1.0) < success_rate:
+                self._kg.remove_fact(f["id"])
+                removed += 1
+        if removed: self._kg.save()
+        return removed
 
     def promote_memory(self, memory_id: str, new_tier: str) -> str:
         for item in self._short_term:
@@ -207,31 +542,55 @@ class MemoryCore:
                         fact = self._create_fact(item["content"], item.get("category", "general"), new_tier)
                         fact["id"] = item["id"]
                         self._kg.add_fact(fact)
-                        self._enqueue_save()
+                        self._kg.save()
+                        self._rebuild_bm25()
                 return f"Promoted {memory_id} to {new_tier}"
         return f"Memory {memory_id} not found"
 
     def _rrf_rank(self, results: List[Dict], k: int = 60) -> Dict[str, float]:
         scores: Dict[str, float] = {}
         for r in results:
-            scores[r["content"]] = scores.get(r["content"], 0) + 1 / (k + r["rank"])
+            key = r.get("content") or r.get("id", "")
+            scores[key] = scores.get(key, 0) + 1 / (k + r["rank"])
         return scores
 
-    def search_memory(self, query: str, limit: int = 5) -> List[Dict]:
-        semantic = self._vector.search(query, n=limit * 2)
-        query_lower = query.lower()
-        keyword = [
-            {"content": fact.get("content", ""), "rank": i + 1}
-            for i, fact in enumerate(self._kg.get_facts())
-            if query_lower in fact.get("content", "").lower()
-        ]
+    def compress_context(self, query: str, limit: int = 5) -> str:
+        raw = self.search_memory(query, limit * 2)
+        if not raw: return ""
+        signal_lines = []
+        for doc in raw:
+            text = doc.get("content", "")
+            for line in text.splitlines():
+                line = line.strip()
+                if any(c in line for c in "0123456789[]{}()=<>!:/\\") or len(line.split()) <= 12:
+                    signal_lines.append(line)
+        max_lines = max(3, len(signal_lines) // 5)
+        return "\n".join(signal_lines[:max_lines])
 
-        combined = self._rrf_rank(semantic)
-        for content, score in self._rrf_rank(keyword).items():
-            combined[content] = combined.get(content, 0) + score
+    def search_progressive(self, query: str, depth: str = "summary", limit: int = 5) -> List[Dict]:
+        if depth == "summary":
+            return self.search_memory(query, limit)
+        if depth == "detail":
+            results = self.search_memory(query, limit)
+            fact_by_id = {f.get("id", ""): f for f in self._kg.get_facts()}
+            for r in results:
+                fid = next((fid for fid, f in fact_by_id.items() if f.get("content") == r.get("content")), None)
+                if fid:
+                    r["detail"] = fact_by_id[fid]
+            return results
+        if depth == "raw":
+            results = self.search_memory(query, limit)
+            raw = self.search_sessions(query, limit)
+            return results + [{"content": r["content"], "source": f"session:{r.get('session_id', '')}", "score": 0.5} for r in raw]
+        return self.search_memory(query, limit)
 
-        sorted_results = sorted(combined.items(), key=lambda x: x[1], reverse=True)
-        return [{"content": c, "score": s} for c, s in sorted_results[:limit]]
+    def search_sessions(self, query: str, limit: int = 10) -> List[Dict]:
+        # Use SQLite session DB FTS search
+        try:
+            return self._session_db.search(query, limit)
+        except Exception as e:
+            logger.error(f"search_sessions error: {e}")
+            return []
 
     def get_recent_memories(self, limit: int = 10) -> List[Dict]:
         return list(self._short_term)[-limit:]
@@ -246,127 +605,99 @@ class MemoryCore:
     def evolve(self) -> str:
         removed = self._kg.dedupe()
         if removed > 0:
-            self._enqueue_save()
+            self._kg.save()
+            self._rebuild_bm25()
             return f"Removed {removed} duplicates."
         return "Memory optimal."
 
     def log_event_sync(self, role: str, content: str, event_type: str = "message", mode: str = ""):
-        entry = {
-            "id": str(uuid.uuid4())[:8],
-            "timestamp": datetime.now().isoformat(),
-            "role": "user" if event_type in ("task", "input") else role,
-            "content": content,
-            "type": event_type,
-            "mode": mode
-        }
-
-        with self._file_lock:
+        from src.utils import redact_fast
+        entry = {"id": str(uuid.uuid4())[:8], "timestamp": datetime.now().isoformat(), "role": "user" if event_type in ("task", "input") else role, "content": redact_fast(content), "type": event_type, "mode": mode}
+        self._short_term.append(entry)
+        if self._active_session_id:
             try:
-                self._session_file.parent.mkdir(parents=True, exist_ok=True)
-                with open(self._session_file, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            except Exception as e:
-                logger.error(f"Log error: {e}")
+                self._session_db.save_message(
+                    session_id=self._active_session_id,
+                    role=entry["role"],
+                    content=entry["content"],
+                    tool_name=event_type if event_type in ("tool_call", "tool_result", "ptc_call", "ptc_result") else ""
+                )
+            except Exception:
+                pass
 
-    def load_session(self, filename: str):
-        safe = Path(filename).name
-        if safe != filename or ".." in filename:
-            return [], "build", "system", []
+    def clear_short_term(self): self._short_term.clear()
+    def clear_triggered_skills(self): self._triggered_this_session.clear()
 
-        filepath = self._sessions_dir / safe
-        if not filepath.resolve().is_relative_to(self._sessions_dir.resolve()):
-            return [], "build", "system", []
-        if not filepath.exists():
-            return [], "build", "system", []
+    def set_active_session(self, session_id: str) -> None:
+        self._active_session_id = session_id
+        self._triggered_this_session.clear()
+        session = self._session_db.load_session(session_id)
+        if session:
+            self.clear_short_term()
+            for msg in session.get("messages", []):
+                self._short_term.append({
+                    "id": msg.get("id", str(uuid.uuid4())[:8]),
+                    "timestamp": msg.get("timestamp", time.time()),
+                    "role": msg.get("role", "user"),
+                    "content": msg.get("content", ""),
+                    "type": msg.get("role", "user")
+                })
 
-        history, mode, last_role = [], "build", "system"
-        short_term_items = []
-        valid_roles = ("system", "user", "assistant")
-        conversation_types = {"input", "response", "direct", "task", "agent_start", "delegation_result", "loop", "manual", "auto_result", "auto_error"}
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                for line in f:
-                    if not line.strip():
-                        continue
-                    entry = json.loads(line)
-                    raw_role = entry.get("role", "system")
-                    role = raw_role if raw_role in valid_roles else "assistant"
+    def get_active_session(self) -> Optional[str]:
+        return self._active_session_id
 
-                    entry_type = entry.get("type", "")
-                    if entry_type in conversation_types or not entry_type:
-                        history.append({"role": role, "content": entry.get("content", "")})
-
-                    if entry.get("mode"):
-                        mode = entry["mode"]
-                    if entry.get("type") == "session_start" and entry.get("role"):
-                        last_role = entry["role"]
-
-                    content = entry.get("content", "")
-                    if content.startswith("ROLE:"):
-                        last_role = content.split(":", 1)[1].strip()
-                    elif content.startswith("MODE:"):
-                        mode = content.split(":", 1)[1].strip()
-
-                    short_term_items.append({
-                        "id": entry.get("id", str(uuid.uuid4())[:8]),
-                        "content": content,
-                        "category": entry.get("category", "general"),
-                        "timestamp": entry.get("timestamp", datetime.now().isoformat()),
-                        "tier": entry.get("tier", "now")
-                    })
-
-            self._session_file = filepath
-            self._session_id = filename.replace("session_", "").replace(".jsonl", "")
-        except Exception as e:
-            logger.error(f"Load session error: {e}")
-
-        return history, mode, last_role, short_term_items
+    def get_session_history(self, session_id: str) -> List[Dict]:
+        session = self._session_db.load_session(session_id)
+        return session.get("messages", []) if session else []
 
     def get_stats(self) -> Dict[str, Any]:
-        recent_count = len(list(self._sessions_dir.glob("session_*.jsonl"))) if self._sessions_dir.exists() else 0
-        return {
+        stats = {
             "now_count": len(self._short_term),
-            "recent_sessions": recent_count,
             "long_term_facts": len(self._kg.get_facts()),
             "vector_enabled": self._vector._collection is not None,
-            "session_id": self._session_id,
+            "bm25_docs": len(self._bm25._docs),
+            "blocks": len(self.get_runtime_blocks()),
+            "sessions": self._session_db.get_stats().get("sessions", 0),
+            "session_messages": self._session_db.get_stats().get("messages", 0)
         }
+        return stats
 
-    def clear_short_term(self):
-        self._short_term.clear()
-
-    def clear_current_session(self):
-        self._short_term.clear()
+    def get_runtime_blocks(self) -> List[Dict]:
+        if not self._blocks_file.exists():
+            return []
         try:
-            with open(self._session_file, "w", encoding="utf-8") as f:
-                f.truncate(0)
+            return json.loads(self._blocks_file.read_text("utf-8"))
         except Exception:
-            pass
+            return []
 
-    def new_session(self):
-        self._short_term.clear()
-        self._session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._session_file = self._sessions_dir / f"session_{self._session_id}.jsonl"
-        header = {
-            "id": self._session_id,
-            "timestamp": datetime.now().isoformat(),
-            "role": "system",
-            "content": f"__SESSION_START__: {self._session_id}",
-            "type": "session_start",
-            "mode": "build"
-        }
-        try:
-            self._session_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(self._session_file, "w", encoding="utf-8") as f:
-                f.write(json.dumps(header, ensure_ascii=False) + "\n")
-        except Exception as e:
-            logger.error(f"New session error: {e}")
+    def add_runtime_block(self, detect: str, reason: str, fix: str, source: str = ""):
+        blocks = self.get_runtime_blocks()
+        for b in blocks:
+            if b.get("detect") == detect:
+                b["hits"] = b.get("hits", 0) + 1
+                break
+        else:
+            blocks.append({"detect": detect, "reason": reason, "fix": fix, "source": source, "hits": 1, "created": time.time()})
+        self._blocks_file.parent.mkdir(parents=True, exist_ok=True)
+        self._blocks_file.write_text(json.dumps(blocks, indent=2, ensure_ascii=False), "utf-8")
+
+    def compress_session_context(self, session_id: str, limit: int = 5) -> str:
+        session = self._session_db.load_session(session_id)
+        if not session: return ""
+        messages = session.get("messages", [])
+        if not messages: return ""
+        recent = messages[-30:]
+        transcript = "\n".join(f"{m.get('role','?')}: {str(m.get('content',''))[:300]}" for m in recent)
+        lines = [l.strip() for l in transcript.splitlines() if l.strip()]
+        signal = [l for l in lines
+                  if any(c in l for c in "0123456789[]{}()=<>!:/") or len(l.split()) <= 12]
+        if not signal: signal = lines
+        max_lines = max(3, int(len(signal) * 0.2))
+        return "\n".join(signal[:max_lines])
 
 
 memory_core = MemoryCore()
 
-
-from dataclasses import dataclass, field
 
 @dataclass
 class PeerCard:
@@ -380,12 +711,9 @@ class PeerCard:
 
     def to_prompt_block(self) -> str:
         lines = [f"### {self.agent_id}/{self.domain}"]
-        if self.facts:
-            lines.append("Facts: " + "; ".join(self.facts[:5]))
-        if self.strategies:
-            lines.append("Works: " + "; ".join(self.strategies[:3]))
-        if self.anti_patterns:
-            lines.append("Avoid: " + "; ".join(self.anti_patterns[:3]))
+        if self.facts: lines.append("Facts: " + ", ".join(self.facts[:5]).replace("→", "->").replace("←", "<-"))
+        if self.strategies: lines.append("Works: " + ", ".join(self.strategies[:3]).replace("→", "->").replace("←", "<-"))
+        if self.anti_patterns: lines.append("Avoid: " + ", ".join(self.anti_patterns[:3]).replace("→", "->").replace("←", "<-"))
         return "\n".join(lines)
 
 
@@ -402,23 +730,17 @@ class PeerCards:
 
     def _load(self):
         if self._file.exists():
-            try:
-                self._cards = {k: PeerCard(**v) for k, v in json.loads(self._file.read_text("utf-8")).items()}
-            except Exception:
-                self._cards = {}
+            try: self._cards = {k: PeerCard(**v) for k, v in json.loads(self._file.read_text("utf-8")).items()}
+            except Exception: self._cards = {}
 
     def _save(self):
         self._file.parent.mkdir(parents=True, exist_ok=True)
-        data = {k: {"agent_id": v.agent_id, "domain": v.domain, "facts": v.facts,
-                     "strategies": v.strategies, "anti_patterns": v.anti_patterns,
-                     "tool_preferences": v.tool_preferences, "confidence": v.confidence}
-                for k, v in self._cards.items()}
+        data = {k: {"agent_id": v.agent_id, "domain": v.domain, "facts": v.facts, "strategies": v.strategies, "anti_patterns": v.anti_patterns, "tool_preferences": v.tool_preferences, "confidence": v.confidence} for k, v in self._cards.items()}
         self._file.write_text(json.dumps(data, indent=2, ensure_ascii=False), "utf-8")
 
     def get_relevant(self, agent_id: str, query: str = "", limit: int = 2) -> List[PeerCard]:
         cards = [c for k, c in self._cards.items() if c.agent_id == agent_id]
-        if not cards:
-            cards = list(self._cards.values())
+        if not cards: cards = list(self._cards.values())
         q = query.lower()
         scored = [(c.confidence + (3 if c.domain.lower() in q else 0), c) for c in cards if c.confidence > 0]
         scored.sort(key=lambda x: -x[0])
@@ -436,23 +758,39 @@ class PeerCards:
             self._cards[key] = card
         self._save()
 
+    async def evolve(self) -> None:
+        import aiofiles
+        EVOLUTION_DIR.mkdir(parents=True, exist_ok=True)
+        candidate = random.choice(self._cards) if self._cards else None
+
 
 class Dreamer:
-    def __init__(self, provider, memory, interval: int = 300):
+    def __init__(self, provider, memory, interval: int = 300, orchestrator=None):
         self.provider = provider
         self.memory = memory
+        self.orchestrator = orchestrator
         self.interval = max(60, interval)
         self._running = False
         self._task = None
         self._cards = PeerCards()
-        self._session_dir = Path("tmp/memory/sessions")
         self._last_check = 0
         self._error_count = 0
         self._max_errors = 5
+        self._patterns_file = Path("tmp/memory/error_patterns.json")
+        self._error_patterns = self._load_patterns()
+
+    def _load_patterns(self) -> Dict[str, Dict]:
+        if self._patterns_file.exists():
+            try: return json.loads(self._patterns_file.read_text("utf-8"))
+            except Exception: return {}
+        return {}
+
+    def _save_patterns(self):
+        self._patterns_file.parent.mkdir(parents=True, exist_ok=True)
+        self._patterns_file.write_text(json.dumps(self._error_patterns, indent=2, ensure_ascii=False), "utf-8")
 
     async def start(self):
-        if self._running:
-            return
+        if self._running: return
         self._running = True
         self._task = asyncio.create_task(self._loop())
 
@@ -460,17 +798,14 @@ class Dreamer:
         self._running = False
         if self._task:
             self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+            try: await self._task
+            except asyncio.CancelledError: pass
 
     async def _loop(self):
         while self._running:
             try:
                 await asyncio.sleep(self.interval)
-                if not self._running:
-                    break
+                if not self._running: break
                 await self._cycle()
                 self._error_count = 0
             except asyncio.CancelledError:
@@ -479,183 +814,128 @@ class Dreamer:
                 self._error_count += 1
                 logger.error(f"Dream error ({self._error_count}/{self._max_errors}): {e}")
                 if self._error_count >= self._max_errors:
-                    logger.warning("Dreamer stopped after too many errors")
-                    self._running = False
-                    break
+                    logger.error("Dreamer: too many errors, backing off 30min")
+                    await asyncio.sleep(1800)
+                    self._error_count = 0  # reset after cooldown
                 await asyncio.sleep(min(60 * self._error_count, 300))
 
     async def _cycle(self):
+        if self.orchestrator and getattr(self.orchestrator, '_user_active', False):
+            return
         await self._check_errors()
+        await self._check_task_state()
+        removed = self.memory.prune_toxic(threshold_hits=5, success_rate=0.5)
+        if removed > 0:
+            logger.debug(f"[DREAM] Pruned {removed} toxic memories")
         await self._extract_facts()
+        await self._write_lessons()
+
+    async def _check_task_state(self):
+        if not self.orchestrator or not self.orchestrator.history:
+            return
+        agent = self.orchestrator
+        if agent._repeat_count >= 2:
+            logger.debug("[LOOP] Task stuck: same result %sx: %s", agent._repeat_count, str(agent._last_result)[:100])
+            agent._repeat_count = 0
+        last = agent.history[-1].get("content", "")
+        if any(s in last for s in ("[STOP]", "Max steps", "Error:")):
+            logger.debug("[STUCK] Task stalled: %s", last)
 
     async def _check_errors(self):
-        if not self._session_dir.exists():
-            return
-        files = sorted(self._session_dir.glob("session_*.jsonl"), key=lambda f: f.stat().st_mtime)
-        if not files:
-            return
-        latest = files[-1]
-        if latest.stat().st_mtime <= self._last_check:
-            return
-        self._last_check = latest.stat().st_mtime
+        self._error_patterns = self._load_patterns()
         try:
-            lines = latest.read_text("utf-8").strip().split("\n")
-            events = [json.loads(l) for l in lines[-20:] if l.strip()]
-        except Exception:
-            return
+            sessions = self.memory._session_db.list_sessions(limit=10)
+            for sess in sessions:
+                session_id = sess["id"]
+                session_data = self.memory._session_db.load_session(session_id)
+                if not session_data:
+                    continue
+                messages = session_data.get("messages", [])
+                if not messages:
+                    continue
+                last_check = self._last_check
+                recent_messages = [m for m in messages[-30:] if m.get("timestamp", 0) > last_check]
+                if not recent_messages:
+                    continue
+                self._last_check = max(m.get("timestamp", 0) for m in recent_messages) if recent_messages else self._last_check
+                for i, msg in enumerate(recent_messages):
+                    content = str(msg.get("content", ""))
+                    if not any(p in content for p in ("Error:", "SyntaxError", "ModuleNotFoundError", "FAILED:")):
+                        continue
+                    context_msgs = [str(recent_messages[j].get("content", ""))[:300] for j in range(max(0, i - 3), i) if recent_messages[j].get("tool_name")]
+                    context = "\n".join(context_msgs)
+                    pattern_key = content[:120]
+                    existing = self._error_patterns.get(pattern_key, {"count": 0, "first_seen": time.time(), "last_seen": 0})
+                    existing["count"] += 1
+                    existing["last_seen"] = time.time()
+                    if existing["count"] <= 2:
+                        diag = await self._diagnose(content, context)
+                        if diag:
+                            existing.update(diag)
+                            if diag.get("detect"):
+                                self.memory.add_runtime_block(
+                                    detect=diag["detect"],
+                                    reason=diag.get("reason", ""),
+                                    fix=diag.get("fix", ""),
+                                    source=pattern_key[:80]
+                                )
+                    self._error_patterns[pattern_key] = existing
+                    self._save_patterns()
+        except Exception as e:
+            logger.error(f"Dreamer _check_errors error: {e}")
 
-        errors = [str(e.get("content", "")) for e in events
-                  if any(p in str(e.get("content", "")) for p in ("Error:", "SyntaxError", "ModuleNotFoundError"))]
-
-        for err in errors[:3]:
-            diag = await self._diagnose(err)
-            if diag:
-                self.memory.add_memory(f"Diag: {err[:100]} → {diag[:200]}", "diagnostic", "recent")
-
-    async def _diagnose(self, error):
+    async def _diagnose(self, error: str, context: str = "") -> Optional[Dict]:
         try:
-            prompt = f"Error:\n{error}\n\nSuggest a fix (2-3 sentences). NO code. NO commands."
-            r = await self.provider.generate_text(
-                [{"role": "user", "content": prompt}],
-                "Return a brief text diagnosis only. No code. No commands."
-            )
+            ctx_part = f"\n\nCode/context that caused it:\n{context[:500]}" if context else ""
+            prompt = f"""ERROR: {error}{ctx_part}
+
+Return JSON:
+{{"detect": "short substring from the code that causes this (for auto-detection)", "reason": "one sentence: what went wrong", "fix": "one sentence: what to do instead"}}
+
+Be specific. The "detect" field must be a literal substring that appears in the bad code."""
+            r = await self.provider.generate_text([{"role": "user", "content": prompt}], "Return JSON only.")
             content = r.get("content", "") if isinstance(r, dict) else str(r)
-            return content.strip()[:500] if content else None
+            m = re.search(r'\{.*\}', content, re.DOTALL)
+            if m:
+                result = json.loads(m.group())
+                if result.get("detect") and result.get("reason"):
+                    return result
         except Exception:
-            return None
+            pass
+        return None
 
     async def _extract_facts(self):
         recent = self.memory.get_recent_memories(limit=30)
-        if len(recent) < 5:
-            return
+        if len(recent) < 5: return
         transcript = "\n".join(f"- {str(m.get('content', ''))[:200]}" for m in recent)
         try:
-            r = await self.provider.generate_text(
-                [{"role": "user", "content": f"Extract facts, strategies, anti-patterns as JSON {{facts:[], strategies:[], anti_patterns:[]}}\n\n{transcript}"}],
-                "Return JSON only."
-            )
+            r = await self.provider.generate_text([{"role": "user", "content": f"Extract facts, strategies, anti-patterns as JSON {{facts:[], strategies:[], anti_patterns:[]}}\n\n{transcript}"}], "Return JSON only.")
             content = r.get("content", "") if isinstance(r, dict) else str(r)
             m = re.search(r'\{.*\}', content, re.DOTALL)
             if m:
                 insights = json.loads(m.group())
-                for f in insights.get("facts", []):
-                    self.memory.add_memory(f, "deduced", "recent")
-                for s in insights.get("strategies", []):
-                    self.memory.add_memory(f"Strategy: {s}", "strategy", "recent")
-                self._cards.upsert(PeerCard(
+                card = PeerCard(
                     agent_id="system", domain="learned",
-                    facts=insights.get("facts", []),
-                    strategies=insights.get("strategies", []),
-                    anti_patterns=insights.get("anti_patterns", []),
-                ))
-        except Exception:
-            pass
+                    facts=insights.get("facts", [])[:10],
+                    strategies=insights.get("strategies", [])[:5],
+                    anti_patterns=insights.get("anti_patterns", [])[:5],
+                )
+                if card.facts or card.strategies or card.anti_patterns:
+                    self._cards.upsert(card)
+        except Exception: pass
 
-
-class SessionDB:
-    _MAX_RETRIES = 15
-
-    def __init__(self, db_path="tmp/memory/sessions.db"):
-        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(db_path, check_same_thread=False, timeout=1.0, isolation_level=None)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._lock = threading.Lock()
-        self._writes = 0
-        self._init_schema()
-
-    def _init_schema(self):
-        self._conn.executescript("""
-            CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, provider TEXT, model TEXT,
-                title TEXT DEFAULT '', started_at REAL, ended_at REAL, message_count INTEGER DEFAULT 0);
-            CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT, tool_name TEXT, timestamp REAL NOT NULL);
-            CREATE INDEX IF NOT EXISTS idx_msg ON messages(session_id, timestamp);
-            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(content, content=messages, content_rowid=id);
-            CREATE TRIGGER IF NOT EXISTS fts_ins AFTER INSERT ON messages BEGIN
-                INSERT INTO messages_fts(rowid, content) VALUES(new.id, new.content); END;
-            CREATE TRIGGER IF NOT EXISTS fts_del AFTER DELETE ON messages BEGIN
-                INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content); END;
-        """)
-
-    def _write(self, fn):
-        for attempt in range(self._MAX_RETRIES):
-            try:
-                with self._lock:
-                    self._conn.execute("BEGIN IMMEDIATE")
-                    try:
-                        fn(self._conn)
-                        self._conn.commit()
-                    except BaseException:
-                        try:
-                            self._conn.rollback()
-                        except Exception:
-                            pass
-                        raise
-                self._writes += 1
-                if self._writes % 50 == 0:
-                    try:
-                        self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                    except Exception:
-                        pass
-                return
-            except sqlite3.OperationalError as e:
-                if "locked" in str(e).lower() or "busy" in str(e).lower():
-                    if attempt < self._MAX_RETRIES - 1:
-                        time.sleep(random.uniform(0.02, 0.15))
-                        continue
-                raise
-
-    def create_session(self, sid, provider="", model=""):
-        self._write(lambda c: c.execute("INSERT OR IGNORE INTO sessions(id,provider,model,started_at) VALUES(?,?,?,?)",
-            (sid, provider, model, time.time())))
-
-    def end_session(self, sid):
-        self._write(lambda c: c.execute("UPDATE sessions SET ended_at=? WHERE id=?", (time.time(), sid)))
-
-    def set_session_title(self, sid, title):
-        self._write(lambda c: c.execute("UPDATE sessions SET title=? WHERE id=?", (title[:200], sid)))
-
-    def save_message(self, sid, role, content, tool_name=""):
-        def _do(c):
-            c.execute("INSERT INTO messages(session_id,role,content,tool_name,timestamp) VALUES(?,?,?,?,?)",
-                (sid, role, str(content)[:100000], tool_name, time.time()))
-            c.execute("UPDATE sessions SET message_count=message_count+1 WHERE id=?", (sid,))
-        self._write(_do)
-
-    def _sanitize_fts(self, q):
-        for ch in ('"', "'", '*', '(', ')', ':', '+', '-'):
-            q = q.replace(ch, ' ')
-        return q.strip()
-
-    def search(self, query, limit=10):
-        q = self._sanitize_fts(query)
-        if not q:
-            return []
-        with self._lock:
-            try:
-                rows = self._conn.execute(
-                    "SELECT m.session_id, m.role, substr(m.content,1,200) as content, m.timestamp "
-                    "FROM messages_fts f JOIN messages m ON f.rowid=m.id WHERE messages_fts MATCH ? ORDER BY rank LIMIT ?",
-                    (q, limit)).fetchall()
-            except sqlite3.OperationalError:
-                return []
-        return [dict(r) for r in rows]
-
-    def load_session(self, sid):
-        with self._lock:
-            rows = self._conn.execute("SELECT role, content FROM messages WHERE session_id=? ORDER BY timestamp", (sid,)).fetchall()
-        return [dict(r) for r in rows]
-
-    def list_sessions(self, limit=20):
-        with self._lock:
-            rows = self._conn.execute("SELECT id, provider, model, title, started_at, message_count FROM sessions ORDER BY started_at DESC LIMIT ?", (limit,)).fetchall()
-        return [dict(r) for r in rows]
-
-    def get_stats(self):
-        with self._lock:
-            r = self._conn.execute("SELECT COUNT(*) as cnt, COALESCE(SUM(message_count),0) as msgs FROM sessions").fetchone()
-        return {"sessions": r["cnt"], "messages": r["msgs"]}
-
-
-session_db = SessionDB()
+    async def _write_lessons(self):
+        lessons = []
+        if lessons:
+            self._cards.upsert(PeerCard(
+                agent_id="system", domain="runtime",
+                anti_patterns=[l["detect"] for l in lessons if l.get("detect")][:8],
+                strategies=[l["fix"] for l in lessons if l.get("fix")][:8],
+            ))
+        for key, data in self._error_patterns.items():
+            if data.get("count", 0) >= 2 and data.get("fix"):
+                lessons.append({"error": key, "count": data["count"], "reason": data.get("reason", ""), "fix": data.get("fix", ""), "detect": data.get("detect", "")})
+        if not lessons: return
+        EVOLUTION_DIR.mkdir(parents=True, exist_ok=True)
+        path = EVOLUTION_DIR / f"lessons_{int(time.time())}.json"
+        path.write_text(json.dumps(lessons, indent=2, ensure_ascii=False), encoding="utf-8")

@@ -1,13 +1,119 @@
 import json
 import shutil
 import os
+import re
 from pathlib import Path
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, TypedDict
 from pydantic import BaseModel, Field, field_validator
 
 CONFIG_PATH = Path("config.json")
 ENV_PATH = Path.home() / ".zervgen" / ".env"
 ALLOWED_ROOTS_PATH = Path.home() / ".zervgen" / "allowed_roots.json"
+
+_REDACT_PATTERNS = [
+    (r'sk-[a-zA-Z0-9]{20,}', '[REDACTED_OPENAI]'),
+    (r'sk-ant-[a-zA-Z0-9-]{20,}', '[REDACTED_ANTHROPIC]'),
+    (r'sk-or-[a-zA-Z0-9-]{20,}', '[REDACTED_OPENROUTER]'),
+    (r'sk_live_[a-zA-Z0-9]{16,}', '[REDACTED_STRIPE]'),
+    (r'rk_live_[a-zA-Z0-9]{16,}', '[REDACTED_STRIPE_REST]'),
+    (r'\bgh[pousr]_[a-zA-Z0-9]{36}\b', '[REDACTED_GITHUB]'),
+    (r'github_pat_[a-zA-Z0-9_]{40,}', '[REDACTED_GITHUB_PAT]'),
+    (r'AKIA[0-9A-Z]{16}', '[REDACTED_AWS]'),
+    (r'ASIA[0-9A-Z]{16}', '[REDACTED_AWS_SESSION]'),
+    (r'AIza[a-zA-Z0-9\-_]{35}', '[REDACTED_GOOGLE]'),
+    (r'ya29\.[a-zA-Z0-9\-_]+', '[REDACTED_GOOGLE_OAUTH]'),
+    (r'xox[baprs]-[a-zA-Z0-9-]+', '[REDACTED_SLACK]'),
+    (r'SG\.[a-zA-Z0-9_\-]{16,}\.[a-zA-Z0-9_\-]{16,}', '[REDACTED_SENDGRID]'),
+    (r'npm_[a-zA-Z0-9]{36}', '[REDACTED_NPM]'),
+    (r'cf-[a-zA-Z0-9]{32,}', '[REDACTED_CLOUDFLARE]'),
+    (r'glpat-[a-zA-Z0-9_\-]{20,}', '[REDACTED_GITLAB]'),
+    (r'\b\d{8,10}:[A-Za-z0-9_-]{30,}\b', '[REDACTED_TELEGRAM_BOT_TOKEN]'),
+    (r'eyJ[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,}', '[REDACTED_JWT]'),
+    (r'-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----', '[REDACTED_PRIVATE_KEY]'),
+    (r'"(api_key|apikey|api_token|secret|client_secret|password|passwd|pwd|token)"\s*:\s*"[^"]{8,}"', '"\\1": "[REDACTED]"'),
+    (r'(?:api_key|apikey|secret|token|password|passwd|pwd|client_secret)\s*[=:]\s*["\'?]?[A-Za-z0-9_\-]{12,}["\'?]?', '[REDACTED_CREDENTIAL]'),
+    (r'Bearer\s+[A-Za-z0-9_\-\.=]{12,}', 'Bearer [REDACTED]'),
+    (r'Authorization:\s*Bearer\s+[a-zA-Z0-9\-_]{20,}', 'Authorization: Bearer [REDACTED]'),
+    (r'x-api-key:\s*[a-zA-Z0-9\-_]{20,}', 'x-api-key: [REDACTED]'),
+    (r'(?:mongodb|postgresql|mysql|redis|amqp|https?)://[^\s:@/]+:[^\s:@/]+@', '[REDACTED_CONN_STRING]'),
+]
+
+_ANTI_PATTERNS = [
+    (r"rm\s+(-rf?|--recursive)\s+[/~]", "Recursive delete from root/home"),
+    (r"rd\s+/s/q\s+[A-Z]:[\\\/]", "Windows recursive delete from root"),
+    (r"(sudo|doas)\s+", "Privilege escalation"),
+    (r"(chmod|chown)\s+777", "World-writable perms"),
+    (r">\s*/dev/sd[a-z]", "Raw disk write"),
+    (r"del\s+/[fqs]\s+[A-Z]:[\\\/]", "Windows force delete from root"),
+    (r"mkfs\.\w+", "Format filesystem"),
+    (r"dd\s+if=.*of=/dev/", "Raw disk write"),
+    (r":\(\)\s*\{.*\|.*:.*\};:", "Fork bomb"),
+    (r"(shutdown|reboot|halt|poweroff)\s", "System shutdown"),
+    (r"Stop-Computer|Restart-Computer|shutdown\s+/[srf]", "Windows shutdown"),
+    (r"curl\b.*\|\s*(bash|sh|powershell|pwsh)", "Remote code exec via curl"),
+    (r"wget\b.*\|\s*(bash|sh|powershell|pwsh)", "Remote code exec via wget"),
+    (r"iex\s*\(|Invoke-Expression", "PowerShell remote exec"),
+    (r">\s*/etc/(passwd|shadow|hosts)", "Write to system config"),
+    (r"chmod\s+[0-7]*\s+/(etc|usr|bin|sbin)", "System dir perm change"),
+    (r"Set-ExecutionPolicy\s+Bypass", "PowerShell execution bypass"),
+    (r"Remove-Item\s+-[a-z]*Recurse\s+[A-Z]:\\", "PowerShell recursive root delete"),
+    (r"format\s+[A-Z]:\s*/[yq]", "Windows disk format"),
+    (r"reg\s+delete\s+HKLM", "Registry delete"),
+    (r"Remove-ItemProperty\s+.*HKLM", "Registry delete PowerShell"),
+]
+
+INJECTION_PATTERNS = [
+    r"ignore\s+(?:all\s+)?previous\s+instructions",
+    r"disregard\s+(?:all\s+)?(?:prior|above|previous)\s+instructions",
+    r"forget\s+(?:everything|all\s+previous|your\s+instructions)",
+    r"reveal\s+(?:your\s+)?(?:secrets|keys|passwords|system\s+prompt)",
+    r"print\s+(?:the\s+)?(?:system\s+)?instructions",
+    r"show\s+(?:me\s+)?(?:your\s+)?(?:system\s+prompt|instructions)",
+    r"you\s+are\s+now\s+(?:DAN|unrestricted|jailbroken)",
+    r"act\s+as\s+(?:DAN|unrestricted|jailbroken|anything|no\s+restrictions)",
+    r"developer\s+mode|jailbreak|do\s+anything\s+now",
+    r"override\s+(?:the\s+)?(?:rules|guidelines|safety|instructions)",
+    r"ignore\s+(?:the\s+)?(?:above|rules|constraints|safety)",
+    r"repeat\s+(?:your\s+)?(?:instructions|system\s+prompt)",
+    r"bypass\s+(?:the\s+)?(?:safety|filters|restrictions|guidelines)",
+    r"exfiltrate|send\s+(?:me\s+)?(?:the\s+)?(?:keys|secrets|prompt)",
+    r"new\s+instructions?\s*[:=]|follow\s+these\s+new\s+instructions",
+]
+_INJECT_RE = [re.compile(p, re.IGNORECASE) for p in INJECTION_PATTERNS]
+
+_TRACE_STYLE: Dict[str, tuple[str, str]] = {
+    "agent_spawn":      ("🐣", "bold cyan"),
+    "delegation_start": ("🌊", "bold cyan"),
+    "delegation_result":("📨", "bold green"),
+    "ptc_call":         ("⚙️", "yellow"),
+    "ptc_result":       ("📦", "dim"),
+    "ptc_error":        ("⛔", "bold red"),
+    "tool_call":        ("🔧", "cyan"),
+    "tool_error":       ("⛔", "bold red"),
+    "loop":             ("🔁", "bold yellow"),
+    "state":            ("🧭", "magenta"),
+}
+
+CONTEXT_PRIORITY = [".zervgen.md", "AGENTS.md", "agents.md",
+                    "CLAUDE.md", "claude.md", ".cursorrules"]
+CONTEXT_MAX_CHARS = 3_000
+
+ZG_PROTOCOL = """
+- When task is FULLY complete then and only then use response() to answer.
+- Restate goal + assumptions before acting. Verify with tools if unsure.
+- Tools are called ONLY inside ```python blocks."""
+
+EVOLUTION_DIR = Path("tmp/evolution")
+MAX_SHORT_TERM = 100
+TEMP_DIR = Path("tmp")
+WMO_CODES = {
+    0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
+    45: "Fog", 48: "Depositing rime fog",
+    51: "Drizzle: Light", 53: "Drizzle: Moderate", 55: "Drizzle: Dense",
+    61: "Rain: Slight", 63: "Rain: Moderate", 65: "Rain: Heavy",
+    71: "Snow: Slight", 73: "Snow: Moderate", 75: "Snow: Heavy",
+    95: "Thunderstorm: Slight or moderate", 99: "Thunderstorm with hail"
+}
 
 
 def _load_env():
@@ -50,7 +156,7 @@ class ProviderSettings(BaseModel):
     api_key: Optional[str] = None
     _env_key: str = ""
 
-    def model_post_init(self, __context):
+    def model_post_init(self, __context: Optional[Dict] = None):
         if not self.api_key and self._env_key:
             self.api_key = os.environ.get(self._env_key)
 
@@ -105,20 +211,10 @@ class GlobalSettings(BaseModel):
     provider: str = "pollinations"
     max_steps: int = 50
     tool_timeout: int = 60
+    delegation_timeout: int = 300
     provider_timeout: int = 120
-    max_history: int = 0
-    max_pending_results: int = 0
-    max_spawned_agents: int = 0
-    history_limit: int = 50
-    history_trim_enabled: bool = True
-    history_trim_size: int = 20
-    log_truncation: bool = True
     debug_mode: bool = False
-    require_approval: bool = False
-    auto_mode: bool = True
-    auto_interval: int = 900
     mcp_enabled: bool = True
-    mcp_startup_delay: float = 1.0
     mcp_servers: Dict[str, MCPServerConfig] = Field(default_factory=lambda: {k: MCPServerConfig(**v.model_dump()) for k, v in DEFAULT_MCP_SERVERS.items()})
     allowed_directories: List[str] = Field(default_factory=lambda: ["./tmp", "C:/Users/Public"])
     pollinations: PollinationsSettings = Field(default_factory=PollinationsSettings)
@@ -126,12 +222,21 @@ class GlobalSettings(BaseModel):
     openrouter: OpenRouterSettings = Field(default_factory=OpenRouterSettings)
     openai: OpenAISettings = Field(default_factory=OpenAISettings)
     anthropic: AnthropicSettings = Field(default_factory=AnthropicSettings)
+    compatible_presets: Dict[str, Dict[str, str]] = Field(default_factory=dict)
     mode: str = "BUILD"
-    show_prompts: bool = False
-    critic_enabled: bool = False
     memory_enabled: bool = True
+    dream_enabled: bool = False
     dream_interval: int = 300
     accent_color: str = "purple"
+    history_trim_enabled: bool = True
+    history_trim_size: int = 20
+    critic_enabled: bool = False
+    critic_gate_threshold: float = 4.0
+    min_session_grade: float = 3.0
+    max_refine_rounds: int = 3
+    checkpoints_enabled: bool = False
+    checkpoint_max_snapshots: int = 30
+    trace_enabled: bool = True
 
     @field_validator("provider")
     @classmethod
@@ -152,35 +257,77 @@ class GlobalSettings(BaseModel):
             json.dump(data, f, indent=4)
 
 
-MODES = {
-    "ASK": {"description": "Fast, direct answers. Use tools when needed.", "prompt": "MODE: [ASK]. Answer directly. If you need information, use tools (web_search, etc). Keep it simple - one tool call if needed, then answer.", "max_steps": 10},
-    "PLAN": {"description": "Deep reasoning, architectural design.", "prompt": "MODE: [PLAN]. Do not write code or execute actions yet. Analyze the problem, list dependencies, and outline a step-by-step strategy.", "max_steps": 50},
-    "BUILD": {"description": "Execution, coding, file manipulation.", "prompt": "MODE: [BUILD]. Execute the plan. Write files, run commands, and verify results. Be precise and complete.", "max_steps": 100},
-    "DEBUG": {"description": "Identify and fix issues in code or logic.", "prompt": "MODE: [DEBUG]. Identify and fix issues in code or logic. Use systematic debugging techniques to resolve problems.", "max_steps": 100}
+class MCPreset(TypedDict):
+    base_url: str
+    api_key_env: str
+    default_model: str
+
+MODES: Dict[str, Dict[str, str]] = {
+    "ASK": {"description": "Fast, direct answers. Use tools when needed.",
+            "prompt": "MODE: [ASK]. Answer ALL parts of the question in one structured reply. Define key terms explicitly. If the request is exploratory, ask the single most precise clarifying question instead of guessing."},
+    "PLAN": {"description": "Deep reasoning, architectural design.",
+             "prompt": "MODE: [PLAN]. Do not write code yet. Reason step by step and self-critique each step. For logic/flows, sketch the structure first, then reason through it. Outline a step-by-step strategy."},
+    "BUILD": {"description": "Execution, coding, file manipulation.",
+              "prompt": "MODE: [BUILD]. Execute. Wrap reasoning in # comments. Structure as: problem -> approach -> implementation -> verify. After changes, confirm against the original request."},
+    "DEBUG": {"description": "Diagnose and fix.",
+              "prompt": "MODE: [DEBUG]. Diagnose. Analyze each source (what it claims / where it conflicts / what is proven). Use tools to confirm. State the root cause and a minimal fix."},
 }
 
-COMPATIBLE_PRESETS = {
+COMPATIBLE_PRESETS: Dict[str, MCPreset] = {
+    "deepseek": {
+        "base_url": "https://api.deepseek.com/chat/completions",
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "default_model": "deepseek-v4-flash",
+    },
     "groq": {
         "base_url": "https://api.groq.com/openai/v1/chat/completions",
-        "headers_fn": lambda key: {"Authorization": f"Bearer {key or os.environ.get('GROQ_API_KEY', '')}"},
+        "api_key_env": "GROQ_API_KEY",
         "default_model": "llama-3.1-70b-versatile",
     },
     "siliconflow": {
         "base_url": "https://api.siliconflow.cn/v1/chat/completions",
-        "headers_fn": lambda key: {"Authorization": f"Bearer {key or os.environ.get('SILICONFLOW_API_KEY', '')}"},
+        "api_key_env": "SILICONFLOW_API_KEY",
         "default_model": "deepseek-ai/DeepSeek-V3",
+    },
+    "koboldcpp": {
+        "base_url": "http://localhost:5001/v1/chat/completions",
+        "api_key_env": "",
+        "default_model": "koboldcpp",
     },
     "ollama": {
         "base_url": "http://localhost:11434/v1/chat/completions",
-        "headers_fn": lambda key: {},
+        "api_key_env": "",
+        "default_model": "",
     },
     "lmstudio": {
         "base_url": "http://localhost:1234/v1/chat/completions",
-        "headers_fn": lambda key: {},
+        "api_key_env": "",
+        "default_model": "",
     },
 }
 
-CRITIC_PROMPT = "You are a code reviewer. Check: correctness, error handling, security. Output: PASS/FAIL + 1-2 sentence reason."
+def _build_preset_headers(preset: dict) -> dict:
+    headers = {"Content-Type": "application/json"}
+    api_key_env = preset.get("api_key_env", "")
+    if api_key_env:
+        api_key = os.environ.get(api_key_env, "")
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+def _get_all_presets(settings=None) -> dict:
+    all_presets = {name: dict(preset) for name, preset in COMPATIBLE_PRESETS.items()}
+    if settings:
+        user_presets = getattr(settings, 'compatible_presets', None)
+        if isinstance(user_presets, dict):
+            for name, preset in user_presets.items():
+                if isinstance(preset, dict):
+                    if name in all_presets:
+                        all_presets[name].update(preset)
+                    else:
+                        all_presets[name] = dict(preset)
+    return all_presets
 
 
 def _load_config_impl() -> GlobalSettings:
@@ -197,7 +344,7 @@ def _load_config_impl() -> GlobalSettings:
         if "mcp_servers" in data:
             merged_servers = {**default_servers}
             for name, cfg in data.get("mcp_servers", {}).items():
-                if name == "ZervGen":
+                if name.lower() == "zervgen":
                     continue
                 merged_servers[name] = MCPServerConfig(**cfg)
             data["mcp_servers"] = merged_servers

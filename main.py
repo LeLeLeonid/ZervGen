@@ -2,6 +2,7 @@ import sys
 import asyncio
 import os
 import signal
+import logging
 from pathlib import Path
 from rich.console import Console
 
@@ -16,7 +17,6 @@ async def graceful_shutdown(sig):
             memory_core._kg.save()
         from src.core.provider import close_http_client
         await close_http_client()
-        console.print("[dim]Session saved.[/dim]")
     except Exception as e:
         console.print(f"[dim]Warning: Could not save session: {e}[/dim]")
     sys.exit(0)
@@ -34,12 +34,20 @@ def handle_exit(sig, frame):
 
 
 async def main():
+    loop = asyncio.get_running_loop()
+    def _ignore_shutdown_exceptions(l, context):
+        if sys.meta_path is None:
+            return
+        l.default_exception_handler(context)
+    loop.set_exception_handler(_ignore_shutdown_exceptions)
     from src.cli import ZervGenCLI
+    from src.utils import setup_logging
+    setup_logging(level=logging.INFO)
     cli = ZervGenCLI()
     try:
         await cli.run()
     finally:
-        pass
+        await cli._cleanup()
 
 
 def run_app():

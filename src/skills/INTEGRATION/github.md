@@ -1,48 +1,49 @@
 ---
+name: github
 description: "Git and GitHub operations - commits, pushes, PRs, issues"
 tags: [git, github, commit, push, pull, branch, merge, pr, issue, clone, repo, repository]
 ---
 # Git/GitHub Context
 
-For git operations, use `run_shell()` with git commands or MCP git tools.
+For git operations, use `shell()` with git commands or MCP git tools.
 
 ## Common Git Operations
 
 ```python
-result = await run_shell("git status")
+result = await shell("git status")
 return await response(text=result)
 ```
 
 ```python
-result = await run_shell("git log --oneline -10")
+result = await shell("git log --oneline -10")
 return await response(text=result)
 ```
 
 ```python
-await run_shell("git add -A")
-result = await run_shell('git commit -m "your message"')
+await shell("git add -A")
+result = await shell('git commit -m "your message"')
 return await response(text=result)
 ```
 
 ```python
-result = await run_shell("git push")
+result = await shell("git push")
 return await response(text=result)
 ```
 
 ```python
-result = await run_shell("git checkout -b feature/my-feature")
+result = await shell("git checkout -b feature/my-feature")
 return await response(text=result)
 ```
 
 ## GitHub CLI
 
 ```python
-result = await run_shell("gh issue list")
+result = await shell("gh issue list")
 return await response(text=result)
 ```
 
 ```python
-result = await run_shell('gh issue create -t "Title" -b "Body"')
+result = await shell('gh issue create -t "Title" -b "Body"')
 return await response(text=result)
 ```
 

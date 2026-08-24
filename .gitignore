@@ -8,5 +8,7 @@ env/
 .env
 .idea/
 .vscode/
+.kilo/
 tmp/
 *.json
+!config.json

@@ -1,276 +1,358 @@
 import asyncio
+import json
 import logging
+import re
 import uuid
-from typing import Any, Dict, List, Optional, Set
+from enum import Enum
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 from rich.console import Console
 from src.config import MODES, GlobalSettings, load_config
-from src.core.base_agent import BaseAgent
+from src.core.base_agent import StemAgent
 from src.core.memory import memory_core
-from src.core.provider import AIProvider
-from src.skills_loader import load_role, role_exists
+from src.core.provider import AIProvider, get_provider
+from src.skills_loader import load_role, role_exists, skill_index, SkillEngine
+from src.tools import TOOL_REGISTRY, get_tools_schema
+from src.utils import get_system_context, sanitize_for_prompt, generate_random_delimiter, count_tokens, add_global_tokens, add_provider_tokens, GitManager
 
 logger = logging.getLogger(__name__)
 console = Console()
 
 
-def _parse_history_role(history: List[Dict]) -> Optional[str]:
-    for msg in reversed(history):
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            if content.startswith("AGENT:"):
-                agent_id = content.split(":", 1)[1].strip()
-                if agent_id and agent_id != "None":
-                    return agent_id.split("_")[0].lower() if "_" in agent_id else agent_id
-            elif content.startswith("ROLE:"):
-                role = content.split(":", 1)[1].strip()
-                if role and role != "system":
-                    return role
-    return None
+class TaskState(Enum):
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    VERIFYING = "verifying"
+    DONE = "done"
+    FAILED = "failed"
+
+class StateAnchor:
+    def __init__(self, max_refine: int = 3):
+        self.state = TaskState.PENDING
+        self.round = 0
+        self.max_refine = max_refine
+        self.last_grade = 0.0
+
+    def can_advance(self) -> bool:
+        return self.state != TaskState.FAILED and self.round < self.max_refine
+
+    def transition(self, grade: float):
+        self.last_grade = grade
+        self.round += 1
+        self.state = TaskState.DONE if grade >= 4.0 else TaskState.VERIFYING
+        if self.round >= self.max_refine and grade < 4.0:
+            self.state = TaskState.FAILED
 
 
-class Orchestrator(BaseAgent):
-    def __init__(self, provider: Optional[AIProvider] = None, settings: Optional[GlobalSettings] = None):
-        if settings is None:
-            settings = provider.settings if provider and hasattr(provider, 'settings') else load_config()
-        self.settings = settings
+class Orchestrator(StemAgent):
+    """Orchestrator: manages complex tasks via multi-wave agent delegation."""
+
+    def __init__(
+        self,
+        provider: Optional[AIProvider] = None,
+        settings: Optional[GlobalSettings] = None,
+        mode: str = "BUILD",
+        memory: Any = None,
+    ):
+        settings = settings or load_config()
+        provider = provider or get_provider(getattr(settings, 'provider', 'pollinations'), settings)
         super().__init__(
-            name="Orchestrator", provider=provider, skill_name="system",
-            settings=self.settings, mode=self.settings.mode, memory=memory_core,
+            name="orchestrator",
+            provider=provider,
+            skill_name="system",
+            settings=settings,
+            mode=mode,
+            memory=memory,
+            silent=False,
         )
-        self.agents: Dict[str, BaseAgent] = {}
+        self.agents: Dict[str, StemAgent] = {}
         self._last_agent_id: Optional[str] = None
-        self._load_tools()
-
-        last_role = _parse_history_role(self.history)
-        if last_role:
-            self.skill_name = last_role
-
-    def _load_tools(self) -> None:
-        from src.tools import TOOL_REGISTRY
-        allowed = {
-            "delegate_to", "response", "search_memory", "add_memory",
-            "promote_memory", "manage_todo", "find_skill", "list_skills",
-            "scan_tools", "web_search", "fetch_url", "get_weather",
-            "calc", "format_json"
-        }
-        self.tools = {k: v for k, v in TOOL_REGISTRY.items() if k in allowed}
-
-    def _log_state(self, key: str, value: str) -> None:
-        if self.memory:
-            self.memory.log_event_sync("system", f"{key}: {value}", "state", self.mode)
-
-    def set_role(self, role: str) -> bool:
-        if load_role(role):
-            self.skill_name = role
-            self._load_tools()
-            self.invalidate_cache()
-            self._log_state("ROLE", role)
-            return True
-        return False
+        self._user_active = True
+        self._active_session_id: Optional[str] = None
+        self._git_mgr = None
+        if settings.checkpoints_enabled and mode.upper() == "BUILD":
+            self._git_mgr = GitManager(Path.cwd(), max_snapshots=settings.checkpoint_max_snapshots)
 
     def set_mode(self, mode: str) -> bool:
-        mode_upper = mode.upper()
-        if mode_upper in MODES:
-            self.mode = mode_upper
-            self.invalidate_cache()
-            self._log_state("MODE", mode_upper)
-            return True
-        return False
-
-    def narrative_cast(self, from_agent: str, to_agent: str, log: list) -> str:
-        key_points = []
-        for msg in log:
-            content = msg.get("content", "")
-            role = msg.get("role", "")
-            if role in ("system", "assistant"):
-                if content and len(content) > 10:
-                    key_points.append(content[:300])
-            elif content and content.startswith("Error"):
-                key_points.append(f"[ERROR] {content[:150]}")
-        return f"Context from {from_agent}: No results." if not key_points else f"=== CONTEXT FROM {from_agent.upper()} ===\n" + "\n---\n".join(key_points[-5:])
-
-    def switch_provider(self, provider_name: str) -> bool:
-        from src.core.provider import get_provider, list_providers
-        valid = [p.name for p in list_providers()]
-        if provider_name.lower() not in valid:
+        mode = mode.upper()
+        if mode not in MODES:
             return False
+        self.mode = mode
+        self.invalidate_cache()
+        return True
+
+    def set_role(self, role: str) -> bool:
+        if not role_exists(role):
+            return False
+        self.skill_name = role
+        self.name = role
+        self._load_tools()
+        self.invalidate_cache()
+        return True
+
+    def switch_provider(self, name: str) -> bool:
         try:
-            self.provider = get_provider(provider_name.lower(), self.settings)
-            self.settings.provider = provider_name.lower()
+            new_provider = get_provider(name, self.settings)
+            self.provider = new_provider
+            self.settings.provider = name
             self.settings.save()
+            self.invalidate_cache()
             return True
-        except Exception as e:
-            logger.error(f"Provider switch failed: {e}")
+        except Exception:
             return False
 
-    def get_mode_status(self) -> Dict[str, Any]:
-        return {"mode": self.mode, "role": self.skill_name}
-
-    async def _spawn_agent(self, role_name: str, context: Optional[Dict] = None, max_steps: Optional[int] = None) -> BaseAgent:
-        target_role = role_name if role_name != "system" else self.skill_name
-        if not role_exists(target_role):
-            target_role = self.skill_name
-        initial_history = context.get("history", []) if context else []
-        agent_id = f"{target_role}_{uuid.uuid4().hex[:8]}"
-        target_name = target_role.capitalize()
-        self._log(target_name, f"Spawning agent: {target_role} (id: {agent_id})", "agent_spawn")
-
-        max_agents = self.settings.max_spawned_agents
-        if max_agents > 0 and len(self.agents) >= max_agents:
-            oldest_key = next(iter(self.agents))
-            try:
-                await self.agents[oldest_key].cleanup()
-            except Exception as e:
-                logger.debug(f"Agent cleanup error: {e}")
-            del self.agents[oldest_key]
-
-        agent = BaseAgent(
-            name=target_role.capitalize(), provider=self.provider, skill_name=target_role,
-            settings=self.settings, mode=self.mode, memory=self.memory,
-            initial_history=initial_history, silent=False,
-        )
-        agent._is_delegated = True
-        if max_steps is not None:
-            agent._max_steps_override = max_steps
-        if "delegate_to" in agent.tools:
-            del agent.tools["delegate_to"]
-
-        self.agents[agent_id] = agent
-        self._last_agent_id = agent_id
-        return agent
-
-    async def _delegate_single(self, spec: Dict) -> tuple:
-        agent_name = spec.get("name", "code")
-        task = spec.get("task", "")
-        max_steps = spec.get("max_steps")
-        system_msgs = [m for m in self.history if m.get("role") == "system"]
-        user_msgs = [m for m in self.history if m.get("role") != "system"]
-        filtered_history = system_msgs + user_msgs[-5:]
-        context = {"history": filtered_history, "parent_task": task}
-        agent = await self._spawn_agent(agent_name, context, max_steps=max_steps)
-        agent._log(agent.name, f"Delegating task: {task[:100]}...", "delegation_start")
-        result = await agent.run(task)
-        casted_context = self.narrative_cast(agent_name, self.name, agent.history)
-        self._log(agent.name, casted_context, "context")
-        self.history.append({"role": "assistant", "content": result})
-        self.skill_name = agent_name
-        return result, agent.history, agent_name
-
-    def _compute_waves(self, agents_spec: List[Dict]) -> List[List[Dict]]:
-        indexed = {i: spec for i, spec in enumerate(agents_spec)}
-        name_to_indices: Dict[str, List[int]] = {}
-        for i, spec in enumerate(agents_spec):
-            name_to_indices.setdefault(spec.get("name", str(i)), []).append(i)
-
-        dep_indices = {}
-        for i, spec in enumerate(agents_spec):
-            dep_names = spec.get("depends_on", [])
-            deps = set()
-            for dn in dep_names:
-                deps.update(name_to_indices.get(dn, []))
-            dep_indices[i] = deps
-
-        waves = []
-        completed: Set[int] = set()
-        remaining = set(indexed.keys())
-        safety = len(agents_spec) + 1
-
-        while remaining and safety > 0:
-            safety -= 1
-            ready = [i for i in remaining if dep_indices[i].issubset(completed)]
-            if not ready:
-                ready = list(remaining)
-            waves.append([indexed[i] for i in ready])
-            completed.update(ready)
-            remaining.difference_update(ready)
-
-        return waves
-
-    async def _handle_delegation(self, args: Dict[str, Any]) -> str:
-        if "agents" in args:
-            agents_spec = args["agents"]
-            for spec in agents_spec:
-                if not role_exists(spec.get("name", "code")):
-                    return f"Error: Agent/Skill '{spec.get('name')}' does not exist"
-
-            waves = self._compute_waves(agents_spec)
-            summary_parts = []
-
-            for wave_idx, wave in enumerate(waves):
-                self._log("Wave", f"Wave {wave_idx + 1}/{len(waves)}: {len(wave)} agents", "wave")
-                results = await asyncio.gather(*[self._delegate_single(s) for s in wave], return_exceptions=True)
-
-                for i, r in enumerate(results):
-                    agent_name = wave[i].get('name', 'agent')
-                    if isinstance(r, Exception):
-                        summary_parts.append(f"- {agent_name}: Error: {r}")
-                    elif isinstance(r, tuple):
-                        result, history, _ = r
-                        summary_parts.append(f"{result[:200]}...")
-                    else:
-                        summary_parts.append(f"- {agent_name}: Unexpected result type")
-
-            return "\n".join(summary_parts)
-
-        sub_agent = args.get("agent_name", "code")
-        if not role_exists(sub_agent):
-            return f"Error: Agent/Skill '{sub_agent}' does not exist"
-
-        spec = {
-            "name": sub_agent,
-            "task": args.get("task", ""),
-            "max_steps": args.get("max_steps")
+    def get_mode_status(self) -> dict:
+        return {
+            "mode": self.mode,
+            "role": self.skill_name,
+            "provider": getattr(self.settings, "provider", "unknown"),
         }
-        result, history, agent_name = await self._delegate_single(spec)
-        return result
+
+    def new_session(self, title: str = None) -> None:
+        from src.utils import reset_global_tokens
+        reset_global_tokens()
+        self.history.clear()
+        self.agents.clear()
+        if self.memory:
+            try:
+                session_id = self.memory._session_db.create_session(
+                    provider=getattr(self.provider, "name", "unknown")
+                )
+                self.memory.set_active_session(session_id)
+                self._active_session_id = session_id
+                if title:
+                    self.memory._session_db.set_session_title(session_id, title[:100])
+            except Exception:
+                pass
+
+    async def run_task(self, task: str, mode: str = "BUILD") -> str:
+        if not self.settings.critic_enabled:
+            return await self._execute_waves(task, mode)
+        
+        anchor = StateAnchor(max_refine=self.settings.max_refine_rounds)
+        anchor.state = TaskState.IN_PROGRESS
+        skill_contract = skill_index.get(self.skill_name)
+        original_task = task
+
+        if skill_contract:
+            pre_err = SkillEngine.validate_pre(skill_contract, {"task": task})
+            if pre_err:
+                return f"PRE-VALIDATION FAILED: {pre_err}"
+
+        while anchor.can_advance():
+            self._log(self.name, f"Round {anchor.round+1} | State: {anchor.state.value}", "state", self.mode)
+            if self.mode == "BUILD" and self._git_mgr and self._active_session_id:
+                self._git_mgr.snapshot(self._active_session_id)
+
+            result = await self._execute_waves(task, mode)
+            procedure = skill_contract.procedure if skill_contract and skill_contract.procedure else []
+            if procedure:
+                grade = await SkillEngine.grade(self.provider, original_task, str(result), procedure)
+            else:
+                grade_prompt = f"""Strict verifier. The ORIGINAL TASK is the rubric, nothing else.
+ORIGINAL TASK:
+{original_task}
+
+OUTPUT TO GRADE:
+{str(result)}
+
+1. List each concrete thing the task actually asks for, one per line.
+2. Mark each MET or MISSING (3-word reason).
+3. Score = round(5 * met / total). Reward only satisfied requirements, never effort.
+End with exactly one line: GRADE: [1-5]"""
+                grade_resp = await self.provider.generate_text([{"role": "user", "content": grade_prompt}], system_prompt="Strict verifier.")
+                try:
+                    grade = float(re.search(r"GRADE:\s*([1-5])", grade_resp).group(1))
+                except:
+                    grade = 3.0
+            if skill_contract:
+                post_err = SkillEngine.validate_post(skill_contract, result)
+                if post_err:
+                    await self._log(self.name, f"POST-VALIDATION FAILED: {post_err}", "state", self.mode)
+            anchor.transition(grade)
+            if grade < self.settings.critic_gate_threshold:
+                anchor.state = TaskState.FAILED
+
+            await memory_core.add_memory(str(result), category="blueprint", critic_score=grade)
+
+            if anchor.state == TaskState.DONE:
+                return result
+            elif anchor.state == TaskState.FAILED:
+                if self._git_mgr:
+                    try:
+                        self._git_mgr.rollback(1)
+                        await self._log(self.name, f"Auto-rollback: grade {grade} < {self.settings.critic_gate_threshold}", "state", self.mode)
+                    except Exception as e:
+                        await self._log(self.name, f"Rollback failed: {e}", "state", self.mode)
+                return f"[ROLLBACK] Grade {grade} — reverted 1 step. Escalate."
+
+            task = f"Original task: {original_task}\n\nPrevious attempt scored {grade}/5. Fix the missing/broken parts. Focus ONLY on gaps."
+        
+        return "Degeneration guard triggered. Halted."
+
+    async def _execute_waves(self, task: str, mode: str) -> str:
+        return await super().run(task)
+
+    async def _handle_delegation(self, args: Dict) -> str:
+        self._delegation_count = getattr(self, "_delegation_count", 0) + 1
+        if self._delegation_count > 3:
+            return "Error: Delegation limit reached."
+        agent_name = args.get("agent_name", "")
+        task = args.get("task", "")
+        context = args.get("context", "")
+        mode = args.get("mode", self.mode)
+        memory_flag = args.get("memory", True)
+        agents_list = args.get("agents", "")
+        full_task = f"{context}\n\n{task}" if context else task
+        if not full_task.strip():
+            return "Error: Empty task"
+
+        if agents_list:
+            try:
+                specs = json.loads(agents_list) if isinstance(agents_list, str) else agents_list
+                if not isinstance(specs, list):
+                    return "Error: agents must be a JSON list"
+                for spec in specs:
+                    if not spec.get("agent_name"):
+                        return "Error: each agent spec needs agent_name"
+                    if not role_exists(spec["agent_name"]):
+                        return f"Error: agent '{spec['agent_name']}' not found"
+                waves = self._compute_waves(specs)
+                all_results = []
+                for wave_idx, wave_specs in enumerate(waves):
+                    self._log(self.name, f"WAVE {wave_idx+1}/{len(waves)}: {[s['agent_name'] for s in wave_specs]}", "delegation_start", self.mode)
+                    wave_tasks = []
+                    agent_id_map = {}
+                    for spec in wave_specs:
+                        spawn_context = f"Overall task: {full_task}\n\nYour specific assignment: {spec.get('task','')}"
+                        if spec.get("context"):
+                            spawn_context = f"{spec['context']}\n\n{spawn_context}"
+                        agent_id, agent = self._spawn_agent(
+                            role_name=spec["agent_name"],
+                            context=spawn_context,
+                            max_steps=spec.get("max_steps")
+                        )
+                        agent_id_map[agent_id] = spec
+                        wave_tasks.append(agent.run(full_task if not spec.get("task") else spawn_context))
+                    wave_results = await asyncio.gather(*wave_tasks, return_exceptions=True)
+                    for agent_id, result in zip(agent_id_map.keys(), wave_results):
+                        if agent_id in self.agents:
+                            agent = self.agents[agent_id]
+                            self._log(agent.name, str(result), "delegation_result", self.mode)
+                            self._last_agent_id = agent_id
+                    all_results.extend([f"=== {spec['agent_name']} ===\n{str(r)}" for r, spec in zip(wave_results, wave_specs)])
+                return "\n\n".join(all_results)
+            except Exception as e:
+                return f"Error in delegation: {e}"
+        else:
+            if not agent_name:
+                return "Error: agent_name required"
+            agent_id = args.get("agent_id", "")
+            if agent_id and agent_id in self.agents:
+                agent = self.agents[agent_id]
+            else:
+                agent_id, agent = self._spawn_agent(role_name=agent_name, context=context, max_steps=None)
+                if not memory_flag:
+                    agent.memory = None
+            try:
+                result = await agent.run(full_task)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                result = f"Error: sub-agent crashed: {type(e).__name__}: {e}"
+            if not result or not result.strip() or result.strip().startswith("Error"):
+                last = [str(m.get("content", ""))[:250] for m in agent.history[-2:]]
+                result = (result or "Error: empty result") + "\n[sub-agent context]\n" + "\n".join(last)
+            self._log(agent.name, str(result), "delegation_result", self.mode)
+            self._last_agent_id = agent_id
+            return result
 
     async def _execute_tool(self, tool_name: str, args: Dict[str, Any]) -> str:
         if tool_name == "delegate_to":
-            if self._status:
-                self._status.__exit__(None, None, None)
-                self._status = None
             return await self._handle_delegation(args)
-
-        if tool_name == "manage_history":
-            action = args.get("action")
-            if action == "delete_last":
-                removed = 0
-                while len(self.history) > 1 and removed < 2:
-                    self.history.pop()
-                    removed += 1
-                return f"History pruned ({removed} messages removed)"
-            elif action == "clear":
-                self.history.clear()
-                return "History cleared"
-            return f"Unknown action: {action}"
-
-        if tool_name == "set_state":
-            if args.get("role"):
-                self.set_role(args["role"])
-            if args.get("mode"):
-                self.set_mode(args["mode"])
-            return "STATE UPDATED"
-
         return await super()._execute_tool(tool_name, args)
-
-    async def process(self, user_input: str) -> str:
-        if not user_input or not isinstance(user_input, str):
-            return "Error: Invalid input"
-        user_input = user_input.strip()
-        if not user_input:
-            return "Error: Empty input"
-
-        last_role = _parse_history_role(self.history)
-        if last_role:
-            self.skill_name = last_role
-
-        return await self.run(user_input)
 
     async def cleanup(self) -> None:
         await super().cleanup()
         for agent in self.agents.values():
             try:
                 await agent.cleanup()
-            except Exception as e:
-                logger.debug(f"Agent cleanup error: {e}")
+            except Exception:
+                pass
         self.agents.clear()
+        if self.memory and self._active_session_id:
+            try:
+                self.memory._session_db.end_session(self._active_session_id)
+            except Exception:
+                pass
+
+    def _compute_waves(self, agents_spec: List[Dict]) -> List[List[Dict]]:
+        by_name = {spec["agent_name"]: spec for spec in agents_spec}
+        in_degree = {spec["agent_name"]: 0 for spec in agents_spec}
+        graph = {spec["agent_name"]: set() for spec in agents_spec}
+        for spec in agents_spec:
+            deps = spec.get("depends_on", [])
+            for dep in deps:
+                if dep in graph:
+                    graph[dep].add(spec["agent_name"])
+                    in_degree[spec["agent_name"]] = in_degree.get(spec["agent_name"], 0) + 1
+                else:
+                    logger.warning(f"Agent '{spec['agent_name']}' depends on unknown agent '{dep}' — dependency ignored")
+        waves = []
+        remaining = [s for s in agents_spec if in_degree.get(s["agent_name"], 0) == 0]
+        while remaining:
+            current_wave = remaining[:]
+            waves.append(current_wave)
+            next_remaining = []
+            for spec in current_wave:
+                name = spec["agent_name"]
+                for succ in graph.get(name, set()):
+                    in_degree[succ] = in_degree.get(succ, 0) - 1
+                    if in_degree[succ] == 0:
+                        next_remaining.append(by_name[succ])
+            remaining = next_remaining
+        all_names = {s["agent_name"] for s in agents_spec}
+        placed = {s["agent_name"] for w in waves for s in w}
+        if all_names != placed:
+            msg = f"Circular dependency detected among: {all_names - placed}"
+            logger.error(msg)
+            raise ValueError(msg)
+        return waves
+
+    def _spawn_agent(self, role_name: str, context: str, max_steps: int = None) -> tuple:
+        if not role_exists(role_name):
+            raise ValueError(f"Role '{role_name}' does not exist")
+        agent_id = f"{role_name}_{uuid.uuid4().hex[:8]}"
+        role_cfg = load_role(role_name) or load_role("system")
+        prompt = role_cfg.prompt if role_cfg else f"You are {role_name}."
+        filtered_context = []
+        for msg in self.history:
+            if msg.get("role") == "system":
+                filtered_context.append(msg)
+            elif msg.get("role") in ("user", "assistant") and len(filtered_context) < 8:
+                filtered_context.append(msg)
+        initial_history = [{"role": "system", "content": prompt}]
+        if filtered_context:
+            last_msgs = [msg["content"] for msg in filtered_context if msg["role"] in ("user", "assistant")][-6:]
+            for content in last_msgs:
+                initial_history.append({"role": "user", "content": content})
+        agent = StemAgent(
+            name=role_name,
+            provider=self.provider,
+            skill_name=role_name,
+            settings=self.settings,
+            mode=self.mode,
+            memory=self.memory,
+            initial_history=initial_history,
+            silent=False,
+        )
+        agent.status_cb = self.status_cb
+        agent._max_steps_override = max_steps or self._get_max_steps()
+        agent._is_delegated = True
+        agent._mcp = self._mcp
+        agent._mcp_initialized = True
+        agent_tools = {k: v for k, v in self.tools.items() if k != "delegate_to"}
+        agent.tools = agent_tools
+        self.agents[agent_id] = agent
+        self._log(self.name, f"SPAWN: {role_name} ({agent_id})", "agent_spawn", self.mode)
+        return agent_id, agent
