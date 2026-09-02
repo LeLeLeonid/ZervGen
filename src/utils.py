@@ -361,6 +361,13 @@ class GitManager:
             safe_run(["git", "init"], cwd=self.repo_dir, check=True)
             safe_run(["git", "config", "user.email", "zervgen@local"], cwd=self.repo_dir, check=True)
             safe_run(["git", "config", "user.name", "ZervGen"], cwd=self.repo_dir, check=True)
+            exclude = self.repo_dir / ".git" / "info" / "exclude"
+            exclude.parent.mkdir(parents=True, exist_ok=True)
+            patterns = ["/tmp/", "/node_modules/", "/__pycache__/", "/.venv/", "/venv/", "/.env"]
+            current = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+            missing = [p for p in patterns if p not in current.splitlines()]
+            if missing:
+                exclude.write_text(current.rstrip() + "\n" + "\n".join(missing) + "\n", encoding="utf-8")
 
     def _git_env(self):
         return {**os.environ, "GIT_DIR": str(self.repo_dir / ".git"), "GIT_WORK_TREE": str(self.cwd)}
@@ -369,17 +376,77 @@ class GitManager:
         total = sum(f.stat().st_size for f in self.repo_dir.rglob("*") if f.is_file())
         return total / (1024 * 1024)
 
-    def snapshot(self, session_id: str) -> str:
+    def snapshot(self, session_id: str, state: Optional[dict] = None) -> str:
         env = self._git_env()
         safe_run(["git", "add", "-A"], cwd=self.repo_dir, env=env)
+        for path in ("tmp", "node_modules", "__pycache__", ".venv", "venv", ".env"):
+            safe_run(["git", "reset", "--", path], cwd=self.repo_dir, env=env)
         r = safe_run(["git", "diff", "--cached", "--quiet"], cwd=self.repo_dir, env=env)
         if r.returncode == 0:
             return None
         r = safe_run(["git", "commit", "-m", f"turn {session_id}"], cwd=self.repo_dir, env=env, text=True)
-        sha = r.stdout.strip().split()[-1] if r.returncode == 0 else None
+        sha = None
+        if r.returncode == 0:
+            rev = safe_run(["git", "rev-parse", "HEAD"], cwd=self.repo_dir, env=env, text=True)
+            sha = rev.stdout.strip() if rev.returncode == 0 else None
+        if state is not None:
+            state_dir = self.repo_dir / "run_state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            key = sha or "HEAD"
+            state_dir.joinpath(f"{key}.json").write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
         self._prune()
         return sha
 
+    def checkpoint(self, run_id: str, state: Optional[dict] = None) -> Optional[str]:
+        revision = self.snapshot(run_id, state=None)
+        checkpoint_id = f"{run_id}_{int(time.time() * 1000)}"
+        state_dir = self.repo_dir / "run_state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        payload = {"id": checkpoint_id, "revision": revision or self.latest_revision(), "state": state or {}}
+        state_dir.joinpath(f"{checkpoint_id}.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return checkpoint_id
+
+    def load_state(self, checkpoint_id: str) -> Optional[dict]:
+        path = self.repo_dir / "run_state" / f"{checkpoint_id}.json"
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def latest_revision(self) -> Optional[str]:
+        env = self._git_env()
+        r = safe_run(["git", "rev-parse", "HEAD"], cwd=self.repo_dir, env=env, text=True)
+        return r.stdout.strip() if r.returncode == 0 else None
+
+    def restore(self, revision: str) -> bool:
+        if not revision:
+            return False
+        env = self._git_env()
+        r = safe_run(["git", "checkout", revision, "--", "."], cwd=self.repo_dir, env=env, text=True)
+        return r.returncode == 0
+    
+    def checkpoints(self, limit: int = 10) -> List[dict]:
+        state_dir = self.repo_dir / "run_state"
+        files = sorted(state_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True) if state_dir.exists() else []
+        out = []
+        for path in files[:max(1, limit)]:
+            try:
+                out.append(json.loads(path.read_text(encoding="utf-8")))
+            except Exception:
+                continue
+        return out
+
+    def restore_checkpoint(self, checkpoint_id: str = "") -> Optional[dict]:
+        state = self.load_state(checkpoint_id) if checkpoint_id else (self.checkpoints(1) or [None])[0]
+        if not state:
+            return None
+        revision = state.get("revision")
+        if revision and not self.restore(revision):
+            return None
+        return state
+    
     def _prune(self):
         env = self._git_env()
         r = safe_run(["git", "log", "--oneline"], cwd=self.repo_dir, env=env)
@@ -395,6 +462,14 @@ class GitManager:
                 safe_run(["git", "reset", "--hard", "HEAD~1"], cwd=self.repo_dir, env=env)
                 safe_run(["git", "gc", "--prune=now"], cwd=self.repo_dir, env=env)
                 lines = lines[1:]
+                state_dir = self.repo_dir / "run_state"
+                if state_dir.exists():
+                    files = sorted(state_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+                    for path in files[self.max_snapshots:]:
+                        try:
+                            path.unlink()
+                        except OSError:
+                            pass
 
     def rollback(self, steps: int = 1) -> str:
         env = self._git_env()

@@ -201,3 +201,10 @@ def _record_failure(provider: str) -> None:
 
 def _record_success(provider: str) -> None:
     _circuit_breaker.record_success(provider)
+    
+def resolve_model_tier(tier: str, settings) -> tuple[str, str]:
+    tiers = getattr(settings, "model_tiers", {}) or {}
+    cfg = tiers.get(str(tier).upper(), {}) if isinstance(tiers, dict) else {}
+    provider = cfg.get("provider") or getattr(settings, "provider", "pollinations")
+    model = cfg.get("model") or get_model_name(provider, settings)
+    return provider, model
