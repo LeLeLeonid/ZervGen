@@ -676,7 +676,6 @@ class ZervGenCLI:
         if not self.orchestrator:
             CC.print("[red]System not initialized.[/red]")
             return True
-
         history = self.orchestrator.history
         if len(history) <= 10:
             CC.print("[yellow]Not enough history to compact.[/yellow]")
@@ -718,15 +717,16 @@ class ZervGenCLI:
                 summary = result.get("content", "Summary unavailable")
             else:
                 summary = str(result)
-
             summary_msg = {"role": "user", "content": f"[CONTEXT SUMMARY]\n{summary[:2000]}"}
             self.orchestrator.history = system_msgs + [summary_msg] + recent
-
+            reset_global_tokens()
+            in_tok, _ = count_tokens(self.orchestrator.history, "")
+            add_global_tokens(in_tok)
+            
             await memory_core.add_memory(summary[:500], category="compacted", tier="recent")
             CC.print(f"[bold green]Compacted {len(to_summarize)} messages into 1 summary.[/bold green]")
         except Exception as e:
             CC.print(f"[red]Compaction failed: {e}[/red]")
-
         return True
 
     async def settings_menu(self) -> None:
@@ -1228,8 +1228,8 @@ class ZervGenCLI:
                     if not user_input.strip():
                         continue
                     if user_input.lower() in ('exit', 'quit', 'q', '/q'):
-                        sys.exit(1)
-                        return
+                        await self._cleanup()
+                        raise SystemExit(0)
                     if user_input.lower() in ('back', '/back', 'menu'):
                         self._should_exit = True
                         self._app.exit()

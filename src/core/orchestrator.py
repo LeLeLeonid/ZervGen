@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 import uuid
 from enum import Enum
 from pathlib import Path
@@ -14,6 +15,7 @@ from src.core.provider import AIProvider, get_provider
 from src.skills_loader import load_role, role_exists, skill_index, SkillEngine
 from src.tools import TOOL_REGISTRY, get_tools_schema
 from src.utils import get_system_context, sanitize_for_prompt, generate_random_delimiter, count_tokens, add_global_tokens, add_provider_tokens, GitManager
+from src.core.runtime import CheckpointRef, Plan, Task, TaskStatus
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -125,6 +127,62 @@ class Orchestrator(StemAgent):
             except Exception:
                 pass
 
+    def _checkpoint(self, reason: str) -> Optional[str]:
+        if not (self._git_mgr and self._active_session_id and getattr(self.settings, "checkpoints_enabled", True) and self._run):
+            return None
+        state = {"reason": reason, "goal": self._run.goal, "mode": self.mode, "messages": self.history[-20:]}
+        checkpoint_id = self._git_mgr.checkpoint(self._active_session_id, state)
+        st = self._git_mgr.load_state(checkpoint_id) or {}
+        self._run.checkpoint = CheckpointRef(id=checkpoint_id, revision=st.get("revision"))
+        self._run.metadata["checkpoint_reason"] = reason
+        self._run.emit("checkpoint", self.name, "git", "saved", output={"checkpoint_id": checkpoint_id, "git_sha": st.get("revision") or ""})
+        return checkpoint_id
+
+    async def resume_checkpoint(self, checkpoint_id: str = "") -> str:
+        if not self._git_mgr or not getattr(self.settings, "resume_enabled", True):
+            return "Error: Checkpoints are unavailable."
+        state = self._git_mgr.restore_checkpoint(checkpoint_id) if hasattr(self._git_mgr, "restore_checkpoint") else (self._git_mgr.load_state(checkpoint_id) if checkpoint_id else None)
+        if not state:
+            return "Error: Checkpoint not found or could not be restored."
+        payload = state.get("state") or {}
+        self.history = list(payload.get("messages") or [])
+        goal = str(payload.get("goal") or "").strip()
+        if not goal:
+            return f"Restored checkpoint {state.get('id', '-')}; no resumable goal found."
+        self.mode = str(payload.get("mode") or self.mode).upper()
+        if self._run:
+            self._run.emit("resume", self.name, "checkpoint", "restored", output=state.get("id"))
+        return await self.run_task(goal, self.mode)
+
+    async def _verify_artifacts(self) -> List[str]:
+        failures = []
+        for artifact in (self._run.artifacts if self._run else []):
+            path = Path(artifact.path)
+            if not path.exists():
+                failures.append(f"Missing artifact: {artifact.path}")
+                continue
+            if artifact.kind == "file" and path.suffix.lower() == ".py":
+                import py_compile
+                try:
+                    py_compile.compile(str(path), doraise=True)
+                except py_compile.PyCompileError as e:
+                    failures.append(f"Python syntax failed: {artifact.path}: {e.msg or e}")
+            elif artifact.kind == "file" and path.suffix.lower() == ".json":
+                try:
+                    json.loads(path.read_text(encoding="utf-8"))
+                except Exception as e:
+                    failures.append(f"JSON validation failed: {artifact.path}: {e}")
+        commands = list(getattr(self.settings, "verification_commands", []) or []) if self.mode == "BUILD" else []
+        for command in commands:
+            if not str(command).strip():
+                continue
+            result = await self._execute_tool("shell", {"command": command})
+            if str(result).startswith("Error"):
+                failures.append(f"Verification command failed: {command}\n{result}")
+        if self._run:
+            self._run.emit("verification", self.name, "artifacts", "passed" if not failures else "failed", output=failures or "artifact checks passed")
+        return failures
+
     async def run_task(self, task: str, mode: str = "BUILD") -> str:
         if not self.settings.critic_enabled:
             return await self._execute_waves(task, mode)
@@ -145,6 +203,15 @@ class Orchestrator(StemAgent):
                 self._git_mgr.snapshot(self._active_session_id)
 
             result = await self._execute_waves(task, mode)
+            verify_failures = await self._verify_artifacts()
+            if verify_failures:
+                self._log(self.name, "VERIFICATION FAILED:\n" + "\n".join(verify_failures), "state", self.mode)
+                result = f"{result}\n\n[VERIFICATION FAILURES]\n" + "\n".join(verify_failures)
+            if self._git_mgr and self._run and self._active_session_id:
+                checkpoint_id = self._git_mgr.checkpoint(self._active_session_id, self._run.to_dict())
+                if checkpoint_id:
+                    checkpoint = self._git_mgr.load_state(checkpoint_id) or {}
+                    self._run.checkpoint = CheckpointRef(id=checkpoint_id, revision=checkpoint.get("revision"))
             procedure = skill_contract.procedure if skill_contract and skill_contract.procedure else []
             if procedure:
                 grade = await SkillEngine.grade(self.provider, original_task, str(result), procedure)
@@ -194,9 +261,8 @@ End with exactly one line: GRADE: [1-5]"""
         return await super().run(task)
 
     async def _handle_delegation(self, args: Dict) -> str:
-        self._delegation_count = getattr(self, "_delegation_count", 0) + 1
-        if self._delegation_count > 3:
-            return "Error: Delegation limit reached."
+        if self._run and not self._run.budget.delegation():
+            return "Error: Delegation budget exhausted."
         agent_name = args.get("agent_name", "")
         task = args.get("task", "")
         context = args.get("context", "")
@@ -218,13 +284,29 @@ End with exactly one line: GRADE: [1-5]"""
                     if not role_exists(spec["agent_name"]):
                         return f"Error: agent '{spec['agent_name']}' not found"
                 waves = self._compute_waves(specs)
+                self._plan = Plan()
+                for spec in [item for wave in waves for item in wave]:
+                    self._plan.add(Task(
+                        id=str(spec.get("id") or spec.get("task_id") or spec["agent_name"]), 
+                        objective=str(spec.get("task", "")), 
+                        agent=spec["agent_name"], 
+                        depends_on=list(spec.get("depends_on", []) or [])
+                    ))
+                self._plan.validate()
+                if self._run:
+                    self._run.plan = self._plan
+                    
                 all_results = []
+                results_by_id = {}
                 for wave_idx, wave_specs in enumerate(waves):
-                    self._log(self.name, f"WAVE {wave_idx+1}/{len(waves)}: {[s['agent_name'] for s in wave_specs]}", "delegation_start", self.mode)
+                    self._log(self.name, f"WAVE {wave_idx+1}/{len(waves)}: {[s.get('id', s['agent_name']) for s in wave_specs]}", "delegation_start", self.mode)
                     wave_tasks = []
                     agent_id_map = {}
                     for spec in wave_specs:
+                        dep_text = [f"Dependency {dep} result:\n{results_by_id[dep]}" for dep in spec.get("depends_on", []) if dep in results_by_id]
                         spawn_context = f"Overall task: {full_task}\n\nYour specific assignment: {spec.get('task','')}"
+                        if dep_text:
+                            spawn_context += "\n\n" + "\n\n".join(dep_text)
                         if spec.get("context"):
                             spawn_context = f"{spec['context']}\n\n{spawn_context}"
                         agent_id, agent = self._spawn_agent(
@@ -234,13 +316,37 @@ End with exactly one line: GRADE: [1-5]"""
                         )
                         agent_id_map[agent_id] = spec
                         wave_tasks.append(agent.run(full_task if not spec.get("task") else spawn_context))
-                    wave_results = await asyncio.gather(*wave_tasks, return_exceptions=True)
+                    limit = max(1, getattr(self.settings, "max_parallel_agents", 4))
+                    if len(wave_tasks) > limit:
+                        wave_results = []
+                        for start in range(0, len(wave_tasks), limit):
+                            wave_results.extend(await asyncio.gather(*wave_tasks[start:start + limit], return_exceptions=True))
+                    else:
+                        wave_results = await asyncio.gather(*wave_tasks, return_exceptions=True)
+                        
                     for agent_id, result in zip(agent_id_map.keys(), wave_results):
                         if agent_id in self.agents:
                             agent = self.agents[agent_id]
                             self._log(agent.name, str(result), "delegation_result", self.mode)
                             self._last_agent_id = agent_id
-                    all_results.extend([f"=== {spec['agent_name']} ===\n{str(r)}" for r, spec in zip(wave_results, wave_specs)])
+                            
+                    for result, spec in zip(wave_results, wave_specs):
+                        task_id = str(spec.get("id") or spec.get("task_id") or spec.get("agent_name"))
+                        results_by_id[task_id] = str(result)
+                        task_obj = self._plan.tasks.get(task_id) if getattr(self, "_plan", None) else None
+                        if task_obj:
+                            if isinstance(result, Exception):
+                                task_obj.status = TaskStatus.FAILED
+                                task_obj.result = f"{type(result).__name__}: {result}"
+                            else:
+                                ok = bool(result) and not str(result).strip().startswith("Error")
+                                task_obj.status = TaskStatus.DONE if ok else TaskStatus.FAILED
+                                task_obj.result = str(result)
+                            child = self.agents.get(next((aid for aid, sp in agent_id_map.items() if sp is spec), ""))
+                            if child and getattr(child, "_run", None):
+                                task_obj.artifacts = list(child._run.artifacts)
+                                
+                    all_results.extend([f"=== {spec.get('id', spec['agent_name'])}: {spec['agent_name']} ===\n{str(r)}" for r, spec in zip(wave_results, wave_specs)])
                 return "\n\n".join(all_results)
             except Exception as e:
                 return f"Error in delegation: {e}"
@@ -287,36 +393,36 @@ End with exactly one line: GRADE: [1-5]"""
                 pass
 
     def _compute_waves(self, agents_spec: List[Dict]) -> List[List[Dict]]:
-        by_name = {spec["agent_name"]: spec for spec in agents_spec}
-        in_degree = {spec["agent_name"]: 0 for spec in agents_spec}
-        graph = {spec["agent_name"]: set() for spec in agents_spec}
+        def node_id(spec):
+            return str(spec.get("id") or spec.get("task_id") or spec["agent_name"])
+        by_id = {node_id(spec): spec for spec in agents_spec}
+        if len(by_id) != len(agents_spec):
+            raise ValueError("Duplicate delegation task id")
+        in_degree = {key: 0 for key in by_id}
+        graph = {key: set() for key in by_id}
         for spec in agents_spec:
-            deps = spec.get("depends_on", [])
-            for dep in deps:
-                if dep in graph:
-                    graph[dep].add(spec["agent_name"])
-                    in_degree[spec["agent_name"]] = in_degree.get(spec["agent_name"], 0) + 1
-                else:
-                    logger.warning(f"Agent '{spec['agent_name']}' depends on unknown agent '{dep}' — dependency ignored")
+            current = node_id(spec)
+            for dep in spec.get("depends_on", []) or []:
+                dep = str(dep)
+                if dep not in graph:
+                    raise ValueError(f"Unknown dependency '{dep}' for '{current}'")
+                graph[dep].add(current)
+                in_degree[current] += 1
         waves = []
-        remaining = [s for s in agents_spec if in_degree.get(s["agent_name"], 0) == 0]
+        remaining = [by_id[key] for key, degree in in_degree.items() if degree == 0]
         while remaining:
-            current_wave = remaining[:]
-            waves.append(current_wave)
-            next_remaining = []
-            for spec in current_wave:
-                name = spec["agent_name"]
-                for succ in graph.get(name, set()):
-                    in_degree[succ] = in_degree.get(succ, 0) - 1
+            waves.append(remaining)
+            next_ids = []
+            for spec in remaining:
+                current = node_id(spec)
+                for succ in graph[current]:
+                    in_degree[succ] -= 1
                     if in_degree[succ] == 0:
-                        next_remaining.append(by_name[succ])
-            remaining = next_remaining
-        all_names = {s["agent_name"] for s in agents_spec}
-        placed = {s["agent_name"] for w in waves for s in w}
-        if all_names != placed:
-            msg = f"Circular dependency detected among: {all_names - placed}"
-            logger.error(msg)
-            raise ValueError(msg)
+                        next_ids.append(succ)
+            remaining = [by_id[key] for key in next_ids]
+        if sum(len(wave) for wave in waves) != len(agents_spec):
+            blocked = [key for key, degree in in_degree.items() if degree > 0]
+            raise ValueError(f"Circular dependency detected among: {blocked}")
         return waves
 
     def _spawn_agent(self, role_name: str, context: str, max_steps: int = None) -> tuple:
@@ -349,10 +455,10 @@ End with exactly one line: GRADE: [1-5]"""
         agent.status_cb = self.status_cb
         agent._max_steps_override = max_steps or self._get_max_steps()
         agent._is_delegated = True
+        agent._parent_run = getattr(self, "_run", None)
         agent._mcp = self._mcp
         agent._mcp_initialized = True
-        agent_tools = {k: v for k, v in self.tools.items() if k != "delegate_to"}
-        agent.tools = agent_tools
+        self._run.emit("agent_spawn", self.name, name=role_name, status="ready", metadata={"agent_id": agent_id})
         self.agents[agent_id] = agent
         self._log(self.name, f"SPAWN: {role_name} ({agent_id})", "agent_spawn", self.mode)
         return agent_id, agent

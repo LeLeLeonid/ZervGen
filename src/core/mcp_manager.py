@@ -13,12 +13,19 @@ from src.config import GlobalSettings, MCPServerConfig, load_config
 logger = logging.getLogger(__name__)
 
 MCP_SDK_AVAILABLE = False
+MCP_MODERN_CLIENT = None
 try:
-    from mcp import ClientSession, StdioServerParameters
+    from mcp import Client, ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
     MCP_SDK_AVAILABLE = True
+    MCP_MODERN_CLIENT = Client
 except ImportError:
-    pass
+    try:
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
+        MCP_SDK_AVAILABLE = True
+    except ImportError:
+        pass
 
 def _unwrap(e: BaseException) -> BaseException:
     while getattr(e, "exceptions", None):
@@ -32,6 +39,7 @@ class MCPServer:
         self.config = config
         self.tools: Dict[str, Any] = {}
         self._session: Optional[ClientSession] = None
+        self._client = None
         self._connected = False
         self._bg_task: Optional[asyncio.Task] = None
         self._ready = asyncio.Event()
@@ -52,31 +60,52 @@ class MCPServer:
         return f"{prefix} | stderr: {tail}" if tail else prefix
 
     async def _run_lifecycle(self, params):
-        import tempfile
-        import os
-        errlog = tempfile.NamedTemporaryFile(mode='w+', encoding='utf-8', delete=False, suffix='.log')
+        errlog = tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8", delete=False, suffix=".log")
         self._errlog = errlog
         try:
-            async with stdio_client(params, errlog=errlog) as (read_stream, write_stream):
-                async with ClientSession(read_stream, write_stream) as session:
-                    await session.initialize()
-                    tools_result = await session.list_tools()
-                    self.tools = {t.name: t for t in tools_result.tools}
-                    self._session = session
+            if MCP_MODERN_CLIENT is not None:
+                transport = stdio_client(params, errlog=errlog)
+                async with MCP_MODERN_CLIENT(transport, input_required_max_rounds=max(1, int(getattr(self.config, "mcp_input_required_max_rounds", 10)))) as client:
+                    self._client = client
+                    self.tools = {}
+                    cursor = None
+                    while True:
+                        tools_result = await client.list_tools(cursor=cursor) if cursor else await client.list_tools()
+                        self.tools.update({t.name: t for t in tools_result.tools})
+                        cursor = getattr(tools_result, "nextCursor", None) or getattr(tools_result, "next_cursor", None)
+                        if not cursor:
+                            break
                     self._connected = True
                     self._ready.set()
                     self._last_error = None
                     await asyncio.Event().wait()
+            else:
+                async with stdio_client(params, errlog=errlog) as streams:
+                    async with ClientSession(*streams) as session:
+                        await session.initialize()
+                        self.tools = {}
+                        cursor = None
+                        while True:
+                            tools_result = await session.list_tools(cursor=cursor) if cursor else await session.list_tools()
+                            self.tools.update({t.name: t for t in tools_result.tools})
+                            cursor = getattr(tools_result, "nextCursor", None) or getattr(tools_result, "next_cursor", None)
+                            if not cursor:
+                                break
+                        self._session = session
+                        self._connected = True
+                        self._ready.set()
+                        self._last_error = None
+                        await asyncio.Event().wait()
         except asyncio.CancelledError:
-            self._last_error = self._stderr_tail("cancelled: handshake never completed (slow npx download or hung spawn)")
+            self._last_error = self._stderr_tail("cancelled")
         except Exception as e:
-            subs = getattr(e, "exceptions", None)
-            detail = subs[0] if subs else e
+            detail = _unwrap(e)
             self._last_error = self._stderr_tail(f"{type(detail).__name__}: {detail}")
             logger.error("MCP server '%s' lifecycle error: %s", self.name, self._last_error)
         finally:
             self._connected = False
             self._session = None
+            self._client = None
             self._ready.set()
             if self._errlog:
                 try:
@@ -140,11 +169,12 @@ class MCPServer:
                 return str(await func(**arguments))
             return str(func(**arguments))
         # External server: JSON-RPC via session
-        if not self._session:
+        target = self._client or self._session
+        if not target:
             raise RuntimeError(f"{self.name} not connected")
         try:
             result = await asyncio.wait_for(
-                self._session.call_tool(tool_name, arguments),
+                target.call_tool(tool_name, arguments),
                 timeout=30.0
             )
             if result and result.content:
@@ -166,6 +196,7 @@ class MCPServer:
                 pass
         self._connected = False
         self._session = None
+        self._client = None
         self._bg_task = None
 
 

@@ -31,6 +31,7 @@ class SessionDB:
         self._db_path = db_path or Path("tmp/memory/sessions.db")
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = Lock()
+        self._executor = ThreadPoolExecutor(max_workers=4)
         self._init_db()
 
     def _run_sync(self, func, *args):
@@ -201,7 +202,7 @@ class SessionDB:
         def _load(conn):
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT id, provider, model, title, started_at, ended_at, message_count, last_grade 
+                SELECT id, provider, model, title, started_at, ended_at, message_count, last_grade
                 FROM sessions WHERE id = ?
             """, (session_id,))
             row = cursor.fetchone()
@@ -438,11 +439,35 @@ class MemoryCore:
         return results
 
     def inject_context(self, query: str, limit: int = 5, trusted_sources=None) -> str:
-        if not query.strip():
+        if not query or not query.strip():
             return ""
-        pinned = [f.get("content", "") for f in self._kg.get_facts() if f.get("category") == "context"]
-        lessons = [f.get("content", "") for f in self._kg.get_facts() if f.get("category") == "lesson"]
-        return "\n".join(pinned[:2] + lessons[:3]).strip()
+        hits = self.search_memory(query, max(1, limit) * 3)
+        allowed = set(trusted_sources or ())
+        selected = []
+        seen = set()
+        for hit in hits:
+            fact = hit.get("fact") or {}
+            source = fact.get("source", "")
+            category = fact.get("category", "")
+            if allowed and source not in allowed and category not in {"context", "lesson"}:
+                continue
+            content = str(hit.get("content") or "").strip()
+            if content and content not in seen:
+                seen.add(content)
+                selected.append(content)
+            if len(selected) >= limit:
+                break
+        if len(selected) < limit:
+            for fact in self._kg.get_facts():
+                if fact.get("category") not in {"context", "lesson"}:
+                    continue
+                content = str(fact.get("content") or "").strip()
+                if content and content not in seen:
+                    seen.add(content)
+                    selected.append(content)
+                if len(selected) >= limit:
+                    break
+        return "\n".join(selected)
 
     def search_tgs(self, query: str, limit: int = 3) -> str:
         facts = self._kg.get_facts()
@@ -512,7 +537,7 @@ class MemoryCore:
             return "Memory rejected: invalid length"
         if any(kw in content.lower() for kw in ("error:", "traceback", "syntaxerror", "nameerror", "ptc result:", "occurred:")):
             return "Memory rejected: probable error dump"
-        
+
         fact = self._create_fact(content, category, tier)
         fact["source"] = source
         self._kg.add_fact(fact)
@@ -728,6 +753,32 @@ class PeerCards:
             cls._instance._load()
         return cls._instance
 
+    def _configured(self) -> List[PeerCard]:
+        try:
+            from src.config import load_config
+            raw = getattr(load_config(), "peer_cards", {}) or {}
+        except Exception:
+            return []
+        cards = []
+        for domain, value in raw.items():
+            if isinstance(value, str):
+                facts = [value]
+                strategies = []
+                anti_patterns = []
+                confidence = 1.0
+            elif isinstance(value, dict):
+                facts = value.get("facts", [])
+                strategies = value.get("strategies", [])
+                anti_patterns = value.get("anti_patterns", [])
+                confidence = float(value.get("confidence", 1.0))
+            else:
+                continue
+            if isinstance(facts, str): facts = [facts]
+            if isinstance(strategies, str): strategies = [strategies]
+            if isinstance(anti_patterns, str): anti_patterns = [anti_patterns]
+            cards.append(PeerCard("user", str(domain), facts, strategies, anti_patterns, {}, max(0.0, min(1.0, confidence))))
+        return cards
+
     def _load(self):
         if self._file.exists():
             try: self._cards = {k: PeerCard(**v) for k, v in json.loads(self._file.read_text("utf-8")).items()}
@@ -735,33 +786,44 @@ class PeerCards:
 
     def _save(self):
         self._file.parent.mkdir(parents=True, exist_ok=True)
-        data = {k: {"agent_id": v.agent_id, "domain": v.domain, "facts": v.facts, "strategies": v.strategies, "anti_patterns": v.anti_patterns, "tool_preferences": v.tool_preferences, "confidence": v.confidence} for k, v in self._cards.items()}
+        data = {k: {"agent_id": v.agent_id, "domain": v.domain, "facts": v.facts, "strategies": v.strategies, "anti_patterns": v.anti_patterns, "tool_preferences": v.tool_preferences, "confidence": v.confidence} for k, v in self._cards.items() if not k.startswith("config:")}
         self._file.write_text(json.dumps(data, indent=2, ensure_ascii=False), "utf-8")
 
     def get_relevant(self, agent_id: str, query: str = "", limit: int = 2) -> List[PeerCard]:
-        cards = [c for k, c in self._cards.items() if c.agent_id == agent_id]
-        if not cards: cards = list(self._cards.values())
-        q = query.lower()
-        scored = [(c.confidence + (3 if c.domain.lower() in q else 0), c) for c in cards if c.confidence > 0]
-        scored.sort(key=lambda x: -x[0])
+        cards = self._configured() + list(self._cards.values())
+        q = set(re.findall(r"[a-z0-9_\-]+", query.lower()))
+        scored = []
+        for card in cards:
+            tokens = set(re.findall(r"[a-z0-9_\-]+", (card.domain + " " + " ".join(card.facts + card.strategies + card.anti_patterns)).lower()))
+            overlap = len(q & tokens)
+            agent_bonus = 2.0 if card.agent_id == agent_id else 0.0
+            score = agent_bonus + overlap + max(0.0, min(1.0, card.confidence))
+            if score > 0:
+                scored.append((score, card))
+        scored.sort(key=lambda x: x[0], reverse=True)
         return [c for _, c in scored[:limit]]
 
     def upsert(self, card: PeerCard):
         key = f"{card.agent_id}:{card.domain}"
         existing = self._cards.get(key)
         if existing:
-            existing.facts = list(set(existing.facts + card.facts))[:15]
-            existing.strategies = list(set(existing.strategies + card.strategies))[:8]
-            existing.anti_patterns = list(set(existing.anti_patterns + card.anti_patterns))[:8]
-            existing.confidence = min(1.0, existing.confidence + 0.05)
+            existing.facts = list(dict.fromkeys(existing.facts + card.facts))[:15]
+            existing.strategies = list(dict.fromkeys(existing.strategies + card.strategies))[:8]
+            existing.anti_patterns = list(dict.fromkeys(existing.anti_patterns + card.anti_patterns))[:8]
+            existing.tool_preferences.update(card.tool_preferences)
+            existing.confidence = min(1.0, max(existing.confidence, card.confidence) + 0.05)
         else:
             self._cards[key] = card
         self._save()
 
     async def evolve(self) -> None:
-        import aiofiles
-        EVOLUTION_DIR.mkdir(parents=True, exist_ok=True)
-        candidate = random.choice(self._cards) if self._cards else None
+        for card in self._cards.values():
+            if card.agent_id == "user":
+                continue
+            card.facts = list(dict.fromkeys(card.facts))[:15]
+            card.strategies = list(dict.fromkeys(card.strategies))[:8]
+            card.anti_patterns = list(dict.fromkeys(card.anti_patterns))[:8]
+        self._save()
 
 
 class Dreamer:
@@ -935,7 +997,13 @@ Be specific. The "detect" field must be a literal substring that appears in the 
         for key, data in self._error_patterns.items():
             if data.get("count", 0) >= 2 and data.get("fix"):
                 lessons.append({"error": key, "count": data["count"], "reason": data.get("reason", ""), "fix": data.get("fix", ""), "detect": data.get("detect", "")})
-        if not lessons: return
+        if not lessons:
+            return
+        self._cards.upsert(PeerCard(
+            agent_id="system", domain="runtime",
+            anti_patterns=[l["detect"] for l in lessons if l.get("detect")][:8],
+            strategies=[l["fix"] for l in lessons if l.get("fix")][:8],
+        ))
         EVOLUTION_DIR.mkdir(parents=True, exist_ok=True)
         path = EVOLUTION_DIR / f"lessons_{int(time.time())}.json"
         path.write_text(json.dumps(lessons, indent=2, ensure_ascii=False), encoding="utf-8")

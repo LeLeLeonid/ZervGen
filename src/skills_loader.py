@@ -11,6 +11,62 @@ logger = logging.getLogger(__name__)
 
 SKILLS_DIR = Path(__file__).parent / "skills"
 AGENTS_DIR = SKILLS_DIR / "AGENTS"
+CATALOG_PATH = Path("tmp/memory/skills_catalog.json")
+
+def _external_roots() -> List[Path]:
+    try:
+        from src.config import load_config
+        roots = getattr(load_config(), "external_skill_roots", ["tmp"])
+        return [Path(r).resolve() for r in roots if str(r).strip()]
+    except Exception:
+        return [Path("tmp").resolve()]
+
+def _parse_frontmatter(text: str) -> Optional[dict]:
+    if not text.startswith("---"):
+        return None
+    try:
+        end = text.index("---", 3)
+    except ValueError:
+        return None
+    try:
+        fm = yaml.safe_load(text[3:end]) or {}
+    except Exception:
+        return None
+    if not (fm.get("name") and fm.get("description")):
+        return None
+    tags = fm.get("tags", [])
+    if isinstance(tags, str):
+        fm["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
+    elif not isinstance(tags, list):
+        fm["tags"] = []
+    else:
+        fm["tags"] = tags
+    return fm
+
+def rebuild_catalog() -> dict:
+    old = {}
+    if CATALOG_PATH.exists():
+        try:
+            old = json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    catalog = {}
+    for root in _external_roots():
+        if not root.exists():
+            continue
+        for md in root.rglob("*.md"):
+            try:
+                fm = _parse_frontmatter(md.read_text(encoding="utf-8", errors="replace"))
+            except Exception:
+                continue
+            if fm:
+                tags = fm["tags"]
+                if "favorite" in old.get(fm["name"], {}).get("tags", []) and "favorite" not in tags:
+                    tags.append("favorite")
+                catalog[fm["name"]] = {"path": str(md), "description": fm["description"], "tags": tags}
+    CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CATALOG_PATH.write_text(json.dumps(catalog, indent=2))
+    return catalog
 
 
 class SkillEngine:
@@ -82,6 +138,7 @@ class SkillDef:
     dependencies: List[str] = field(default_factory=list)
     verification: str = "checklist"  # "checklist" or "heavy"
     body: str = ""
+    path: str = ""
 
     def match_trigger(self, user_input: str) -> bool:
         if not self.tags:
@@ -91,9 +148,11 @@ class SkillDef:
             pattern = r'\b' + re.escape(tag.lower()) + r'\b'
             if re.search(pattern, input_lower):
                 return True
-
-        return any(re.search(r'\b' + re.escape(tag.lower()) + r'\b', input_lower) for tag in self.tags)
-
+        return False
+    
+    @property
+    def is_favorite(self) -> bool:
+        return "favorite" in self.tags or not self.path
 
 class SkillRegistry:
     """Loads YAML contracts, validates, topological dependency sort (GoS)."""
@@ -111,6 +170,18 @@ class SkillRegistry:
         self._initialized = True
         self.skills: Dict[str, SkillDef] = {}
         self._load_all()
+        self._load_external()   
+
+    def _load_external(self) -> None:
+        for name, meta in rebuild_catalog().items():
+            if name not in self.skills:
+                self.skills[name] = SkillDef(
+                    name=name,
+                    description=meta["description"],
+                    tags=meta["tags"],
+                    body="",
+                    path=meta["path"],
+                )
 
     def _load_all(self):
         for md_file in AGENTS_DIR.glob("*.md"):
@@ -154,6 +225,13 @@ class SkillRegistry:
         except Exception as e:
             logger.warning(f"Skill load failed: {path} -> {e}")
 
+    def _external_enabled(self) -> bool:
+        try:
+            from src.config import load_config
+            return bool(getattr(load_config(), "external_skills_enabled", False))
+        except Exception:
+            return False
+
     def resolve_dependencies(self, skill_name: str) -> List[str]:
         visited, order = set(), []
         def dfs(name: str):
@@ -169,11 +247,38 @@ class SkillRegistry:
         return order
 
     def get(self, name: str) -> Optional[SkillDef]:
-        return self.skills.get(name)
+        skill = self.skills.get(name)
+        if skill and skill.path and not self._external_enabled():
+            return None
+        return skill
+
+    def is_external(self, name: str) -> bool:
+        skill = self.skills.get(name)
+        return bool(skill and skill.path)
+
+    def visible(self) -> List[SkillDef]:
+        if self._external_enabled():
+            return list(self.skills.values())
+        return [skill for skill in self.skills.values() if not skill.path]
+
+    def get_body(self, name: str) -> str:
+        s = self.skills.get(name)
+        if not s:
+            return f"Error: skill '{name}' not found."
+        if s.path and not self._external_enabled():
+            return f"Error: external skills are disabled: '{name}'."
+        if not s.body and s.path:
+            try:
+                text = Path(s.path).read_text(encoding="utf-8", errors="replace")
+                s.body = text.split("---", 2)[2].strip() if text.startswith("---") else text
+            except Exception as e:
+                return f"Error: cannot read {s.path}: {e}"
+        return s.body or "(empty)"
 
     def match_task(self, task: str) -> Optional[str]:
         task_lower = task.lower()
-        for name, skill in self.skills.items():
+        for skill in self.visible():
+            name = skill.name
             if name.lower() in task_lower:
                 return name
             for dep in skill.dependencies:
@@ -183,19 +288,23 @@ class SkillRegistry:
 
     def find_by_tags(self, tags: List[str]) -> Optional[SkillDef]:
         tags_lower = [t.lower() for t in tags]
-        for skill in self.skills.values():
-            if any(re.search(r'\b' + re.escape(t) + r'\b', skill.name.lower()) for t in tags_lower):
+        patterns = [re.compile(r'\b' + re.escape(t) + r'\b') for t in tags_lower]
+        for skill in self.visible():
+            name_lower = skill.name.lower()
+            if skill.name.lower() in tags_lower:
                 return skill
-            if any(re.search(r'\b' + re.escape(t) + r'\b', tag.lower()) for tag in skill.tags for t in tags_lower):
+            if any(p.search(name_lower) for p in patterns):
                 return skill
-            if any(re.search(r'\b' + re.escape(t) + r'\b', tool.lower()) for tool in skill.tools for t in tags_lower):
+            if any(p.search(tag.lower()) for tag in skill.tags for p in patterns):
+                return skill
+            if any(p.search(tool.lower()) for tool in skill.tools for p in patterns):
                 return skill
         return None
 
     def reload(self):
         self.skills.clear()
         self._load_all()
-
+        self._load_external()
 
 class RoleConfig:
     def __init__(self, name: str, content: str, meta: Dict):

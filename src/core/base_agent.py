@@ -6,9 +6,12 @@ import logging
 import inspect
 import re
 import subprocess
+import time
 import os
 import sys
+import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 from rich.console import Console
 from rich.panel import Panel
@@ -19,6 +22,7 @@ from src.core.provider import AIProvider, get_provider
 from src.skills_loader import load_role, SkillEngine
 from src.tools import TOOL_REGISTRY
 from src.utils import get_system_context, sanitize_for_prompt, generate_random_delimiter, count_tokens, add_global_tokens, add_provider_tokens, ContextCompressor, ModelCatalog, safe_run, GitManager
+from src.core.runtime import Run, ToolCall, ToolResult, Artifact, RunStatus, Task
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -47,7 +51,7 @@ class _StreamFilter:
                 self._push_thought(pre)
             self.in_fence = not self.in_fence
             self.buf = post
-            
+
         if not self.in_fence:
             sys.stdout.write(self.buf)
             sys.stdout.flush()
@@ -95,6 +99,9 @@ class StemAgent:
         self._injected: List[Dict[str, str]] = []
         self._response_called = False
         self._response_value = ""
+        self._run: Optional[Run] = None
+        self._trace_parent_id = ""
+        self._tripwire_errors: Dict[str, int] = {}
         self._load_tools()
         self.tools["set_mode"] = self._tool_set_mode
 
@@ -124,9 +131,9 @@ class StemAgent:
         return result
 
     async def _tool_set_mode(self, mode: str) -> str:
-        """Change this agent's operating mode (BUILD, ASK, PLAN, DEBUG)."""
         old = self.mode
         self.mode = mode.upper()
+        self.invalidate_cache()
         return f"Mode changed: {old} -> {self.mode}"
 
     @classmethod
@@ -137,19 +144,15 @@ class StemAgent:
 
     def _load_tools(self) -> None:
         role_cfg = load_role(self.skill_name)
-        allowed = None
-        if role_cfg and getattr(role_cfg, 'tools', None):
-            allowed = set(role_cfg.tools)
+        if self.skill_name == "system":
+            allowed = {"response", "delegate_to", "find_skill", "load_skill", "search_memory", "search_tgs", "list_skills", "list_mcp_servers", "set_external_skills", "set_mode"}
+        else:
+            allowed = set(getattr(role_cfg, "tools", []) or [])
             if "all" in allowed:
                 allowed = set(TOOL_REGISTRY.keys())
-        if allowed:
-            self.tools = {k: v for k, v in TOOL_REGISTRY.items() if k in allowed}
-            for t in ("response", "load_skill", "find_skill", "scan_tools"):
-                if t not in self.tools and t in TOOL_REGISTRY:
-                    self.tools[t] = TOOL_REGISTRY[t]
-        else:
-            self.tools = dict(TOOL_REGISTRY)
-    
+            allowed.update({"response", "load_skill", "find_skill"})
+        self.tools = {k: v for k, v in TOOL_REGISTRY.items() if k in allowed}
+
     def _active_tools(self) -> dict:
         write_set = {"write_file", "append_file", "edit_file", "shell"}
         if self.mode == "BUILD":
@@ -182,9 +185,10 @@ class StemAgent:
                 for name, server in self._mcp.servers.items():
                     if not server._connected:
                         logger.warning(f"MCP server '{name}' failed to connect")
-            for tool_name in self._mcp.tools_map:
-                mcp_name = f"mcp_{tool_name}"
-                self.tools[mcp_name] = self._make_mcp_wrapper(tool_name)
+            if getattr(self.settings, "mcp_expose_direct_tools", False):
+                for tool_name in self._mcp.tools_map:
+                    mcp_name = f"mcp_{tool_name}"
+                    self.tools[mcp_name] = self._make_mcp_wrapper(tool_name)
             if self._mcp.tools_map:
                 logger.info(f"MCP ready: {len(self._mcp.tools_map)} tools from {len(self._mcp.servers)} servers")
             self._mcp_initialized = True
@@ -217,6 +221,42 @@ class StemAgent:
     def invalidate_cache(self):
         self._cached_system_prompt = None
 
+    def _emit_run(self, kind, actor, name="", status="", input=None, output=None, error="", duration_ms=0.0, parent_id=""):
+        if not self._run:
+            return None
+        from src.utils import redact_fast
+        cap = max(200, int(getattr(self.settings, "trace_capture_chars", 2000)))
+        def clean(v):
+            if v is None:
+                return None
+            t = redact_fast(str(v))
+            return t[:cap] + ("..." if len(t) > cap else "")
+        meta = {"error": clean(error)} if error else None
+        event = self._run.emit(kind, actor, name, status, clean(input), clean(output), duration_ms, parent_id or self._trace_parent_id, meta)
+        try:
+            payload = event.as_dict() if hasattr(event, "as_dict") else {"event": str(event)}
+        except Exception:
+            payload = {"event": str(event)}
+        logger.info("[RUN_EVENT] %s", json.dumps(payload, ensure_ascii=False, default=str))
+        return event
+
+    def _record_error_tripwire(self, error: str) -> bool:
+        if not self._run:
+            return False
+        normalized = re.sub(r"\b[0-9a-f]{8,}\b", "<id>", str(error).lower())
+        normalized = re.sub(r"\d+(?:\.\d+)?s", "<n>s", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip()[:300]
+        if not normalized:
+            return False
+        count = self._tripwire_errors.get(normalized, 0) + 1
+        self._tripwire_errors[normalized] = count
+        threshold = max(2, int(getattr(self.settings, "tripwire_error_repeats", 3)))
+        if count < threshold:
+            return False
+        self._run.metadata.setdefault("tripwires", {})[normalized] = count
+        self._emit_run("tripwire", self.name, "repeated_error", "triggered", output=normalized)
+        return True
+
     def _get_trigger_input(self) -> str:
         return self.history[-1]["content"] if self.history else ""
 
@@ -240,7 +280,7 @@ class StemAgent:
         if current_tokens < threshold:
             return
         if self._compressor is None:
-            self._compressor = ContextCompressor(self.provider)  
+            self._compressor = ContextCompressor(self.provider)
         try:
             self.history = await self._compressor.compress(self.history)
         except Exception as e:
@@ -250,75 +290,136 @@ class StemAgent:
             self.history = head + self.history[-10:]
         self._cached_system_prompt = None
 
-    def _build_system_prompt(self, role_cfg, include_roles: bool = False, user_input: str = "") -> str:
-        context = get_system_context()
-        if self.memory:
-            memories_str = self.memory.inject_context(user_input or "", limit=8, trusted_sources={"user", "tool_result", "delegation"})
-        else:
-            memories_str = ""
+    def _prompt_header(self, role_cfg) -> str:
+        role_prompt = role_cfg.prompt if role_cfg else "You are a ZervGen Agent."
+        tier = getattr(self.settings, "active_model_tier", "COOL")
+        return f"{role_prompt}\n=== OP STATE ===\nROLE: {self.skill_name}\nMODE: {self.mode}\nTIER: {tier}"
 
-        prompt = f"{role_cfg.prompt if role_cfg else 'You are a ZervGen Agent.'}\n=== OP STATE ===\nROLE: {self.skill_name}\nMODE: {self.mode}\n--- CONTEXT ---\n{context}\n--- MEMORY ---\n{memories_str}\n"
+    def _prompt_run(self) -> str:
+        if not self._run:
+            return ""
+        b = self._run.budget
+        return (
+            "--- RUN ---\n"
+            f"ID: {self._run.id}\n"
+            f"STATUS: {self._run.status.value}\n"
+            f"STEPS: {getattr(b, 'steps', 0)}/{getattr(b, 'max_steps', 0)}\n"
+            f"TOOLS: {getattr(b, 'tool_calls', 0)}/{getattr(b, 'max_tool_calls', 0)}\n"
+            f"DELEGATIONS: {getattr(b, 'delegations', 0)}/{getattr(b, 'max_delegations', 0)}"
+        )
 
-        if self._active_todos:
-            prompt += "--- ACTIVE TODOS ---\n" + "\n".join(f"- {todo}" for todo in self._active_todos) + "\n\n"
+    def _prompt_memory(self, user_input: str) -> str:
+        if not self.memory:
+            return ""
+        try:
+            limit = max(1, int(getattr(self.settings, "prompt_memory_limit", 4)))
+            value = self.memory.inject_context(
+                user_input,
+                limit=limit,
+                trusted_sources={"user", "tool_result", "delegation"}
+            )
+            return f"--- MEMORY ---\n{value}" if value else ""
+        except Exception as e:
+            logger.debug("Prompt memory failed: %s", e)
+            return ""
 
+    def _prompt_peer_cards(self, user_input: str) -> str:
         try:
             from src.core.memory import PeerCards
-            cards = PeerCards().get_relevant(self.skill_name, user_input, limit=2)
+            limit = max(1, int(getattr(self.settings, "prompt_peer_card_limit", 3)))
+            cards = PeerCards().get_relevant(self.skill_name, user_input, limit=limit)
             if cards:
-                prompt += "--- PEER CARDS ---\n" + "\n\n".join(c.to_prompt_block() for c in cards) + "\n\n"
-        except Exception:
-            pass
+                return "--- PEER CARDS ---\n" + "\n\n".join(c.to_prompt_block() for c in cards)
+        except Exception as e:
+            logger.debug("Prompt peer cards failed: %s", e)
+        return ""
 
-        if getattr(self.settings, "mcp_enabled", True) and self._mcp:
-            connected = []
-            dead = []
-            for name, srv in self._mcp.servers.items():
-                if srv.connected:
-                    keys = list(srv.tools.keys())
-                    shown = ", ".join(keys[:5])
-                    connected.append(f"- {name} ({len(keys)}): {shown}{'…' if len(keys) > 5 else ''}")
-                else:
-                    err = (srv._last_error or "unknown")[:60]
-                    dead.append(f"- {name} (DEAD: {err})")
-            if connected or dead:
-                prompt += "--- MCP SERVERS ---\n"
-                if connected:
-                    prompt += "ACTIVE:\n" + "\n".join(connected) + "\n"
-                if dead:
-                    prompt += "DEAD:\n" + "\n".join(dead) + "\n"
-                prompt += "Run: mcp_execute(server, tool, args). Discover full schema: mcp_execute(server, 'list').\n\n"
-        triggered_skills = []
-        if user_input:
+    def _prompt_mcp(self) -> str:
+        if not getattr(self.settings, "mcp_enabled", True) or not self._mcp:
+            return ""
+        if not getattr(self.settings, "prompt_show_mcp_tools", False):
+            return ""
+        active = []
+        for name, srv in self._mcp.servers.items():
+            if srv.connected:
+                active.append(f"- {name}: {len(srv.tools)} tools")
+        return "--- MCP ---\n" + "\n".join(active) if active else ""
+
+    def _prompt_skills(self, user_input: str) -> str:
+        try:
             from src.skills_loader import skill_index
-            seen = self.memory._triggered_this_session if self.memory else set()
-            triggered_skills = [s for s in skill_index.skills.values() if s.match_trigger(user_input) and s.name not in seen]
-            if triggered_skills:
-                for skill in triggered_skills:
-                    prompt += f"--- TRIGGERED SKILL: {skill.name} ---\n{skill.body}\n\n"
+            show_internal = bool(getattr(self.settings, "prompt_show_internal_skills", False))
+            show_external = bool(getattr(self.settings, "prompt_show_external_skills", False))
+            auto_internal = bool(getattr(self.settings, "prompt_auto_trigger_skills", False))
+            auto_external = bool(getattr(self.settings, "prompt_auto_trigger_external_skills", False))
+            visible = skill_index.visible()
+            sections = []
+            if auto_internal or auto_external:
+                seen = self.memory._triggered_this_session if self.memory else set()
+                for skill in visible:
+                    external = skill_index.is_external(skill.name)
+                    if external and not auto_external:
+                        continue
+                    if not external and not auto_internal:
+                        continue
+                    if not skill.match_trigger(user_input) or skill.name in seen:
+                        continue
+                    body = skill_index.get_body(skill.name)
+                    if not body.startswith("Error:"):
+                        sections.append(f"--- TRIGGERED SKILL: {skill.name} ---\n{body}")
                     if self.memory:
                         self.memory._triggered_this_session.add(skill.name)
+            names = []
+            for skill in visible:
+                external = skill_index.is_external(skill.name)
+                if external and not show_external:
+                    continue
+                if not external and not show_internal:
+                    continue
+                names.append(f"- {skill.name}: {skill.description[:100]}")
+            if names:
+                sections.append("--- SKILL INDEX ---\nUse load_skill(name) only when needed.\n" + "\n".join(names))
+            return "\n\n".join(sections)
+        except Exception as e:
+            logger.debug("Prompt skills failed: %s", e)
+            return ""
 
-        try:
-            from src.skills_loader import skill_index
-            triggered_names = {s.name for s in triggered_skills}
-            index_lines = [f"- {s.name}: {s.description[:60]}" for s in skill_index.skills.values() if s.name not in triggered_names]
-            if index_lines:
-                prompt += "--- AVAILABLE SKILLS ---\nUse load_skill('name') to read full instructions.\n" + "\n".join(index_lines) + "\n\n"
-        except Exception: pass
-        
+    def _prompt_tools(self) -> str:
+        active = self._active_tools()
+        if not active:
+            return ""
+        from src.tools import get_tools_schema
+        return "--- AVAILABLE TOOLS ---\n" + get_tools_schema(active, compact=True)
+
+    def _prompt_project_rules(self) -> str:
         try:
             from src.utils import discover_context_files, redact_fast
-            prompt += f"--- REASONING PROTOCOL ---{ZG_PROTOCOL}\n"
-            ctx_files = discover_context_files(".")
-            if ctx_files:
-                prompt += f"--- CONTEXT FILES ---\n{redact_fast(ctx_files)}\n"
-                logging.getLogger(__name__).info("Context files loaded (%d chars)" % len(ctx_files))
-            else:
-                logging.getLogger(__name__).info("discover_context_files empty - AGENTS.md not found or blocked")
+            text = discover_context_files(".")
+            if not text:
+                return ""
+            limit = max(400, int(getattr(self.settings, "prompt_project_rules_chars", 1800)))
+            return "--- PROJECT RULES ---\n" + redact_fast(text)[:limit]
         except Exception as e:
-            logging.getLogger(__name__).warning(f"discover_context_files failed: {e}")
+            logger.debug("Prompt project rules failed: %s", e)
+            return ""
 
+    def _build_system_prompt(self, role_cfg, include_roles: bool = False, user_input: str = "") -> str:
+        sections = [
+            self._prompt_header(role_cfg),
+            self._prompt_run(),
+            f"--- CONTEXT ---\n{get_system_context()}",
+            self._prompt_memory(user_input),
+            self._prompt_peer_cards(user_input),
+            self._prompt_mcp(),
+            self._prompt_skills(user_input),
+            self._prompt_tools(),
+            f"--- EXECUTION PROTOCOL ---\n{ZG_PROTOCOL.strip()}",
+            self._prompt_project_rules(),
+        ]
+        prompt = "\n\n".join(section for section in sections if section)
+        limit = max(4000, int(getattr(self.settings, "prompt_max_chars", 14000)))
+        if len(prompt) > limit:
+            prompt = prompt[:limit]
         current_hash = hashlib.md5(prompt.encode()).hexdigest()
         if current_hash == self._prompt_hash and self._prompt_obj_ref is not None:
             return self._prompt_obj_ref
@@ -331,6 +432,8 @@ class StemAgent:
         safe_content = redact_fast(content)
         logger.info(f"[{event_type.upper()}] {role}: {safe_content}")
         trace_line(role, event_type, safe_content)
+        if self._run:
+            self._run.emit(event_type, role, input=safe_content)
         if self.memory:
             self.memory.log_event_sync(role, safe_content, event_type, mode or self.mode)
         if event_type in ("input", "response", "agent_start", "delegation_result", "loop"):
@@ -350,8 +453,16 @@ class StemAgent:
             or tool_name.startswith("mcp_")
         ):
             return f"Error: Tool '{tool_name}' requires BUILD mode (current: {self.mode})"
+        if self._run and not self._run.budget.tool():
+            return "Error: Tool-call budget exhausted"
         func = self.tools[tool_name]
+        call_id = uuid.uuid4().hex[:12]
+        call = ToolCall(call_id, tool_name, dict(args), self.name)
+        if self._run:
+            self._run.tool_calls.append(call)
+            self._run.emit("tool_call", self.name, name=tool_name, status="running", input=args)
         self._log(self.name, f"TOOL: {tool_name}({args})", "tool_call", self.mode)
+        started = time.monotonic()
         try:
             tool_timeout = getattr(self.settings, 'tool_timeout', 60)
             result = await asyncio.wait_for(
@@ -359,6 +470,15 @@ class StemAgent:
                 timeout=tool_timeout
             )
             result_str = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+            duration = time.monotonic() - started
+            if self._run:
+                tool_result = ToolResult(call_id, True, result_str, duration=duration, ended_at=time.time())
+                self._run.tool_results.append(tool_result)
+                self._run.emit("tool_result", self.name, name=tool_name, status="ok", output=self._format_tool_output(tool_name, result_str), duration=duration)
+                if tool_name in {"write_file", "append_file", "edit_file"}:
+                    path = str(args.get("path", ""))
+                    if path:
+                        self._run.artifacts.append(Artifact(path=path))
             if tool_name != "delegate_to":
                 self._log(self.name, result_str, "tool_result", self.mode)
             return self._format_tool_output(tool_name, result_str)
@@ -372,7 +492,13 @@ class StemAgent:
                 error_msg = f"TypeError: {e}"
         except Exception as e:
             error_msg = f"Error: Tool '{tool_name}' failed: {e}"
+        duration = time.monotonic() - started
+        if self._run:
+            self._run.tool_results.append(ToolResult(call_id, False, error=error_msg, duration=duration, ended_at=time.time()))
+            self._run.emit("tool_result", self.name, name=tool_name, status="error", output=error_msg, duration=duration)
         self._log(self.name, f"TOOL ERROR: {tool_name} -> {error_msg}", "tool_error", self.mode)
+        if self._record_error_tripwire(f"{tool_name}: {error_msg}"):
+            return f"Error: TRIPWIRE repeated failure for {tool_name}. Escalate or change strategy."
         return error_msg
 
     def _extract_codes(self, text: str) -> List[str]:
@@ -407,7 +533,7 @@ class StemAgent:
             ast.fix_missing_locations(tree)
             return ast.unparse(tree)
         return code
-    
+
     def _auto_await_tools(self, code: str, names: set) -> str:
         try:
             tree = ast.parse(code)
@@ -429,14 +555,14 @@ class StemAgent:
         tree = _AA().visit(tree)
         ast.fix_missing_locations(tree)
         return ast.unparse(tree)
-    
+
     def _looks_like_code(self, text: str) -> bool:
         try:
             compile(text, "<ptc_probe>", "exec")
         except (SyntaxError, ValueError):
             return False
         return bool(re.search(r"\bawait\s+\w+\s*\(|^\s*\w+\s*=[^=]|\bprint\s*\(", text, re.MULTILINE))
-    
+
     def _looks_like_xml(self, text: str) -> bool:
         for line in text.split('\n'):
             stripped = line.strip()
@@ -444,9 +570,84 @@ class StemAgent:
                 return True
         return False
 
+    def _looks_like_shell(self, text: str) -> List[tuple[str, str]]:
+        blocks = []
+        for match in re.finditer(r'```(bash|cmd|shell|powershell|sh)\s*\n(.*?)\n\s*```', text, re.DOTALL | re.IGNORECASE):
+            lang = match.group(1).lower()
+            code = match.group(2).strip()
+            if code:
+                blocks.append((lang, code))
+        return blocks
+
+    def _validate_ptc(self, code: str) -> Optional[str]:
+        try:
+            tree = ast.parse(code)
+        except SyntaxError as e:
+            return f"Syntax Error: {e}"
+        blocked_names = {"open", "eval", "exec", "compile", "__import__", "globals", "locals", "vars", "dir", "getattr", "setattr", "delattr", "breakpoint", "input", "help", "type", "object"}
+        blocked_attrs = {"__class__", "__dict__", "__globals__", "__code__", "__closure__", "__subclasses__", "__mro__", "mro", "__getattribute__", "__getattr__", "_agent", "_run", "_mcp", "provider", "settings", "memory", "tools"}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.Yield, ast.YieldFrom, ast.With, ast.AsyncWith, ast.Global, ast.Nonlocal)):
+                return "PTC blocked: unsupported syntax"
+            if isinstance(node, ast.Name) and node.id in blocked_names:
+                return f"PTC blocked: {node.id}"
+            if isinstance(node, ast.Attribute):
+                if node.attr in blocked_attrs or node.attr.startswith("_"):
+                    return f"PTC blocked: {node.attr}"
+                if isinstance(node.value, ast.Name) and node.value.id in {"os", "sys", "subprocess", "socket", "pathlib", "shutil", "ctypes", "builtins", "importlib"}:
+                    return f"PTC blocked: {node.value.id}"
+        return None
+
+    def _extract_json_tool_calls(self, text: str) -> List[Dict[str, Any]]:
+        if not getattr(self.settings, "json_tool_fallback", True):
+            return []
+        candidates = []
+        blocks = re.findall(r"```json\s*\n(.*?)\n\s*```", text, re.DOTALL | re.IGNORECASE)
+        candidates.extend(blocks)
+        stripped = text.strip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            candidates.append(stripped)
+        for raw in candidates:
+            try:
+                value = json.loads(raw)
+            except Exception:
+                continue
+            items = value.get("tool_calls") if isinstance(value, dict) else value
+            if items is None and isinstance(value, dict):
+                items = [value]
+            if not isinstance(items, list):
+                items = [items]
+            out = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("tool") or item.get("name") or item.get("function")
+                args = item.get("arguments", item.get("args", {}))
+                if isinstance(name, dict):
+                    args = name.get("arguments", args)
+                    name = name.get("name")
+                if not isinstance(name, str) or name not in self._active_tools():
+                    continue
+                if not isinstance(args, dict):
+                    continue
+                out.append({"name": name, "arguments": args})
+            if out:
+                return out
+        return []
+
+    def _log_ptc_error(self, message: str, full_response: str = "") -> None:
+        captured = full_response.strip()
+        if captured:
+            message = f"{message}\nMODEL OUTPUT:\n{captured}"
+        self._log(self.name, message, "ptc_error", self.mode)
+
     async def _run_code(self, code: str, full_response: str = "") -> str:
         if not code:
             return "Error: Empty code"
+        validation_error = self._validate_ptc(code)
+        if validation_error:
+            self._log_ptc_error(validation_error, full_response)
+            return validation_error
         if code.count('"""') % 2 != 0:
             code += '\n"""'
         if code.count("'''") % 2 != 0:
@@ -481,7 +682,27 @@ class StemAgent:
         print_outputs = []
         def _captured_print(*args, **kwargs) -> None:
             print_outputs.append(" ".join(str(a) for a in args))
-        g = {**self._active_tools(), "json": json, "print": _captured_print, "_orchestrator": self}
+        safe_builtins = {
+            "abs": abs, "all": all, "any": any, "bool": bool, "dict": dict, "enumerate": enumerate,
+            "float": float, "int": int, "len": len, "list": list, "max": max, "min": min,
+            "range": range, "round": round, "set": set, "sorted": sorted, "str": str,
+            "sum": sum, "tuple": tuple, "zip": zip, "isinstance": isinstance,
+            "Exception": Exception, "KeyError": KeyError, "TypeError": TypeError, "ValueError": ValueError,
+            "NotImplementedError": NotImplementedError, "RuntimeError": RuntimeError, "format": format, "repr": repr, "reversed": reversed,
+        }
+        class _ToolRuntimeView:
+            def __init__(self, owner): self.owner = owner
+            async def request_permission(self, question, details="", default=False):
+                return await self.owner.request_permission(question, details, default)
+        safe_asyncio = SimpleNamespace(
+            gather=asyncio.gather,
+            wait_for=asyncio.wait_for,
+            create_task=asyncio.create_task,
+            ensure_future=asyncio.ensure_future,
+            shield=asyncio.shield,
+            as_completed=asyncio.as_completed,
+        )
+        g = {**self._active_tools(), "json": json, "asyncio": safe_asyncio, "print": _captured_print, "_orchestrator": _ToolRuntimeView(self), "__builtins__": safe_builtins}
         lines = fixed_code.split("\n")
         indented = "\n".join(f"    {l}" for l in lines)
         wrapped = f"async def __execute():\n{indented}"
@@ -510,18 +731,24 @@ class StemAgent:
                 self._log(self.name, str(result), "ptc_result", self.mode)
             return str(result) if result else ""
         except asyncio.CancelledError:
-            return "Error: Execution cancelled"
+            raise
         except asyncio.TimeoutError:
-            if is_delegate:
-                return "Error: delegated agent timed out. Retry with a smaller sub-task, or do the work yourself with native tools."
-            return "Error: Execution timed out"
+            err = "Error: delegated agent timed out. Retry with a smaller sub-task, or do the work yourself with native tools." if is_delegate else "Error: Execution timed out"
+            self._log_ptc_error(err, full_response)
+            self._record_error_tripwire(f"ptc:{err}")
+            return err
         except NameError as e:
             err_str = str(e)
             if "mcp_" in err_str:
                 missing = re.search(r"mcp_\w+", err_str)
                 tool = missing.group(0) if missing else "unknown"
-                return f"MCP Error: {tool} unavailable. Retry once; if it persists use native equivalents (fetch_url, read_file, shell)."
-            return f"NameError: {err_str}"
+                err = f"MCP Error: {tool} unavailable. Retry once; if it persists use native equivalents (fetch_url, read_file, shell)."
+                self._log_ptc_error(err, full_response)
+                return err
+            err = f"NameError: {err_str}"
+            self._log_ptc_error(err, full_response)
+            self._record_error_tripwire(f"ptc:{err}")
+            return err
         except TypeError as e:
             err_msg = f"TypeError: {e}"
             hint = ""
@@ -536,7 +763,10 @@ class StemAgent:
         except Exception as e:
             err_msg = f"{type(e).__name__}: {e}"
             self._log(self.name, f"ERROR: {err_msg}", "ptc_error", self.mode)
-            return f"Error: {err_msg}"
+            err = f"Error: {err_msg}"
+            self._log_ptc_error(err, full_response)
+            self._record_error_tripwire(f"ptc:{err}")
+            return err
 
     def _get_max_steps(self) -> int:
         return self._max_steps_override or self.settings.max_steps
@@ -559,10 +789,10 @@ class StemAgent:
             if self._status is not None:
                 self._status.__exit__(None, None, None)
                 self._status = None
-    
+
     def inject_user_message(self, text: str) -> None:
         self._injected.append({"role": "user", "content": text})
- 
+
     async def _handle_llm_turn(self, system_prompt: str) -> str:
         mode_def = MODES.get(self.mode, MODES["BUILD"])
         delim = generate_random_delimiter(16)
@@ -599,6 +829,7 @@ class StemAgent:
             _record_failure(p_name)
             raise
         response = response.strip()
+        self._emit_run("model_output", self.name, "llm", "received", output=response[:2000])
         if response.startswith(delim) and response.endswith(delim):
             response = response[len(delim):-len(delim)].strip()
         in_tok, out_tok = count_tokens(self.history, response)
@@ -608,7 +839,25 @@ class StemAgent:
                 self.provider.META.name if hasattr(self.provider, 'META') else self.settings.provider
             )
             add_provider_tokens(p_name, in_tok, out_tok)
+        if self._run:
+            provider_cost = float(getattr(self.provider, "_last_cost", 0.0) or 0.0)
+            if provider_cost > 0:
+                self._run.metadata["cost_usd"] = float(self._run.metadata.get("cost_usd", 0.0)) + provider_cost
+                max_cost = float(getattr(self.settings, "max_cost_usd", 0.0) or 0.0)
+                if max_cost and self._run.metadata["cost_usd"] > max_cost:
+                    raise RuntimeError(f"Cost budget exceeded (${max_cost:.4f})")
         return response
+
+    async def _run_verification_sensors(self) -> str:
+        commands = list(getattr(self.settings, "verification_commands", []) or [])
+        if self.mode != "BUILD" or not commands or "shell" not in self._active_tools():
+            return ""
+        failures = []
+        for command in commands:
+            result = await self._execute_tool("shell", {"command": command})
+            if str(result).startswith("Error"):
+                failures.append(f"{command}: {result}")
+        return "\n".join(failures)
 
     async def run(self, task: str) -> str:
         if not task or not isinstance(task, str):
@@ -639,14 +888,28 @@ class StemAgent:
         self._response_called = False
         self._response_value = ""
         self._set_status(True)
+        self._run = Run.create(task, self.name, max_steps=max_steps, parent_run_id=getattr(getattr(self, "_parent_run", None), "id", None))
+        self._run.status = RunStatus.RUNNING
+        self._run.budget.max_tool_calls = getattr(self.settings, "max_tool_calls", 200)
+        self._run.budget.max_delegations = getattr(self.settings, "max_delegations", 12)
+        self._run.budget.max_parallel_agents = getattr(self.settings, "max_parallel_agents", 4)
+        self._run.plan.add(Task(id="root", objective=task, agent=self.name))
+        self._run.metadata["cost_usd"] = 0.0
+        deadline = time.monotonic() + max(0, int(getattr(self.settings, "run_timeout", 0)))
         try:
             while step < max_steps:
                 step += 1
+                if deadline and time.monotonic() > deadline:
+                    self._run.status = RunStatus.FAILED
+                    self._log(self.name, "Run timeout exceeded", "ptc_error", self.mode)
+                    return "Error: Run timeout exceeded."
+                self._run.budget.steps = step
                 if self.interrupt_event.is_set():
                     self.interrupt_event.clear()
-                    self.history.append({"role": "user", "content": "[LOOP] Try something different!"})
-                    self.invalidate_cache()
-                    continue
+                    self._run.status = RunStatus.STOPPED
+                    self._run.ended_at = time.time()
+                    self._log(self.name, "Stopped by user", "ptc_error", self.mode)
+                    return "Stopped by user."
                 if self._injected:
                     for msg in self._injected:
                         self.history.append(msg)
@@ -655,7 +918,7 @@ class StemAgent:
                 await self._trim_history()
                 if self._cached_system_prompt is None:
                     role_cfg = load_role(self.skill_name) or load_role("system")
-                    self._cached_system_prompt = self._build_system_prompt(role_cfg, include_roles=self.skill_name == "system", user_input=self._get_trigger_input())
+                    self._cached_system_prompt = self._build_system_prompt(role_cfg, include_roles=self.skill_name == "system", user_input=task)
                 response = None
                 attempt = 0
                 while response is None:
@@ -663,9 +926,10 @@ class StemAgent:
                     try:
                         response = await self._handle_llm_turn(self._cached_system_prompt)
                     except asyncio.TimeoutError:
-                        if attempt >= 3:
-                            return "Error: Provider timeout after 3 attempts."
-                        self._log(self.name, f"Timeout, retry {attempt}/3", "ptc_error", self.mode)
+                        max_retries = max(1, int(getattr(self.settings, "max_retries", 3)))
+                        if attempt >= max_retries:
+                            return f"Error: Provider timeout after {max_retries} attempts."
+                        self._log(self.name, f"Timeout, retry {attempt}/{max_retries}", "ptc_error", self.mode)
                         await asyncio.sleep(2 * attempt)
                     except Exception as e:
                         err = str(e).lower()
@@ -673,21 +937,44 @@ class StemAgent:
                             self._log(self.name, "Context overflow, compressing", "ptc_error", self.mode)
                             await self._trim_history()
                             self.invalidate_cache()
-                            if attempt >= 3:
+                            max_retries = max(1, int(getattr(self.settings, "max_retries", 3)))
+                            if attempt >= max_retries:
                                 return f"Error: {e}"
                         elif "429" in str(e) or "rate limit" in err:
-                            if attempt >= 4:
+                            max_retries = max(1, int(getattr(self.settings, "max_retries", 3)))
+                            if attempt >= max_retries:
                                 return f"Error: {e}"
-                            self._log(self.name, f"Rate limited, retry {attempt}/4", "ptc_error", self.mode)
+                            self._log(self.name, f"Rate limited, retry {attempt}/{max_retries}", "ptc_error", self.mode)
                             await asyncio.sleep(5 * attempt)
                         else:
                             self._log(self.name, str(e) or repr(e), "ptc_error", self.mode)
                             return f"Error: {e}"
                 codes = self._extract_codes(response)
+                shell_blocks = self._looks_like_shell(response) if getattr(self.settings, "legacy_shell_blocks_enabled", False) else []
+                if not codes:
+                    json_calls = self._extract_json_tool_calls(response)
+                    if json_calls:
+                        outputs = []
+                        for call in json_calls:
+                            result = await self._execute_tool(call["name"], call["arguments"])
+                            outputs.append(f"{call['name']} -> {result}")
+                            if self._response_called:
+                                self._response_called = False
+                                self._set_status(False)
+                                return self._response_value
+                        self._log(self.name, "\n".join(outputs), "ptc_result", self.mode)
+                        self.history.append({"role": "assistant", "content": response})
+                        self.history.append({"role": "assistant", "content": "\n".join(outputs)})
+                        self.invalidate_cache()
+                        continue
+                for lang, cmd in shell_blocks:
+                    self._log(self.name, f"SHELL ({lang}): {cmd}", "ptc_call", self.mode)
+                    shell_result = await self._execute_tool("shell", {"command": cmd})
+                    self.history.append({"role": "assistant", "content": f"[SHELL {lang}]\n{cmd}\n[OUTPUT]\n{shell_result}"})
                 if self.settings.debug_mode and not self._silent:
                     self._set_status(False)
                     console.print(Panel(Text(response), title="[green]OUTPUT[/green]"))
-                #TODO Make IF codes then combined_code -> execute AND raw_text in response or print AND loop goes further 
+                #TODO Make IF codes then combined_code -> execute AND raw_text in response or print AND loop goes further
                 if codes:
                     prose = response.split("```", 1)[0].strip()
                     if prose and not self._silent and not self.settings.debug_mode and not getattr(self, "_last_streamed", False):
@@ -697,6 +984,11 @@ class StemAgent:
                     combined_code = "\n\n".join(codes)
                     raw_output = await self._run_code(combined_code, response)
                     self.history.append({"role": "assistant", "content": response})
+                    if raw_output and str(raw_output).startswith("PTC ") and self._record_error_tripwire(str(raw_output)):
+                        self._run.status = RunStatus.FAILED
+                        self._run.ended_at = time.time()
+                        self._emit_run("run_end", self.name, status="failed", output=raw_output)
+                        return raw_output
                     if raw_output and (not self.history or self.history[-1].get("content") != raw_output):
                         self.history.append({"role": "assistant", "content": raw_output})
 
@@ -729,8 +1021,14 @@ class StemAgent:
                     continue
                 else:
                     if not response or not response.strip():
-                        self._set_status(False)
-                        return "[ERROR] Provider returned empty. Check API key/model."
+                        self._empty_count = getattr(self, "_empty_count", 0) + 1
+                        if self._empty_count >= 3:
+                            self._empty_count = 0
+                            self._log(self.name, "Provider returned empty 3x.", "ptc_error", self.mode)
+                            return "[ERROR] Provider returned empty 3x."
+                        self.invalidate_cache()
+                        continue
+                    self._empty_count = 0
                     clean_response = self._strip_ptc(response)
                     if self._looks_like_code(clean_response):
                         self._log(self.name, "AUTO-PTC: unfenced code detected, executing", "ptc_call", self.mode)
@@ -749,12 +1047,23 @@ class StemAgent:
                         self.history.append({"role": "user", "content": "Your previous response was not in PTC format. Use ```python ...``` code blocks for tool calls. Please try again."})
                         self.invalidate_cache()
                         continue
+                    sensor_error = await self._run_verification_sensors()
+                    if sensor_error:
+                        self._log(self.name, sensor_error, "state", self.mode)
+                        self.history.append({"role": "user", "content": f"Verification failed:\n{sensor_error}\nFix the failure and verify again."})
+                        self.invalidate_cache()
+                        continue
                     self._log(self.name, clean_response, "response", self.mode)
                     if not self._is_delegated and self.memory and len(clean_response) > 20:
                         asyncio.create_task(self.memory.add_memory(f"TASK: {task[:250]} => OUTCOME: {clean_response[:250]}", category="lesson", tier="recent", source="auto"))
                     return clean_response
+            self._run.status = RunStatus.FAILED
             return "Max steps reached."
         finally:
+            if self._run and self._run.status == RunStatus.RUNNING:
+                self._run.status = RunStatus.DONE
+            if self._run:
+                self._run.ended_at = time.time()
             self._set_status(False)
 
     def get_history_summary(self, max_messages: int = -1) -> str:

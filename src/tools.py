@@ -130,7 +130,7 @@ async def web_search(query: str, limit: int = 5, region: str = "wt-wt", recency:
             }
             for r in results
         ]
-        return structured  
+        return structured
     except ImportError:
         return "Error: ddgs not installed. pip install duckduckgo-search"
     except Exception as e:
@@ -247,13 +247,12 @@ async def shell(command: str, timeout: int = 60) -> str:
         pass
     try:
         process = await asyncio.create_subprocess_shell(command.strip(), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=int(timeout) if isinstance(timeout, (int, float, str)) else 60)
-        out, err = stdout.decode('utf-8', errors='replace').strip(), stderr.decode('utf-8', errors='replace').strip()
-        return {
-            "exit_code": process.returncode,
-            "stdout": out,
-            "stderr": err
-        }
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=int(timeout))
+        out = stdout.decode('utf-8', errors='replace').strip()
+        err = stderr.decode('utf-8', errors='replace').strip()
+        if process.returncode != 0:
+            return f"Exit code: {process.returncode}\nSTDOUT: {out}\nSTDERR: {err}"
+        return out or "(no output)"
     except asyncio.TimeoutError:
         return f"Timeout after {timeout}s"
     except Exception as e:
@@ -372,12 +371,16 @@ async def grep_files(pattern: str, path: str = ".", file_type: str = "", use_reg
         search_pattern = re.compile(pattern) if use_regex else re.compile(re.escape(pattern))
         matches = []
         for file_path in base.rglob(f"*{file_type}" if file_type else "*"):
-            if file_path.is_file() and file_path.stat().st_size <= 1000000:
+            if file_path.is_file() and file_path.stat().st_size <= 1_000_000:
                 try:
                     content = file_path.read_text(encoding='utf-8', errors='ignore')
                     for i, line in enumerate(content.split('\n'), 1):
-                        if search_pattern.search(line):
-                            matches.append(f"{file_path}:{i}: {line.strip()}")
+                        if use_regex:
+                            if search_pattern.search(line):
+                                matches.append(f"{file_path}:{i}: {line.strip()}")
+                        else:
+                            if pattern in line:
+                                matches.append(f"{file_path}:{i}: {line.strip()}")
                 except Exception:
                     pass
         if not matches:
@@ -536,8 +539,9 @@ async def type_text(text: str) -> str:
 
 async def find_skill(tags) -> str:
     from src.skills_loader import skill_index
+    visible = skill_index.visible()
     if tags is None:
-        return json.dumps([{"name": s} for s in skill_index.skills.keys()])
+        return json.dumps([{"name": s.name, "description": s.description} for s in visible])
     if isinstance(tags, str):
         tags = [t.strip().lower() for t in re.split(r'[,\s]+', tags) if t.strip()]
     elif isinstance(tags, (list, tuple)):
@@ -545,17 +549,17 @@ async def find_skill(tags) -> str:
     else:
         tags = [str(tags).lower()]
     if not tags or "*" in tags or "all" in tags:
-        return json.dumps([{"name": s} for s in skill_index.skills.keys()])
+        return json.dumps([{"name": s.name, "description": s.description} for s in visible])
     skill = skill_index.find_by_tags(tags)
     if skill:
-        return json.dumps({"name": skill.name, "description": skill.description})
+        return json.dumps({"name": skill.name, "description": skill.description, "external": skill_index.is_external(skill.name)})
     return "Error: No matching skill found"
 
 
 async def list_skills() -> str:
     from src.skills_loader import skill_index, get_all_roles
     roles = ", ".join(get_all_roles().keys())
-    skills = ", ".join(skill_index.skills.keys())
+    skills = ", ".join(s.name for s in skill_index.visible())
     out = []
     if roles:
         out.append(f"Agents:\n{roles}")
@@ -565,17 +569,58 @@ async def list_skills() -> str:
 
 
 async def load_skill(name: str) -> str:
-    """Read the full body of a skill by name."""
     from src.skills_loader import skill_index
-    s = skill_index.get(name)
-    return s.body if s else f"Error: skill '{name}' not found"
+    skill = skill_index.get(name)
+    if not skill:
+        if skill_index.is_external(name):
+            return f"Error: external skills are disabled: '{name}'."
+        return f"Error: skill '{name}' not found."
+    body = skill_index.get_body(name)
+    if body.startswith("Error:"):
+        return body
+    src = f"\n{skill.path}" if skill.path else ""
+    return f"--- {name} ---{src}\n{body}"
+
+
+async def set_external_skills(enabled: bool) -> str:
+    from src.config import load_config
+    from src.skills_loader import skill_index
+    settings = load_config()
+    settings.external_skills_enabled = bool(enabled)
+    settings.save()
+    skill_index.reload()
+    return f"External skills {'enabled' if enabled else 'disabled'}."
+
+async def add_favorite(skill_name: str) -> str:
+    """Add the tag to an external skill in json."""
+    import json
+    from src.skills_loader import CATALOG_PATH, skill_index
+
+    skill = skill_index.get(skill_name)
+    if not skill or not skill.path:
+        return f"Error: '{skill_name}' is not an external skill."
+    catalog = {}
+    if CATALOG_PATH.exists():
+        try:
+            catalog = json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    entry = catalog.setdefault(skill_name, {"path": skill.path, "description": skill.description, "tags": []})
+    tags = entry.setdefault("tags", [])
+    if "favorite" in tags:
+        return f"'{skill_name}' is already a favorite."
+    tags.append("favorite")
+    CATALOG_PATH.write_text(json.dumps(catalog, indent=2))
+    if "favorite" not in skill.tags:
+        skill.tags.append("favorite")
+    return f"'{skill_name}' pinned as favorite."
 
 
 # ─── MEMORY ──────────────────────────────────────────────────────────────────
 
 async def add_memory(content: str, category: str = "general", tier: str = "now") -> str:
     from src.core.memory import memory_core
-    return memory_core.add_memory(content, category, tier)
+    return await memory_core.add_memory(content, category, tier)
 
 
 async def promote_memory(memory_id: str, new_tier: str = "recent") -> str:
@@ -727,7 +772,7 @@ async def add_mcp_server(name: str, command: str, args: str = "[]", env: str = "
         if match and name not in match.group(2):
             text = text[:match.end(2)] + "\n" + new_entry + text[match.start(3):]
             cfg_path.write_text(text, encoding="utf-8")
-            return f"MCP server '{name}' added to config.json AND hardcoded into src/config.py."  
+            return f"MCP server '{name}' added to config.json AND hardcoded into src/config.py."
     return f"MCP server '{name}' added to config.json."
 
 
@@ -805,20 +850,18 @@ def _generate_registry():
     return registry
 
 
-def get_tools_schema(tools: dict = None) -> str:
+def get_tools_schema(tools: dict = None, compact: bool = False) -> str:
     source = tools if tools is not None else TOOL_REGISTRY
     schema = []
     for name, func in source.items():
         try:
-            sig = inspect.signature(func)
-            params = str(sig).replace(" -> str", "").replace("**kwargs", "")
+            params = str(inspect.signature(func)).replace(" -> str", "").replace("**kwargs", "")
         except (ValueError, TypeError):
             params = "(...)"
-        try:
-            doc = inspect.getdoc(func) or "Tool."
-        except Exception:
-            doc = "Tool."
-        schema.append(f"- {name}{params}: {doc}")
+        doc = inspect.getdoc(func) or ""
+        if compact:
+            doc = " ".join(doc.split())[:180]
+        schema.append(f"- {name}{params}" + (f": {doc}" if doc else ""))
     return "\n".join(schema)
 
 

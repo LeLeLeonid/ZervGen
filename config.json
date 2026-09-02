@@ -6,6 +6,7 @@
     "provider_timeout": 120,
     "debug_mode": true,
     "mcp_enabled": true,
+    "mcp_expose_direct_tools": false,
     "mcp_servers": {
         "filesystem": {
             "command": "npx",
@@ -115,6 +116,44 @@
     "min_session_grade": 3.0,
     "max_refine_rounds": 3,
     "checkpoints_enabled": false,
+    "resume_enabled": true,
     "checkpoint_max_snapshots": 30,
-    "trace_enabled": true
+    "trace_enabled": true,
+    "external_skills_enabled": false,
+    "external_skill_roots": [
+        "tmp"
+    ],
+    "prompt_show_internal_skills": false,
+    "prompt_show_external_skills": false,
+    "prompt_auto_trigger_skills": false,
+    "prompt_auto_trigger_external_skills": false,
+    "prompt_show_mcp_tools": false,
+    "prompt_max_chars": 14000,
+    "prompt_memory_limit": 4,
+    "prompt_peer_card_limit": 3,
+    "prompt_project_rules_chars": 1800,
+    "json_tool_fallback": true,
+    "ptc_strict": true,
+    "ptc_auto_detect": false,
+    "legacy_shell_blocks_enabled": false,
+    "max_tool_calls": 200,
+    "max_file_writes": 20,
+    "max_token_budget": 100000,
+    "max_cost_usd": 0.0,
+    "max_delegations": 12,
+    "max_parallel_agents": 4,
+    "max_retries": 3,
+    "run_timeout": 1800,
+    "tripwire_error_repeats": 3,
+    "trace_capture_chars": 2000,
+    "verification_commands": [],
+    "heartbeat_enabled": false,
+    "heartbeat_interval": 300,
+    "peer_cards": {},
+    "active_model_tier": "COOL",
+    "model_tiers": {
+        "LOW": {},
+        "COOL": {},
+        "APEX": {}
+    }
 }

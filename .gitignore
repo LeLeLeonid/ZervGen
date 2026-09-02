@@ -11,4 +11,4 @@ env/
 .kilo/
 tmp/
 *.json
-!config.json
+config.json
