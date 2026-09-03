@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 import time
 import uuid
 
+
 class RunStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
@@ -13,6 +14,7 @@ class RunStatus(str, Enum):
     FAILED = "failed"
     STOPPED = "stopped"
 
+
 class TaskStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
@@ -20,6 +22,7 @@ class TaskStatus(str, Enum):
     DONE = "done"
     FAILED = "failed"
     BLOCKED = "blocked"
+
 
 @dataclass
 class Task:
@@ -29,24 +32,69 @@ class Task:
     depends_on: List[str] = field(default_factory=list)
     status: TaskStatus = TaskStatus.PENDING
     result: Any = None
+    artifacts: List["Artifact"] = field(default_factory=list)
+
 
 @dataclass
 class Plan:
     tasks: Dict[str, Task] = field(default_factory=dict)
 
     def add(self, task: Task) -> None:
-        if task.id in self.tasks:
-            raise ValueError(f"Duplicate task id: {task.id}")
+        if not task.id or task.id in self.tasks:
+            raise ValueError(f"Duplicate or empty task id: {task.id!r}")
         self.tasks[task.id] = task
 
+    def validate(self) -> None:
+        for task in self.tasks.values():
+            missing = [dep for dep in task.depends_on if dep not in self.tasks]
+            if missing:
+                raise ValueError(f"Task '{task.id}' depends on missing task(s): {', '.join(missing)}")
+            if task.id in task.depends_on:
+                raise ValueError(f"Task '{task.id}' cannot depend on itself")
+
+        visiting = set()
+        visited = set()
+
+        def visit(task_id: str) -> None:
+            if task_id in visiting:
+                raise ValueError(f"Cyclic task dependency involving '{task_id}'")
+            if task_id in visited:
+                return
+            visiting.add(task_id)
+            for dep in self.tasks[task_id].depends_on:
+                visit(dep)
+            visiting.remove(task_id)
+            visited.add(task_id)
+
+        for task_id in self.tasks:
+            visit(task_id)
+
     def ready(self) -> List[Task]:
-        return [
-            task for task in self.tasks.values()
-            if task.status == TaskStatus.PENDING and all(self.tasks.get(dep) and self.tasks[dep].status == TaskStatus.DONE for dep in task.depends_on)
-        ]
+        ready = []
+        for task in self.tasks.values():
+            if task.status != TaskStatus.PENDING:
+                continue
+            dependencies = [self.tasks[dep] for dep in task.depends_on if dep in self.tasks]
+            if all(dep.status == TaskStatus.DONE for dep in dependencies) and len(dependencies) == len(task.depends_on):
+                ready.append(task)
+        return ready
+
+    def next_ready(self) -> Optional[Task]:
+        ready = self.ready()
+        return ready[0] if ready else None
 
     def blocked(self) -> List[Task]:
-        return [task for task in self.tasks.values() if task.status == TaskStatus.BLOCKED]
+        blocked = []
+        for task in self.tasks.values():
+            if task.status != TaskStatus.PENDING:
+                if task.status == TaskStatus.BLOCKED:
+                    blocked.append(task)
+                continue
+            if any(self.tasks.get(dep) and self.tasks[dep].status in {TaskStatus.FAILED, TaskStatus.BLOCKED} for dep in task.depends_on):
+                task.status = TaskStatus.BLOCKED
+                blocked.append(task)
+        return blocked
+
 
 @dataclass
 class ToolCall:
@@ -55,6 +103,7 @@ class ToolCall:
     arguments: Dict[str, Any]
     agent: str
     started_at: float = field(default_factory=time.time)
+
 
 @dataclass
 class ToolResult:
@@ -65,17 +114,20 @@ class ToolResult:
     ended_at: float = field(default_factory=time.time)
     duration: float = 0.0
 
+
 @dataclass
 class Artifact:
     path: str
     kind: str = "file"
     content_hash: Optional[str] = None
 
+
 @dataclass
 class CheckpointRef:
     id: str
     revision: Optional[str] = None
     state_path: Optional[str] = None
+
 
 @dataclass
 class ModelProfile:
@@ -87,6 +139,7 @@ class ModelProfile:
     reasoning: bool = False
     vision: bool = False
     programmatic_tools: bool = True
+
 
 @dataclass
 class Budget:
@@ -110,6 +163,7 @@ class Budget:
         self.delegations += 1
         return self.delegations <= self.max_delegations
 
+
 @dataclass
 class TraceEvent:
     run_id: str
@@ -123,6 +177,22 @@ class TraceEvent:
     output: Any = None
     duration: Optional[float] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "type": self.type,
+            "actor": self.actor,
+            "timestamp": self.timestamp,
+            "parent_id": self.parent_id,
+            "name": self.name,
+            "status": self.status,
+            "input": self.input,
+            "output": self.output,
+            "duration": self.duration,
+            "metadata": self.metadata,
+        }
+
 
 @dataclass
 class Run:
@@ -145,9 +215,26 @@ class Run:
 
     @classmethod
     def create(cls, goal: str, agent: str, max_steps: int = 50, parent_run_id: Optional[str] = None) -> "Run":
-        return cls(id=uuid.uuid4().hex[:12], goal=goal, agent=agent, parent_run_id=parent_run_id, budget=Budget(max_steps=max_steps))
+        return cls(
+            id=uuid.uuid4().hex[:12],
+            goal=goal,
+            agent=agent,
+            parent_run_id=parent_run_id,
+            budget=Budget(max_steps=max_steps),
+        )
 
-    def emit(self, event_type: str, actor: str, name: Optional[str] = None, status: Optional[str] = None, input: Any = None, output: Any = None, duration: Optional[float] = None, parent_id: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> TraceEvent:
+    def emit(
+        self,
+        event_type: str,
+        actor: str,
+        name: Optional[str] = None,
+        status: Optional[str] = None,
+        input: Any = None,
+        output: Any = None,
+        duration: Optional[float] = None,
+        parent_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> TraceEvent:
         event = TraceEvent(
             run_id=self.id,
             type=event_type,
@@ -178,6 +265,7 @@ class Run:
                         "depends_on": task.depends_on,
                         "status": task.status.value,
                         "result": task.result,
+                        "artifacts": [artifact.__dict__ for artifact in task.artifacts],
                     }
                     for key, task in self.plan.tasks.items()
                 }
@@ -186,6 +274,7 @@ class Run:
             "tool_calls": [call.__dict__ for call in self.tool_calls[-50:]],
             "tool_results": [result.__dict__ for result in self.tool_results[-50:]],
             "artifacts": [artifact.__dict__ for artifact in self.artifacts[-50:]],
+            "events": [event.as_dict() for event in self.events[-200:]],
             "checkpoint": self.checkpoint.__dict__ if self.checkpoint else None,
             "parent_run_id": self.parent_run_id,
             "created_at": self.created_at,
