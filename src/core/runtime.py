@@ -51,7 +51,6 @@ class Plan:
                 raise ValueError(f"Task '{task.id}' depends on missing task(s): {', '.join(missing)}")
             if task.id in task.depends_on:
                 raise ValueError(f"Task '{task.id}' cannot depend on itself")
-
         visiting = set()
         visited = set()
 
@@ -75,20 +74,20 @@ class Plan:
             if task.status != TaskStatus.PENDING:
                 continue
             dependencies = [self.tasks[dep] for dep in task.depends_on if dep in self.tasks]
-            if all(dep.status == TaskStatus.DONE for dep in dependencies) and len(dependencies) == len(task.depends_on):
+            if len(dependencies) == len(task.depends_on) and all(dep.status == TaskStatus.DONE for dep in dependencies):
                 ready.append(task)
         return ready
 
     def next_ready(self) -> Optional[Task]:
-        ready = self.ready()
-        return ready[0] if ready else None
+        return self.ready()[0] if self.ready() else None
 
     def blocked(self) -> List[Task]:
         blocked = []
         for task in self.tasks.values():
+            if task.status == TaskStatus.BLOCKED:
+                blocked.append(task)
+                continue
             if task.status != TaskStatus.PENDING:
-                if task.status == TaskStatus.BLOCKED:
-                    blocked.append(task)
                 continue
             if any(self.tasks.get(dep) and self.tasks[dep].status in {TaskStatus.FAILED, TaskStatus.BLOCKED} for dep in task.depends_on):
                 task.status = TaskStatus.BLOCKED
@@ -152,16 +151,22 @@ class Budget:
     delegations: int = 0
 
     def step(self) -> bool:
+        if self.steps >= self.max_steps:
+            return False
         self.steps += 1
-        return self.steps <= self.max_steps
+        return True
 
     def tool(self) -> bool:
+        if self.tool_calls >= self.max_tool_calls:
+            return False
         self.tool_calls += 1
-        return self.tool_calls <= self.max_tool_calls
+        return True
 
     def delegation(self) -> bool:
+        if self.delegations >= self.max_delegations:
+            return False
         self.delegations += 1
-        return self.delegations <= self.max_delegations
+        return True
 
 
 @dataclass
