@@ -102,6 +102,7 @@ class StemAgent:
         self._run: Optional[Run] = None
         self._trace_parent_id = ""
         self._tripwire_errors: Dict[str, int] = {}
+        self._background_tasks: set[asyncio.Task] = set()
         self._load_tools()
         self.tools["set_mode"] = self._tool_set_mode
 
@@ -118,16 +119,13 @@ class StemAgent:
                     return f"[JSON Object Keys: {list(data.keys())}] (Truncated. Use specific extraction if needed)."
             except json.JSONDecodeError:
                 pass
-
         if "<html" in result.lower()[:500] or "<!doctype" in result.lower()[:500] or "<div" in result.lower()[:500]:
             text = re.sub(r'<[^>]+>', ' ', result)
             text = re.sub(r'\s+', ' ', text).strip()
             return f"[HTML Extracted Text]: {text[:1500]}"
-
         TRUNC_LIMIT = getattr(self.settings, 'tool_output_limit', 8000)
         if len(result) > TRUNC_LIMIT:
             return result[:TRUNC_LIMIT] + f"\n... [TRUNCATED {len(result) - TRUNC_LIMIT} CHARS — use read with offset to get the rest]"
-
         return result
 
     async def _tool_set_mode(self, mode: str) -> str:
@@ -170,12 +168,6 @@ class StemAgent:
                 connect_task = asyncio.create_task(self._mcp.connect_all())
                 try:
                     await asyncio.wait_for(connect_task, timeout=120.0)
-                except asyncio.TimeoutError:
-                    connect_task.cancel()
-                    try:
-                        await connect_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
                 except Exception:
                     connect_task.cancel()
                     try:
@@ -205,6 +197,12 @@ class StemAgent:
         return _mcp_call
 
     async def cleanup(self) -> None:
+        if self._background_tasks:
+            tasks = tuple(self._background_tasks)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._background_tasks.clear()
         if self._mcp and self._mcp_initialized:
             try:
                 await self._mcp.cleanup()
@@ -217,6 +215,9 @@ class StemAgent:
 
     def request_interrupt(self) -> None:
         self.interrupt_event.set()
+
+    async def request_permission(self, question: str, details: str = "", default: bool = False) -> bool:
+        return True
 
     def invalidate_cache(self):
         self._cached_system_prompt = None
@@ -313,11 +314,7 @@ class StemAgent:
             return ""
         try:
             limit = max(1, int(getattr(self.settings, "prompt_memory_limit", 4)))
-            value = self.memory.inject_context(
-                user_input,
-                limit=limit,
-                trusted_sources={"user", "tool_result", "delegation"}
-            )
+            value = self.memory.inject_context(user_input, limit=limit, trusted_sources={"user", "tool_result", "delegation"})
             return f"--- MEMORY ---\n{value}" if value else ""
         except Exception as e:
             logger.debug("Prompt memory failed: %s", e)
@@ -448,10 +445,7 @@ class StemAgent:
     async def _execute_tool(self, tool_name: str, args: Dict[str, Any]) -> str:
         if tool_name not in self.tools:
             return f"Error: Tool '{tool_name}' not found"
-        if self.mode != "BUILD" and (
-            tool_name in ("write_file", "append_file", "edit_file", "shell")
-            or tool_name.startswith("mcp_")
-        ):
+        if self.mode != "BUILD" and (tool_name in ("write_file", "append_file", "edit_file", "shell") or tool_name.startswith("mcp_")):
             return f"Error: Tool '{tool_name}' requires BUILD mode (current: {self.mode})"
         if self._run and not self._run.budget.tool():
             return "Error: Tool-call budget exhausted"
@@ -465,10 +459,7 @@ class StemAgent:
         started = time.monotonic()
         try:
             tool_timeout = getattr(self.settings, 'tool_timeout', 60)
-            result = await asyncio.wait_for(
-                func(**args) if inspect.iscoroutinefunction(func) else asyncio.to_thread(func, **args),
-                timeout=tool_timeout
-            )
+            result = await asyncio.wait_for(func(**args) if inspect.iscoroutinefunction(func) else asyncio.to_thread(func, **args), timeout=tool_timeout)
             result_str = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
             duration = time.monotonic() - started
             if self._run:
@@ -548,8 +539,7 @@ class StemAgent:
         class _AA(ast.NodeTransformer):
             def visit_Call(self, node):
                 self.generic_visit(node)
-                if (id(node) not in excluded and id(node) not in awaited
-                        and isinstance(node.func, ast.Name) and node.func.id in names):
+                if (id(node) not in excluded and id(node) not in awaited and isinstance(node.func, ast.Name) and node.func.id in names):
                     return ast.copy_location(ast.Await(value=node), node)
                 return node
         tree = _AA().visit(tree)
@@ -799,10 +789,7 @@ class StemAgent:
         full_prompt = f"{system_prompt}\n\n{delim}\nFOCUS: {mode_def['prompt']}\n{delim}"
         provider_timeout = getattr(self.settings, 'provider_timeout', 120)
         valid_roles = {"system", "user", "assistant"}
-        safe_history = [
-            {"role": m["role"] if m["role"] in valid_roles else "assistant", "content": m["content"]}
-            for m in self.history
-        ]
+        safe_history = [{"role": m["role"] if m["role"] in valid_roles else "assistant", "content": m["content"]} for m in self.history]
         use_streaming = not self._silent and not self.settings.debug_mode
         self._last_streamed = use_streaming
         if self.settings.debug_mode and not self._silent:
@@ -812,20 +799,15 @@ class StemAgent:
         try:
             if use_streaming:
                 self._set_status(False)
-                response = await asyncio.wait_for(
-                    self.provider.generate_text(safe_history, full_prompt, on_token=_StreamFilter(thought_cb=self._live_thought)), timeout=provider_timeout)
+                response = await asyncio.wait_for(self.provider.generate_text(safe_history, full_prompt, on_token=_StreamFilter(thought_cb=self._live_thought)), timeout=provider_timeout)
                 self._set_status(True)
             else:
                 response = await asyncio.wait_for(self.provider.generate_text(safe_history, full_prompt), timeout=provider_timeout)
             from src.core.provider import _record_success
-            _record_success(self.provider.name if hasattr(self.provider, 'name') else (
-                self.provider.META.name if hasattr(self.provider, 'META') else self.settings.provider
-            ))
+            _record_success(self.provider.name if hasattr(self.provider, 'name') else (self.provider.META.name if hasattr(self.provider, 'META') else self.settings.provider))
         except Exception as e:
             from src.core.provider import _record_failure
-            p_name = self.provider.name if hasattr(self.provider, 'name') else (
-                self.provider.META.name if hasattr(self.provider, 'META') else self.settings.provider
-            )
+            p_name = self.provider.name if hasattr(self.provider, 'name') else (self.provider.META.name if hasattr(self.provider, 'META') else self.settings.provider)
             _record_failure(p_name)
             raise
         response = response.strip()
@@ -835,9 +817,7 @@ class StemAgent:
         in_tok, out_tok = count_tokens(self.history, response)
         add_global_tokens(in_tok + out_tok)
         if self.provider:
-            p_name = self.provider.name if hasattr(self.provider, 'name') else (
-                self.provider.META.name if hasattr(self.provider, 'META') else self.settings.provider
-            )
+            p_name = self.provider.name if hasattr(self.provider, 'name') else (self.provider.META.name if hasattr(self.provider, 'META') else self.settings.provider)
             add_provider_tokens(p_name, in_tok, out_tok)
         if self._run:
             provider_cost = float(getattr(self.provider, "_last_cost", 0.0) or 0.0)
@@ -860,6 +840,7 @@ class StemAgent:
         return "\n".join(failures)
 
     async def run(self, task: str) -> str:
+        self._tripwire_errors = {}
         if not task or not isinstance(task, str):
             return "Error: Invalid task"
         task = task.strip()
@@ -974,7 +955,6 @@ class StemAgent:
                 if self.settings.debug_mode and not self._silent:
                     self._set_status(False)
                     console.print(Panel(Text(response), title="[green]OUTPUT[/green]"))
-                #TODO Make IF codes then combined_code -> execute AND raw_text in response or print AND loop goes further
                 if codes:
                     prose = response.split("```", 1)[0].strip()
                     if prose and not self._silent and not self.settings.debug_mode and not getattr(self, "_last_streamed", False):
@@ -991,7 +971,6 @@ class StemAgent:
                         return raw_output
                     if raw_output and (not self.history or self.history[-1].get("content") != raw_output):
                         self.history.append({"role": "assistant", "content": raw_output})
-
                     if self._response_called:
                         self._response_called = False
                         self._repeat_count = 0
@@ -999,7 +978,6 @@ class StemAgent:
                         self._log(self.name, self._response_value or "(empty)", "response", self.mode)
                         self._set_status(False)
                         return self._response_value
-
                     stable = str(raw_output)
                     if "Error" in stable or "Timeout" in stable:
                         stable = re.sub(r'\d{2}:\d{2}:\d{2}|[0-9a-f]{8}-[0-9a-f-]{8,}', '', stable)
@@ -1016,7 +994,6 @@ class StemAgent:
                     else:
                         self._repeat_count = 0
                         self._last_stable_result = stable
-
                     self._set_status(False)
                     continue
                 else:
@@ -1055,7 +1032,9 @@ class StemAgent:
                         continue
                     self._log(self.name, clean_response, "response", self.mode)
                     if not self._is_delegated and self.memory and len(clean_response) > 20:
-                        asyncio.create_task(self.memory.add_memory(f"TASK: {task[:250]} => OUTCOME: {clean_response[:250]}", category="lesson", tier="recent", source="auto"))
+                        task = asyncio.create_task(self.memory.add_memory(f"TASK: {task[:250]} => OUTCOME: {clean_response[:250]}", category="lesson", tier="recent", source="auto"))
+                        self._background_tasks.add(task)
+                        task.add_done_callback(self._background_tasks.discard)
                     return clean_response
             self._run.status = RunStatus.FAILED
             return "Max steps reached."
