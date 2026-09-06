@@ -85,13 +85,22 @@ def _atomic_write(path: Path, content: str) -> None:
 async def delegate_to(agent_name: str = "", agent_id: str = "", task: str = "", context: str = "", mode: str = "ASK", memory: bool = True, agents: str = "") -> str:
     import inspect
     from src.skills_loader import role_exists
-
     frame = inspect.currentframe().f_back
     orchestrator = None
     while frame:
-        orchestrator = frame.f_globals.get("_orchestrator")
-        if hasattr(orchestrator, '_handle_delegation'):
-            break
+        cand = frame.f_globals.get("_orchestrator")
+        if cand:
+            if hasattr(cand, '_handle_delegation'):
+                orchestrator = cand
+                break
+            root = getattr(cand, 'root', None)
+            if root and hasattr(root, '_handle_delegation'):
+                orchestrator = root
+                break
+            owner = getattr(cand, 'owner', None)
+            if owner and hasattr(owner, '_handle_delegation'):
+                orchestrator = owner
+                break
         frame = frame.f_back
 
     if orchestrator and hasattr(orchestrator, '_handle_delegation'):
@@ -100,7 +109,7 @@ async def delegate_to(agent_name: str = "", agent_id: str = "", task: str = "", 
             "mode": mode, "memory": memory, "agents": agents
         })
 
-    return "Error: delegation requires an orchestrator. Run via CLI, not standalone."
+    return "Error: delegation requires an active orchestrator with _handle_delegation."
 
 # ─── WEB ─────────────────────────────────────────────────────────────────────
 
@@ -788,23 +797,35 @@ async def add_mcp_server(name: str, command: str, args: str = "[]", env: str = "
 
 
 async def list_mcp_servers() -> dict:
-    """Returns {server_name: {status, installed, cmd}}. Iterate = names."""
+    """Returns {server_name: {enabled, connected, installed, tools, error, cmd}}."""
     import shutil
-    config = load_config()
+    from src.core.mcp_manager import MCPManager
+    mgr = MCPManager()
     out = {}
-    for name, cfg in config.mcp_servers.items():
-        status = "ON" if cfg.enabled else "OFF"
+    for name, cfg in mgr.settings.mcp_servers.items():
+        srv = mgr.servers.get(name)
         if cfg.command == "internal":
-            installed = "yes"
+            installed = True
         elif cfg.args and cfg.args[0] == "-m" and len(cfg.args) > 1:
             try:
                 __import__(cfg.args[1])
-                installed = "yes"
+                installed = True
             except ImportError:
-                installed = "NO"
+                installed = False
         else:
-            installed = "yes" if (shutil.which(cfg.command) or shutil.which(f"{cfg.command}.exe")) else "NO"
-        out[name] = {"status": status, "installed": installed, "cmd": cfg.command}
+            installed = bool(
+                shutil.which(cfg.command)
+                or shutil.which(f"{cfg.command}.exe")
+                or shutil.which(f"{cfg.command}.cmd")
+            )
+        out[name] = {
+            "enabled": bool(cfg.enabled),
+            "connected": bool(srv and srv.connected),
+            "installed": installed,
+            "tools": len(srv.tools) if srv else 0,
+            "error": srv._last_error if srv and srv._last_error else None,
+            "cmd": cfg.command,
+        }
     return out or {"error": "No MCP servers configured."}
 
 
@@ -832,6 +853,16 @@ async def mcp_execute(server: str, tool: str = "", arguments: str = "{}", args: 
             return "Error: arguments must be a JSON object."
     except json.JSONDecodeError as e:
         return f"Error: invalid JSON arguments: {e}"
+    if not await mgr.ensure_server(server):
+        if await mgr.restart_server(server):
+            return await mgr.execute_tool(tool_name=tool, arguments=args_dict, server=server)
+        srv = mgr.servers.get(server)
+        err = srv._last_error if srv else "not configured"
+        return f"Error: server '{server}' unavailable: {err}"
+    srv = mgr.servers.get(server)
+    if srv and not srv.connected and srv._bg_task and srv._bg_task.done():
+        if await mgr.restart_server(server):
+            return await mgr.execute_tool(tool_name=tool, arguments=args_dict, server=server)
     return await mgr.execute_tool(tool_name=tool, arguments=args_dict, server=server)
 
 

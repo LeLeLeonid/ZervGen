@@ -70,6 +70,7 @@ class StemAgent:
         memory: Any = None,
         initial_history: Optional[List[Dict]] = None,
         silent: bool = False,
+        orchestrator: Optional[Any] = None,
     ):
         self.name = name
         self.provider = provider
@@ -80,6 +81,7 @@ class StemAgent:
         self.history: List[Dict[str, str]] = list(initial_history) if initial_history else []
         self.tools: Dict[str, Any] = {}
         self.interrupt_event = asyncio.Event()
+        self.orchestrator = orchestrator
         self._mcp = None
         self._mcp_initialized = False
         self._max_steps_override: Optional[int] = None
@@ -151,9 +153,33 @@ class StemAgent:
 
     def _active_tools(self) -> dict:
         write_set = {"write_file", "append_file", "edit_file", "shell"}
-        if self.mode == "BUILD":
-            return dict(self.tools)
-        return {k: v for k, v in self.tools.items() if k not in write_set and not k.startswith("mcp_")}
+        raw_tools = dict(self.tools) if self.mode == "BUILD" else {k: v for k, v in self.tools.items() if k not in write_set}
+        gated_tools = {}
+        for name, func in raw_tools.items():
+            gated_tools[name] = self._bind_permission_gate(name, func)
+        return gated_tools
+
+    def _bind_permission_gate(self, tool_name: str, func: Any):
+        import functools
+        @functools.wraps(func)
+        async def _gated_wrapper(*args, **kwargs):
+            call_args = dict(kwargs)
+            if args:
+                try:
+                    sig = inspect.signature(func)
+                    bound = sig.bind_partial(*args, **kwargs)
+                    call_args = bound.arguments
+                except Exception:
+                    call_args["_args"] = list(args)
+            gate_err = await self._permission_check(tool_name, call_args)
+            if gate_err:
+                raise PermissionError(gate_err)
+            if self._run and not self._run.budget.tool():
+                raise RuntimeError("Error: Tool-call budget exhausted")
+            if inspect.iscoroutinefunction(func):
+                return await func(*args, **kwargs)
+            return await asyncio.to_thread(func, *args, **kwargs)
+        return _gated_wrapper
 
     async def _init_mcp(self) -> None:
         if self._mcp_initialized or not getattr(self.settings, 'mcp_enabled', True):
@@ -161,26 +187,6 @@ class StemAgent:
         try:
             from src.core.mcp_manager import MCPManager
             self._mcp = MCPManager(self.settings)
-            if not self._mcp.tools_map and not getattr(self._mcp, "_connect_attempted", False):
-                self._mcp._connect_attempted = True
-                connect_task = asyncio.create_task(self._mcp.connect_all())
-                try:
-                    await asyncio.wait_for(connect_task, timeout=120.0)
-                except Exception:
-                    connect_task.cancel()
-                    try:
-                        await connect_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                for name, server in self._mcp.servers.items():
-                    if not server._connected:
-                        logger.warning(f"MCP server '{name}' failed to connect")
-            if getattr(self.settings, "mcp_expose_direct_tools", False):
-                for tool_name in self._mcp.tools_map:
-                    mcp_name = f"mcp_{tool_name}"
-                    self.tools[mcp_name] = self._make_mcp_wrapper(tool_name)
-            if self._mcp.tools_map:
-                logger.info(f"MCP ready: {len(self._mcp.tools_map)} tools from {len(self._mcp.servers)} servers")
             self._mcp_initialized = True
         except Exception as e:
             logger.warning(f"MCP init failed (will retry): {e}")
@@ -339,7 +345,7 @@ class StemAgent:
             return ""
         try:
             limit = max(1, int(getattr(self.settings, "prompt_memory_limit", 4)))
-            value = self.memory.inject_context(user_input, limit=limit, trusted_sources={"user", "tool_result", "delegation"})[:10]
+            value = self.memory.inject_context(user_input, limit=limit, trusted_sources={"user", "tool_result", "delegation"})
             return f"--- MEMORY ---\n{value}" if value else ""
         except Exception as e:
             logger.debug("Prompt memory failed: %s", e)
@@ -425,30 +431,44 @@ class StemAgent:
             return ""
 
     def _build_system_prompt(self, role_cfg, include_roles: bool = False, user_input: str = "") -> str:
+        header = self._prompt_header(role_cfg)
+        run_info = self._prompt_run()
+        ctx = f"--- CONTEXT ---\n{get_system_context()}"
+        tools_schema = self._prompt_tools()
+        protocol = f"--- EXECUTION PROTOCOL ---\n{ZG_PROTOCOL.strip()}"
+        mcp_tools = self._prompt_mcp()
+        mem_text = self._prompt_memory(user_input)
+        if len(mem_text) > 500:
+            mem_text = mem_text[:500] + "\n[Memory truncated]"
+        peer_text = self._prompt_peer_cards(user_input)
+        if len(peer_text) > 1200:
+            peer_text = peer_text[:1200] + "\n[Peer cards truncated]"
+        skills_text = self._prompt_skills(user_input)
+        if len(skills_text) > 2000:
+            skills_text = skills_text[:2000] + "\n[Skill catalog truncated]"
+        rules_text = self._prompt_project_rules()
+        if len(rules_text) > 3000:
+            rules_text = rules_text[:3000] + "\n[Project rules truncated]"
         sections = [
-            self._prompt_header(role_cfg),
-            self._prompt_run(),
-            f"--- CONTEXT ---\n{get_system_context()}",
-            self._prompt_memory(user_input),
-            self._prompt_peer_cards(user_input),
-            self._prompt_mcp(),
-            self._prompt_skills(user_input),
-            self._prompt_tools(),
-            f"--- EXECUTION PROTOCOL ---\n{ZG_PROTOCOL.strip()}",
-            self._prompt_project_rules(),
+            header,
+            run_info,
+            ctx,
+            mem_text,
+            peer_text,
+            mcp_tools,
+            skills_text,
+            tools_schema,
+            rules_text,
+            protocol,
         ]
-        prompt = "\n\n".join(section for section in sections if section)
-        limit = max(4000, int(getattr(self.settings, "prompt_max_chars", 14000)))
-        if len(prompt) > limit:
-            prompt = prompt[:limit]
-        if prompt == self._prompt_obj_ref:
-            return self._prompt_obj_ref
+        prompt = "\n\n".join(s for s in sections if s)
         self._prompt_obj_ref = prompt
         return prompt
 
     def _log(self, role: str, content: str, event_type: str = "message", mode: str = "") -> None:
         from src.utils import redact_fast, trace_line
         safe_content = redact_fast(content)
+        trace_line(role, event_type, safe_content)
         logger.info(f"[{event_type.upper()}] {role}: {safe_content}")
         if self._run:
             self._run.emit(event_type, role, input=safe_content)
@@ -507,7 +527,7 @@ class StemAgent:
                         p.write_text(blob, encoding="utf-8", errors="replace")
                         line += f" [copy: {p}]"
                 logger.info(f"[TOOL_RESULT] {self.name}: {line}")
-            return result_str
+            return self._format_tool_output(tool_name, result_str)
         except asyncio.TimeoutError:
             error_msg = f"Error: Tool '{tool_name}' timed out"
         except TypeError as e:
@@ -609,18 +629,18 @@ class StemAgent:
             tree = ast.parse(code)
         except SyntaxError as e:
             return f"Syntax Error: {e}"
-        blocked_names = {"open", "eval", "exec", "compile", "__import__", "globals", "locals", "vars", "dir", "getattr", "setattr", "delattr", "breakpoint", "input", "help", "object"}
-        blocked_attrs = {"__class__", "__dict__", "__globals__", "__code__", "__closure__", "__subclasses__", "__mro__", "mro", "__getattribute__", "__getattr__", "_agent", "_run", "_mcp", "provider", "settings", "memory", "tools"}
+        blocked_names = {"eval", "exec", "compile", "__import__", "globals", "locals", "vars", "breakpoint", "input"}
+        blocked_attrs = {"__class__", "__dict__", "__globals__", "__code__", "__closure__", "__subclasses__", "__mro__", "mro", "__getattribute__", "__getattr__", "provider", "settings", "memory", "tools", "history", "headers"}
         for node in ast.walk(tree):
-            if isinstance(node, (ast.Import, ast.ImportFrom, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.Yield, ast.YieldFrom, ast.With, ast.AsyncWith, ast.Global, ast.Nonlocal)):
-                return "PTC blocked: unsupported syntax"
+            if isinstance(node, (ast.Import, ast.ImportFrom, ast.Global, ast.Nonlocal)):
+                return "PTC blocked: imports and global/nonlocal mutations not permitted in scripts. Use provided tools."
             if isinstance(node, ast.Name) and node.id in blocked_names:
                 return f"PTC blocked: {node.id}"
             if isinstance(node, ast.Attribute):
-                if node.attr in blocked_attrs or node.attr.startswith("_"):
-                    return f"PTC blocked: {node.attr}"
-                if isinstance(node.value, ast.Name) and node.value.id in {"os", "sys", "subprocess", "socket", "pathlib", "shutil", "ctypes", "builtins", "importlib"}:
-                    return f"PTC blocked: {node.value.id}"
+                if node.attr in blocked_attrs or (node.attr.startswith("_") and not node.attr.startswith("__")):
+                    return f"PTC blocked: private attribute access '{node.attr}'"
+                if isinstance(node.value, ast.Name) and node.value.id in {"os", "sys", "subprocess", "socket", "ctypes", "builtins", "importlib"}:
+                    return f"PTC blocked: direct access to '{node.value.id}' module"
         return None
 
     def _extract_json_tool_calls(self, text: str) -> List[Dict[str, Any]]:
@@ -669,7 +689,7 @@ class StemAgent:
     async def _run_code(self, code: str, full_response: str = "") -> str:
         if not code:
             return "Error: Empty code"
-        validation_error = self._validate_ptc(code) if getattr(self.settings, "ptc_strict", True) else No
+        validation_error = self._validate_ptc(code) if getattr(self.settings, "ptc_strict", True) else None
         if validation_error:
             self._log_ptc_error(validation_error, full_response)
             return validation_error
@@ -717,15 +737,6 @@ class StemAgent:
             "ValueError": ValueError, "NotImplementedError": NotImplementedError, "RuntimeError": RuntimeError, 
             "format": format, "repr": repr, "reversed": reversed,
         }
-        class _ToolRuntimeView:
-            def __init__(self, owner):
-                object.__setattr__(self, "owner", owner)
-            def __getattr__(self, k):
-                return getattr(self.owner, k)
-            def __setattr__(self, k, v):
-                setattr(self.owner, k, v)
-            async def request_permission(self, question, details="", default=False):
-                return await self.owner.request_permission(question, details, default)
         safe_asyncio = SimpleNamespace(
             gather=asyncio.gather,
             wait_for=asyncio.wait_for,
@@ -734,7 +745,24 @@ class StemAgent:
             shield=asyncio.shield,
             as_completed=asyncio.as_completed,
         )
-        g = {**self._active_tools(), "json": json, "asyncio": safe_asyncio, "print": _captured_print, "_orchestrator": _ToolRuntimeView(self), "__builtins__": safe_builtins}
+        root_coordinator = getattr(self, "_orchestrator", None) or getattr(self, "orchestrator", None) or self
+        class _ToolRuntimeView:
+            def __init__(self, owner, root):
+                object.__setattr__(self, "owner", owner)
+                object.__setattr__(self, "root", root)
+            def __getattr__(self, k):
+                if hasattr(self.root, k):
+                    return getattr(self.root, k)
+                return getattr(self.owner, k)
+            def __setattr__(self, k, v):
+                setattr(self.owner, k, v)
+            async def request_permission(self, question, details="", default=False):
+                return await self.owner.request_permission(question, details, default)
+            async def _handle_delegation(self, args):
+                if hasattr(self.root, "_handle_delegation"):
+                    return await self.root._handle_delegation(args)
+                raise RuntimeError("No active Orchestrator found to handle delegation.")
+        g = {**self._active_tools(), "json": json, "asyncio": safe_asyncio, "print": _captured_print, "_orchestrator": _ToolRuntimeView(self, root_coordinator), "__builtins__": safe_builtins}
         lines = fixed_code.split("\n")
         indented = "\n".join(f"    {l}" for l in lines)
         wrapped = f"async def __execute():\n{indented}"
@@ -762,6 +790,10 @@ class StemAgent:
             if result and not is_delegate:
                 self._log(self.name, str(result), "ptc_result", self.mode)
             return str(result) if result else ""
+        except PermissionError as e:
+            err = f"PERMISSION DENIED: {e}"
+            self._log_ptc_error(err, full_response)
+            return err  
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError:
@@ -826,6 +858,8 @@ class StemAgent:
         self._injected.append({"role": "user", "content": text})
 
     async def _handle_llm_turn(self, system_prompt: str) -> str:
+        if self.interrupt_event.is_set():
+            raise asyncio.CancelledError("Run aborted by user.")
         mode_def = MODES.get(self.mode, MODES["BUILD"])
         delim = generate_random_delimiter(16)
         full_prompt = f"{system_prompt}\n\n{delim}\nFOCUS: {mode_def['prompt']}\n{delim}"
@@ -956,6 +990,8 @@ class StemAgent:
                         self._log(self.name, f"Timeout, retry {attempt}/{max_retries}", "ptc_error", self.mode)
                         await asyncio.sleep(2 * attempt)
                     except Exception as e:
+                        if self.interrupt_event.is_set():
+                            return "Stopped by user."
                         err = str(e).lower()
                         if "context" in err and "length" in err:
                             self._log(self.name, "Context overflow, compressing", "ptc_error", self.mode)

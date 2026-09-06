@@ -258,6 +258,41 @@ class MCPManager:
             for name, server in self.servers.items()
         }
 
+    async def ensure_server(self, name: str) -> bool:
+        cfg = self.settings.mcp_servers.get(name)
+        if cfg is None or not cfg.enabled:
+            return False
+
+        server = self.servers.get(name)
+        if server and server.connected:
+            return True
+
+        if server and server._bg_task and not server._bg_task.done():
+            try:
+                await asyncio.wait_for(server._ready.wait(), timeout=15.0)
+            except asyncio.TimeoutError:
+                return False
+            return server.connected
+
+        server = MCPServer(name, cfg)
+        self.servers[name] = server
+        try:
+            ok = await server.start()
+        except Exception as e:
+            server._last_error = str(_unwrap(e))
+            ok = False
+        if not ok:
+            return False
+
+        for tool_name in server.tools:
+            owner = self.tools_map.get(tool_name)
+            if owner is not None and owner != name:
+                server._last_error = f"tool name collision: {tool_name}"
+                await server.stop(timeout=5.0)
+                return False
+            self.tools_map[tool_name] = name
+        return True
+
     async def connect_all(self) -> Dict[str, bool]:
         if self._connect_attempted:
             return {name: server.connected for name, server in self.servers.items()}
@@ -300,15 +335,20 @@ class MCPManager:
         return results
 
     async def execute_tool(self, tool_name: str, arguments: Dict[str, Any], server: Optional[str] = None) -> str:
-        if not self._connect_attempted:
-            await self.connect_all()
         if server:
-            srv = self.servers.get(server)
+            target = server
         else:
-            srv_name = self.tools_map.get(tool_name)
-            srv = self.servers.get(srv_name) if srv_name else None
-        if not srv:
-            return f"Error: server not found for tool '{tool_name}'."
+            target = self.tools_map.get(tool_name)
+            if target is None:
+                await self.connect_all()
+                target = self.tools_map.get(tool_name)
+            if target is None:
+                return f"Error: no MCP server provides tool '{tool_name}'."
+        if not await self.ensure_server(target):
+            srv = self.servers.get(target)
+            err = srv._last_error if srv else "not configured"
+            return f"Error: server '{target}' unavailable: {err}"
+        srv = self.servers[target]
         if not srv.connected:
             return f"Error: server '{srv.name}' not connected: {srv._last_error or 'unknown error'}"
         if tool_name not in srv.tools:
@@ -319,6 +359,16 @@ class MCPManager:
             return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
         except Exception as e:
             return f"Error executing tool '{tool_name}': {e}"
+
+    async def restart_server(self, name: str) -> bool:
+        old = self.servers.get(name)
+        if old:
+            await old.stop(timeout=5.0)
+        self.servers.pop(name, None)
+        for tool_name, owner in list(self.tools_map.items()):
+            if owner == name:
+                self.tools_map.pop(tool_name, None)
+        return await self.ensure_server(name)
 
     async def start_server(self, name: str) -> bool:
         if name not in self.settings.mcp_servers:
