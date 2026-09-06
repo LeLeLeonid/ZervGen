@@ -102,21 +102,27 @@ class SessionDB:
 
     def _retry(self, func, *args, **kwargs):
         for attempt in range(self.MAX_RETRIES):
+            acquired = False
             try:
-                with self._lock:
-                    conn = sqlite3.connect(str(self._db_path))
-                    conn.execute("PRAGMA journal_mode=WAL")
-                    conn.execute("PRAGMA synchronous=NORMAL")
-                    result = func(conn, *args, **kwargs)
-                    conn.commit()
-                    conn.close()
-                    return result
+                self._lock.acquire()
+                acquired = True
+                conn = sqlite3.connect(str(self._db_path), timeout=10.0)
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                result = func(conn, *args, **kwargs)
+                conn.commit()
+                conn.close()
+                return result
             except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
                 if attempt >= self.MAX_RETRIES - 1 or "lock" not in str(e).lower():
                     raise
-                delay = random.uniform(0.01, 0.05) * (2 ** attempt)
-                time.sleep(delay)
-        raise RuntimeError(f"Failed after {self.MAX_RETRIES} retries")
+                delay = random.uniform(0.02, 0.08) * (2 ** attempt)
+            finally:
+                if acquired:
+                    self._lock.release()
+                    acquired = False
+            time.sleep(delay)
+        raise RuntimeError(f"SessionDB: Failed after {self.MAX_RETRIES} retries")
 
     def create_session(self, provider: str = "", model: str = "") -> str:
         session_id = str(uuid.uuid4())
@@ -637,18 +643,38 @@ class MemoryCore:
 
     def log_event_sync(self, role: str, content: str, event_type: str = "message", mode: str = ""):
         from src.utils import redact_fast
-        entry = {"id": str(uuid.uuid4())[:8], "timestamp": datetime.now().isoformat(), "role": "user" if event_type in ("task", "input") else role, "content": redact_fast(content), "type": event_type, "mode": mode}
+        entry = {
+            "id": str(uuid.uuid4())[:8],
+            "timestamp": datetime.now().isoformat(),
+            "role": "user" if event_type in ("task", "input") else role,
+            "content": redact_fast(content),
+            "type": event_type,
+            "mode": mode
+        }
         self._short_term.append(entry)
         if self._active_session_id:
+            session_id = self._active_session_id
+            tool_name = event_type if event_type in ("tool_call", "tool_result", "ptc_call", "ptc_result") else ""
             try:
-                self._session_db.save_message(
-                    session_id=self._active_session_id,
-                    role=entry["role"],
-                    content=entry["content"],
-                    tool_name=event_type if event_type in ("tool_call", "tool_result", "ptc_call", "ptc_result") else ""
+                loop = asyncio.get_running_loop()
+                loop.run_in_executor(
+                    self._session_db._executor,
+                    self._session_db.save_message,
+                    session_id,
+                    entry["role"],
+                    entry["content"],
+                    tool_name
                 )
-            except Exception:
-                pass
+            except RuntimeError:
+                try:
+                    self._session_db.save_message(
+                        session_id=session_id,
+                        role=entry["role"],
+                        content=entry["content"],
+                        tool_name=tool_name
+                    )
+                except Exception:
+                    pass
 
     def clear_short_term(self): self._short_term.clear()
     def clear_triggered_skills(self): self._triggered_this_session.clear()
@@ -884,6 +910,14 @@ class Dreamer:
     async def _cycle(self):
         if self.orchestrator and getattr(self.orchestrator, '_user_active', False):
             return
+        if self.memory and self.memory._short_term:
+            last_entry = self.memory._short_term[-1]
+            try:
+                ts = datetime.fromisoformat(last_entry.get("timestamp", "")).timestamp()
+                if time.time() - ts < 45.0:
+                    return
+            except Exception:
+                pass
         await self._check_errors()
         await self._check_task_state()
         removed = self.memory.prune_toxic(threshold_hits=5, success_rate=0.5)

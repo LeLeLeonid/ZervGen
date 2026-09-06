@@ -136,7 +136,12 @@ class Orchestrator(StemAgent):
             return f"Restored checkpoint {state.get('id', '-')}; no resumable goal found."
         self.mode = str(payload.get("mode") or self.mode).upper()
         return await self.run_task(goal, self.mode)
-
+    
+    def request_interrupt(self) -> None:
+        for agent in self.agents.values():
+            agent.request_interrupt()
+        super().request_interrupt()
+    
     async def _verify_artifacts(self) -> List[str]:
         failures = []
         for artifact in (self._run.artifacts if self._run else []):
@@ -407,7 +412,9 @@ End with exactly one line: GRADE: [1-5]"""
             memory=self.memory,
             initial_history=initial_history,
             silent=True,
+            orchestrator=self,
         )
+        agent._ask_user = self._ask_user
         agent.status_cb = self.status_cb
         agent._max_steps_override = max_steps or self._get_max_steps()
         agent._is_delegated = True

@@ -62,7 +62,6 @@ class ZervGenCLI:
         self._user_active: bool = False
         self._active_lock = asyncio.Lock()
         self._show_usage: bool = True
-        self._pt_session = PromptSession(history=FileHistory("tmp/.zervgen_history"))
         self._app: Optional[Application] = None
         self._agent_running = False
         self._should_exit = False
@@ -1204,10 +1203,12 @@ class ZervGenCLI:
                 lsrv = live.servers.get(name) if live else None
                 if lsrv and lsrv.connected:
                     runtime = "[green]LIVE[/green]"
-                elif lsrv:
-                    runtime = "[red]DEAD[/red]"
+                elif lsrv and lsrv._bg_task and not lsrv._bg_task.done():
+                    runtime = "[yellow]STARTING[/yellow]"
+                elif cfg.enabled and installed:
+                    runtime = "[dim]IDLE[/dim]"
                 else:
-                    runtime = "[dim]-[/dim]"
+                    runtime = "[red]DEAD[/red]"
                 
                 if not cfg.enabled:
                     display_name = f"[dim]{name}[/dim]"

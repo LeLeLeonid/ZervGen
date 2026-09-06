@@ -21,6 +21,9 @@ class OpenAIProvider:
     def _is_reasoning_model(self) -> bool:
         return any(k in self.model.lower() for k in ["o1", "o3", "r1", "reasoning", "deepseek-r", "deepseek-reasoner"])
 
+    def _estimate_cost(self, input_tokens: int, output_tokens: int) -> float:
+        return (input_tokens * 3 + output_tokens * 15) / 1_000_000
+
     async def _non_stream(self, payload: dict, timeout=None) -> str:
         client = get_http_client()
         kwargs = {"headers": self.headers, "json": payload}
@@ -50,9 +53,6 @@ class OpenAIProvider:
             input_tokens = usage.get("prompt_tokens", 0)
             output_tokens = usage.get("completion_tokens", 0)
             self._last_cost = self._estimate_cost(input_tokens, output_tokens)
-        def _estimate_cost(self, input_tokens: int, output_tokens: int) -> float:
-            """Rough cost estimate. Override per-provider for accuracy."""
-            return (input_tokens * 3 + output_tokens * 15) / 1_000_000
         return content
 
     async def _stream(self, payload: dict, on_token: Callable, timeout=None) -> str:
