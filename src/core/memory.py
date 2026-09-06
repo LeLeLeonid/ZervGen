@@ -530,22 +530,22 @@ class MemoryCore:
         return {"id": str(uuid.uuid4())[:8], "timestamp": time.time(), "content": str(content), "category": str(category), "tier": tier}
 
     async def add_memory(self, content: str, category: str = "general", tier: str = "now", critic_score: float = 0.0, source: str = "user") -> str:
-        GRADED_AND_FAILED = 0 < critic_score < 4.0
-        if GRADED_AND_FAILED:
-            return "Memory rejected: graded below threshold"
+        if critic_score > 0 and critic_score < getattr(self, '_min_grade', 4.0):
+            return f"Memory rejected: graded {critic_score}/5 (threshold: 4.0)"
         if len(content) < 10 or len(content) > 2000:
             return "Memory rejected: invalid length"
-        if any(kw in content.lower() for kw in ("error:", "traceback", "syntaxerror", "nameerror", "ptc result:", "occurred:")):
-            return "Memory rejected: probable error dump"
-
+        error_markers = ("error:", "traceback", "syntaxerror", "nameerror")
+        if any(kw in content.lower() for kw in error_markers) and category != "error_pattern":
+            return "Memory rejected: raw error dump (use category='error_pattern')"
         fact = self._create_fact(content, category, tier)
         fact["source"] = source
+        fact["critic_score"] = critic_score
         self._kg.add_fact(fact)
         self._vector.add([content], [fact], [fact["id"]])
         self._bm25.add(fact["id"], content)
         self._short_term.append(fact)
         self._kg.save()
-        return f"Stored blueprint (grade:{critic_score})"
+        return f"Stored ({category}, grade:{critic_score or 'n/a'})"
 
     def prune_toxic(self, threshold_hits: int = 5, success_rate: float = 0.5) -> int:
         # Auto-drop blueprints recalled often but failing
@@ -988,22 +988,26 @@ Be specific. The "detect" field must be a literal substring that appears in the 
 
     async def _write_lessons(self):
         lessons = []
-        if lessons:
-            self._cards.upsert(PeerCard(
-                agent_id="system", domain="runtime",
-                anti_patterns=[l["detect"] for l in lessons if l.get("detect")][:8],
-                strategies=[l["fix"] for l in lessons if l.get("fix")][:8],
-            ))
         for key, data in self._error_patterns.items():
             if data.get("count", 0) >= 2 and data.get("fix"):
-                lessons.append({"error": key, "count": data["count"], "reason": data.get("reason", ""), "fix": data.get("fix", ""), "detect": data.get("detect", "")})
+                lessons.append({
+                    "error": key,
+                    "count": data["count"],
+                    "reason": data.get("reason", ""),
+                    "fix": data.get("fix", ""),
+                    "detect": data.get("detect", ""),
+                })
         if not lessons:
             return
         self._cards.upsert(PeerCard(
-            agent_id="system", domain="runtime",
+            agent_id="system",
+            domain="runtime",
             anti_patterns=[l["detect"] for l in lessons if l.get("detect")][:8],
             strategies=[l["fix"] for l in lessons if l.get("fix")][:8],
         ))
         EVOLUTION_DIR.mkdir(parents=True, exist_ok=True)
         path = EVOLUTION_DIR / f"lessons_{int(time.time())}.json"
-        path.write_text(json.dumps(lessons, indent=2, ensure_ascii=False), encoding="utf-8")
+        path.write_text(
+            json.dumps(lessons, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )

@@ -86,13 +86,12 @@ async def delegate_to(agent_name: str = "", agent_id: str = "", task: str = "", 
     import inspect
     from src.skills_loader import role_exists
 
-    frame = inspect.currentframe()
+    frame = inspect.currentframe().f_back
     orchestrator = None
     while frame:
         orchestrator = frame.f_globals.get("_orchestrator")
         if hasattr(orchestrator, '_handle_delegation'):
             break
-        orchestrator = None
         frame = frame.f_back
 
     if orchestrator and hasattr(orchestrator, '_handle_delegation'):
@@ -254,8 +253,19 @@ async def shell(command: str, timeout: int = 60) -> str:
             return f"Exit code: {process.returncode}\nSTDOUT: {out}\nSTDERR: {err}"
         return out or "(no output)"
     except asyncio.TimeoutError:
+        if process:
+            process.kill()
+            await process.wait()
         return f"Timeout after {timeout}s"
+    except asyncio.CancelledError:
+        if process:
+            process.kill()
+            await process.wait()
+        raise
     except Exception as e:
+        if process:
+            process.kill()
+            await process.wait()
         return f"Error: {e}"
 
 
@@ -685,8 +695,9 @@ async def manage_todo(action: str, task: str = "", todo_id: str = "") -> str:
 
 async def response(text: str = None) -> str:
     import inspect
+    if text is not None and not isinstance(text, str):
+        text = json.dumps(text, ensure_ascii=False, indent=2)
     frame = inspect.currentframe()
-    agent = None
     while frame:
         agent = frame.f_globals.get("_orchestrator")
         if hasattr(agent, '_response_called'):
@@ -776,10 +787,11 @@ async def add_mcp_server(name: str, command: str, args: str = "[]", env: str = "
     return f"MCP server '{name}' added to config.json."
 
 
-async def list_mcp_servers() -> str:
+async def list_mcp_servers() -> dict:
+    """Returns {server_name: {status, installed, cmd}}. Iterate = names."""
     import shutil
     config = load_config()
-    lines = []
+    out = {}
     for name, cfg in config.mcp_servers.items():
         status = "ON" if cfg.enabled else "OFF"
         if cfg.command == "internal":
@@ -792,8 +804,8 @@ async def list_mcp_servers() -> str:
                 installed = "NO"
         else:
             installed = "yes" if (shutil.which(cfg.command) or shutil.which(f"{cfg.command}.exe")) else "NO"
-        lines.append(f"- {name}: {status}, installed={installed}, cmd={cfg.command}")
-    return "\n".join(lines) if lines else "No MCP servers configured."
+        out[name] = {"status": status, "installed": installed, "cmd": cfg.command}
+    return out or {"error": "No MCP servers configured."}
 
 
 async def mcp_execute(server: str, tool: str = "", arguments: str = "{}", args: str = None) -> str:

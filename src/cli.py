@@ -1,9 +1,7 @@
 import asyncio
 import json
 import os
-import signal
 import sys
-import threading
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -28,10 +26,7 @@ from prompt_toolkit.widgets import TextArea
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style as PTStyle
 from prompt_toolkit.completion import WordCompleter
-from prompt_toolkit.formatted_text import HTML
-from prompt_toolkit.output import create_output
 from prompt_toolkit.patch_stdout import patch_stdout
-
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=ResourceWarning)
@@ -44,7 +39,6 @@ from src.skills_loader import get_all_roles
 from src.utils import get_global_tokens, reset_global_tokens, count_tokens, add_global_tokens, ModelCatalog
 
 console = Console()
-_interrupt_event = threading.Event()
 C = "purple"
 
 
@@ -65,7 +59,6 @@ class ZervGenCLI:
         self.config = config or load_config()
         C = self.config.accent_color
         self.orchestrator: Optional[Orchestrator] = None
-        self._current_task: Optional[asyncio.Task] = None
         self._user_active: bool = False
         self._active_lock = asyncio.Lock()
         self._show_usage: bool = True
@@ -74,8 +67,8 @@ class ZervGenCLI:
         self._agent_running = False
         self._should_exit = False
         self._pending_input: asyncio.Queue = None
-        self._output_lines: List[str] = []
         self._agent_task: Optional[asyncio.Task] = None
+        self._perm_future: Optional[asyncio.Future] = None
         self._modal_cmd: Optional[str] = None
         self._status_text = ""
         self._cmd_table: Dict[str, Any] = {
@@ -106,6 +99,27 @@ class ZervGenCLI:
             "trace": lambda a: self._cmd_trace(a),
         }
 
+    async def _setup_permission_handler(self):
+        if not self.orchestrator:
+            return
+        cli = self
+        async def _tui_ask(question: str, details: str = "", default: bool = False) -> bool:
+            loop = asyncio.get_running_loop()
+            cli._perm_future = loop.create_future()
+            cli._status_text = f"⚠ {question} — type y/n"
+            if cli._app:
+                cli._app.invalidate()
+            try:
+                return await asyncio.wait_for(cli._perm_future, timeout=120)
+            except asyncio.TimeoutError:
+                return default
+            finally:
+                cli._perm_future = None
+                cli._status_text = ""
+                if cli._app:
+                    cli._app.invalidate()
+        self.orchestrator._ask_user = _tui_ask
+
     async def _init_system(self) -> None:
         chosen = self.config.provider
         chain = [chosen] + [p for p in ("openrouter", "groq", "ollama", "lmstudio", "pollinations") if p != chosen]
@@ -130,6 +144,7 @@ class ZervGenCLI:
                 from src.core.memory import Dreamer
                 self._dreamer = Dreamer(self.orchestrator.provider, memory_core, self.config.dream_interval, orchestrator=self.orchestrator)
                 await self._dreamer.start()
+        await self._setup_permission_handler()
     
     def _on_status(self, text: str) -> None:
         self._status_text = text or ""
@@ -353,6 +368,8 @@ class ZervGenCLI:
         enable = args.lower() in ("on", "enable", "true", "1")
         setattr(self.config, attr, enable)
         self.config.save()
+        if self.orchestrator:
+            self.orchestrator.invalidate_cache()
         CC.print(f"[bold {'green' if enable else 'yellow'}]{label} {'ENABLED' if enable else 'DISABLED'}[/bold {'green' if enable else 'yellow'}]")
 
     async def _toggle_dream(self) -> bool:
@@ -749,6 +766,7 @@ class ZervGenCLI:
             table.add_row("9", "MCP Servers", "Manage...")
             table.add_row("10", "Path Whitelist", "Manage...")
             table.add_row("11", "Accent Color", C)
+            table.add_row("12", "Permission Mode", self.config.permission_mode)
 
             CC.print(table)
             CC.print("\n[dim]ID to edit, 'b' to return[/dim]")
@@ -770,6 +788,7 @@ class ZervGenCLI:
                     '9': self._mcp_menu,
                     '10': self._whitelist_menu,
                     '11': self._select_accent_color,
+                    '12': self._permission_menu,
                 }
 
                 if choice in handlers:
@@ -785,6 +804,8 @@ class ZervGenCLI:
         current = getattr(self.config, attr, False)
         setattr(self.config, attr, not current)
         self.config.save()
+        if self.orchestrator:
+            self.orchestrator.invalidate_cache()
 
     def _select_accent_color(self) -> None:
         global C
@@ -805,6 +826,21 @@ class ZervGenCLI:
                 CC.print(f"[{colors[idx]}]✓ Accent: {colors[idx]}[/{colors[idx]}]")
                 if self._app:
                     self._app = self._build_tui()
+        except (ValueError, IndexError):
+            pass
+
+    def _permission_menu(self) -> None:
+        modes = ["ASK", "AUTO", "DENY"]
+        CC.print("\n[bold]PERMISSION MODE[/bold]")
+        for i, m in enumerate(modes, 1):
+            marker = " ← current" if m == self.config.permission_mode else ""
+            CC.print(f"  [{i}] {m}{marker}")
+        try:
+            choice = IntPrompt.ask("Mode", default=1)
+            if 1 <= choice <= 3:
+                self.config.permission_mode = modes[choice - 1]
+                self.config.save()
+                CC.print(f"[green]Permission mode: {modes[choice - 1]}[/green]")
         except (ValueError, IndexError):
             pass
 
@@ -996,7 +1032,6 @@ class ZervGenCLI:
             if not self._has_api_key():
                 CC.print(f"[yellow]{selected.name} requires an API key.[/yellow]")
                 self._input_api_key()
-        self.config.provider = selected.name
         if self.orchestrator:
             if self.orchestrator.switch_provider(selected.name):
                 self.config.save()
@@ -1259,8 +1294,6 @@ class ZervGenCLI:
     async def _process_task(self, user_input: str) -> None:
         if not self.orchestrator:
             return
-        else:
-            self.orchestrator.status_cb = self._on_status
         if not self.orchestrator._active_session_id:
             self.orchestrator.new_session(title=user_input[:80])
         self._agent_task = asyncio.create_task(self._do_run(user_input))
@@ -1274,6 +1307,9 @@ class ZervGenCLI:
                         msg = self._pending_input.get_nowait()
                     except asyncio.QueueEmpty:
                         break
+                    if self._perm_future and not self._perm_future.done() and msg.strip().lower() in ("y", "n", "yes", "no"):
+                        self._perm_future.set_result(msg.strip().lower() in ("y", "yes"))
+                        continue
                     if msg.strip().lower() in ("/stop", "stop"):
                         if self._agent_task and not self._agent_task.done():
                             self.orchestrator.request_interrupt()
@@ -1291,12 +1327,10 @@ class ZervGenCLI:
                 self.orchestrator._user_active = False
             if self._app:
                 self._app.invalidate()
-
         try:
             await self._agent_task
         except (asyncio.CancelledError, Exception):
             pass
-
         for m in list(self.orchestrator._injected):
             self.orchestrator._injected.remove(m)
             self._pending_input.put_nowait(m["content"])

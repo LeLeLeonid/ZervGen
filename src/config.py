@@ -108,6 +108,7 @@ ZG_PROTOCOL = """
 EVOLUTION_DIR = Path("tmp/evolution")
 MAX_SHORT_TERM = 100
 TEMP_DIR = Path("tmp")
+RISK_ASK_TOOLS = {"shell", "write_file", "append_file", "edit_file", "delegate_to", "add_mcp_server", "mouse_click", "type_text"}
 WMO_CODES = {
     0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
     45: "Fog", 48: "Depositing rime fog",
@@ -217,7 +218,7 @@ class GlobalSettings(BaseModel):
     provider_timeout: int = 120
     debug_mode: bool = False
     mcp_enabled: bool = True
-    mcp_expose_direct_tools: bool = False
+    mcp_expose_direct_tools: bool = True
     mcp_servers: Dict[str, MCPServerConfig] = Field(default_factory=lambda: {k: MCPServerConfig(**v.model_dump()) for k, v in DEFAULT_MCP_SERVERS.items()})
     allowed_directories: List[str] = Field(default_factory=lambda: ["./tmp", "C:/Users/Public"])
     pollinations: PollinationsSettings = Field(default_factory=PollinationsSettings)
@@ -227,6 +228,7 @@ class GlobalSettings(BaseModel):
     anthropic: AnthropicSettings = Field(default_factory=AnthropicSettings)
     compatible_presets: Dict[str, Dict[str, str]] = Field(default_factory=dict)
     mode: str = "BUILD"
+    permission_mode: str = "ASK"
     memory_enabled: bool = True
     dream_enabled: bool = False
     dream_interval: int = 300
@@ -241,21 +243,20 @@ class GlobalSettings(BaseModel):
     resume_enabled: bool = True
     checkpoint_max_snapshots: int = 30
     trace_enabled: bool = True
-    external_skills_enabled: bool = False
+    external_skills_enabled: bool = True
     external_skill_roots: List[str] = Field(default_factory=lambda: ["tmp"])
-    prompt_show_internal_skills: bool = False
+    prompt_show_internal_skills: bool = True
     prompt_show_external_skills: bool = False
-    prompt_auto_trigger_skills: bool = False
-    prompt_auto_trigger_external_skills: bool = False
-    prompt_show_mcp_tools: bool = False
+    prompt_auto_trigger_skills: bool = True
+    prompt_auto_trigger_external_skills: bool = True
+    prompt_show_mcp_tools: bool = True
     prompt_max_chars: int = 14000
     prompt_memory_limit: int = 4
     prompt_peer_card_limit: int = 3
-    prompt_project_rules_chars: int = 1800
     json_tool_fallback: bool = True
     ptc_strict: bool = True
-    ptc_auto_detect: bool = False
-    legacy_shell_blocks_enabled: bool = False
+    ptc_auto_detect: bool = True
+    legacy_shell_blocks_enabled: bool = True
     max_tool_calls: int = 200
     max_file_writes: int = 20
     max_token_budget: int = 100000
@@ -267,10 +268,8 @@ class GlobalSettings(BaseModel):
     tripwire_error_repeats: int = 3
     trace_capture_chars: int = 2000
     verification_commands: List[str] = Field(default_factory=list)
-    heartbeat_enabled: bool = False
-    heartbeat_interval: int = 300
     peer_cards: Dict[str, Any] = Field(default_factory=dict)
-    active_model_tier: str = None
+    active_model_tier: str = "None"
     model_tiers: Dict[str, Dict[str, str]] = Field(default_factory=lambda: {"NOOB": {}, "COOL": {}, "APEX": {}})
 
     @field_validator("provider")
@@ -390,7 +389,8 @@ def _load_config_impl() -> GlobalSettings:
             data["mcp_servers"] = merged_servers
 
         return GlobalSettings.model_validate(data)
-    except Exception:
+    except Exception as e:
+        print(f"\n[bold red]CONFIG VALIDATION FAILED:[/bold red]\n{e}\n")
         if CONFIG_PATH.exists():
             shutil.copy(CONFIG_PATH, CONFIG_PATH.with_suffix(".bak"))
         defaults = GlobalSettings()

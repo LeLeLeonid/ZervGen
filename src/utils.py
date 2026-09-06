@@ -1,5 +1,4 @@
 import asyncio
-import functools
 import hashlib
 import os
 import platform
@@ -10,9 +9,10 @@ import subprocess as _subprocess
 import sys
 import threading
 import time
+from functools import wraps
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional, List, Any
+from typing import Dict, Optional, List, Any, Callable, TypeVar
 from rich.console import Console
 import httpx
 import json
@@ -101,25 +101,52 @@ def count_tokens(text_or_history, response: str = "") -> tuple:
     output_tokens = count_tokens_tiktoken(response) if response else 0
     return input_tokens, output_tokens
 
+T = TypeVar("T")
+logger = logging.getLogger(__name__)
 
-def async_retry(retries=5, delays=(2, 5, 10, 25, 60, 120)):
-    def decorator(func):
-        @functools.wraps(func)
-        async def wrapper(*args, **kwargs):
-            for i in range(retries + 1):
+_HTTP_NEVER_RETRY = {400, 401, 403, 404, 422}
+_HTTP_ALWAYS_RETRY = {408, 429, 500, 502, 503, 504}
+_TEXT_ALWAYS_RETRY = {"timeout", "timed out", "overloaded", "rate limit", "connection refused", "connection reset"}
+_TEXT_NEVER_RETRY = {"unauthorized", "forbidden", "not found", "invalid api key", "circuit open"}
+
+def _classify_error(err: Exception) -> str:
+    msg = str(err).lower()
+    err_type = type(err).__name__.lower()
+    if "circuitbreaker" in err_type or "circuit open" in msg:
+        return "never"
+    status_code = getattr(err, "status_code", None) or getattr(err, "response_status", None)
+    if isinstance(status_code, int):
+        if status_code in _HTTP_NEVER_RETRY:
+            return "never"
+        if status_code in _HTTP_ALWAYS_RETRY:
+            return "always"
+    if any(t in msg for t in _TEXT_NEVER_RETRY):
+        return "never"
+    if any(t in msg for t in _TEXT_ALWAYS_RETRY):
+        return "always"
+    return "once"
+
+def async_retry(retries: int = 3, delays=2.0, max_delays: float = 30.0):
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @wraps(func)
+        async def wrapper(*args, **kwargs) -> T:
+            for attempt in range(retries + 1):
                 try:
                     return await func(*args, **kwargs)
                 except Exception as e:
-                    err_str = str(e)
-                    if "429" in err_str or "rate limit" in err_str.lower() or "CircuitBreaker" in type(e).__name__:
-                        raise e
-                    if i == retries:
-                        msg = err_str or f"{type(e).__name__} (no message)"
-                        raise Exception(f"Failed after {retries+1} attempts: {msg}") from e
-                    wait_time = delays[i] if i < len(delays) else delays[-1]
-                    console.print(f"[yellow]Retry {i+1}/{retries} in {wait_time}s...[/yellow]")
-                    logging.getLogger(__name__).warning(f"RETRY {i+1}/{retries} {func.__name__} in {wait_time}s: {err_str[:150]}")
+                    kind = _classify_error(e)
+                    if kind == "never" or (kind == "once" and attempt >= 1) or attempt >= retries:
+                        raise
+                    if isinstance(delays, (list, tuple)):
+                        base = float(delays[min(attempt, len(delays) - 1)])
+                    else:
+                        base = min(float(delays) * (2 ** attempt), max_delays)
+                    wait_time = base * (0.5 + secrets.randbelow(1000) / 1000.0)
+                    logging.getLogger(__name__).warning(
+                        "RETRY %d/%d %s in %.1fs [%s]: %s",
+                        attempt + 1, retries, func.__name__, wait_time, kind, str(e)[:120])
                     await asyncio.sleep(wait_time)
+            raise RuntimeError(f"async_retry exhausted for {func.__name__}")
         return wrapper
     return decorator
 
