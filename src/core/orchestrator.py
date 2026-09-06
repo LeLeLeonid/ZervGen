@@ -211,32 +211,32 @@ End with exactly one line: GRADE: [1-5]"""
                 match = re.search(r"GRADE:\s*([1-5])", grade_resp)
                 grade = float(match.group(1)) if match else 1.0
 
-            post_err = SkillEngine.validate_post(skill_contract, result) if skill_contract else None
-            if post_err:
-                grade = min(grade, float(self.settings.critic_gate_threshold) - 0.01)
-                self._log(self.name, f"POST-VALIDATION FAILED: {post_err}", "state", self.mode)
+                post_err = SkillEngine.validate_post(skill_contract, result) if skill_contract else None
+                if post_err:
+                    grade = min(grade, float(self.settings.critic_gate_threshold) - 0.01)
+                    self._log(self.name, f"POST-VALIDATION FAILED: {post_err}", "state", self.mode)
 
-            if self._run:
-                self._run.metadata["last_grade"] = grade
-                self._run.metadata["verification_failures"] = verify_failures
-                self._run.status = self._run.status.DONE if grade >= self.settings.critic_gate_threshold else self._run.status.VERIFYING
-
-            await memory_core.add_memory(str(result), category="blueprint", critic_score=grade)
-
-            if grade >= self.settings.critic_gate_threshold and not verify_failures:
-                return result
-            if round_no == max_rounds:
-                if self._git_mgr:
-                    try:
-                        self._git_mgr.rollback(1)
-                        self._log(self.name, f"Auto-rollback: grade {grade}", "state", self.mode)
-                    except Exception as e:
-                        self._log(self.name, f"Rollback failed: {e}", "state", self.mode)
                 if self._run:
-                    self._run.status = self._run.status.FAILED
-                return f"[ROLLBACK] Grade {grade} — reverted 1 step. Escalate."
+                    self._run.metadata["last_grade"] = grade
+                    self._run.metadata["verification_failures"] = verify_failures
+                    self._run.status = self._run.status.DONE if grade >= self.settings.critic_gate_threshold else self._run.status.VERIFYING
 
-            task = f"Original task: {original_task}\n\nPrevious attempt scored {grade}/5. Fix the missing/broken parts. Focus ONLY on gaps."
+                await memory_core.add_memory(str(result), category="blueprint", critic_score=grade)
+
+                if grade >= self.settings.critic_gate_threshold and not verify_failures:
+                    return result
+                if round_no == max_rounds:
+                    if self._git_mgr:
+                        try:
+                            self._git_mgr.rollback(1)
+                            self._log(self.name, f"Auto-rollback: grade {grade}", "state", self.mode)
+                        except Exception as e:
+                            self._log(self.name, f"Rollback failed: {e}", "state", self.mode)
+                    if self._run:
+                        self._run.status = self._run.status.FAILED
+                    return f"[ROLLBACK] Grade {grade} — reverted 1 step. Escalate."
+
+                task = f"Original task: {original_task}\n\nPrevious attempt scored {grade}/5. Fix the missing/broken parts. Focus ONLY on gaps."
 
         return "Degeneration guard triggered. Halted."
 
@@ -349,3 +349,71 @@ End with exactly one line: GRADE: [1-5]"""
         result = await agent.run(full_task)
         self._last_agent_id = agent_id
         return str(result)
+
+    def _compute_waves(self, agents_spec: List[Dict]) -> List[List[Dict]]:
+        by_name = {spec["agent_name"]: spec for spec in agents_spec}
+        in_degree = {spec["agent_name"]: 0 for spec in agents_spec}
+        graph = {spec["agent_name"]: set() for spec in agents_spec}
+        for spec in agents_spec:
+            deps = spec.get("depends_on", [])
+            for dep in deps:
+                if dep in graph:
+                    graph[dep].add(spec["agent_name"])
+                    in_degree[spec["agent_name"]] = in_degree.get(spec["agent_name"], 0) + 1
+                else:
+                    logger.warning(
+                        f"Agent '{spec['agent_name']}' depends on unknown "
+                        f"agent '{dep}' — dependency ignored")
+        waves = []
+        remaining = [s for s in agents_spec if in_degree.get(s["agent_name"], 0) == 0]
+        while remaining:
+            current_wave = remaining[:]
+            waves.append(current_wave)
+            next_remaining = []
+            for spec in current_wave:
+                name = spec["agent_name"]
+                for succ in graph.get(name, set()):
+                    in_degree[succ] = in_degree.get(succ, 0) - 1
+                    if in_degree[succ] == 0:
+                        next_remaining.append(by_name[succ])
+            remaining = next_remaining
+        all_names = {s["agent_name"] for s in agents_spec}
+        placed = {s["agent_name"] for w in waves for s in w}
+        if all_names != placed:
+            msg = f"Circular dependency detected among: {all_names - placed}"
+            logger.error(msg)
+            raise ValueError(msg)
+        return waves
+
+    def _spawn_agent(self, role_name: str, context: str, max_steps: int = None) -> tuple:
+        if not role_exists(role_name):
+            raise ValueError(f"Role '{role_name}' does not exist")
+        agent_id = f"{role_name}_{uuid.uuid4().hex[:8]}"
+        role_cfg = load_role(role_name) or load_role("system")
+        prompt = role_cfg.prompt if role_cfg else f"You are {role_name}."
+        initial_history = [{"role": "system", "content": prompt}]
+        non_system = [
+            m for m in self.history
+            if m.get("role") in ("user", "assistant")
+        ]
+        for msg in non_system[-6:]:
+            initial_history.append({"role": msg["role"], "content": msg["content"]})
+        agent = StemAgent(
+            name=role_name,
+            provider=self.provider,
+            skill_name=role_name,
+            settings=self.settings,
+            mode=self.mode,
+            memory=self.memory,
+            initial_history=initial_history,
+            silent=True,
+        )
+        agent.status_cb = self.status_cb
+        agent._max_steps_override = max_steps or self._get_max_steps()
+        agent._is_delegated = True
+        agent._mcp = self._mcp
+        agent._mcp_initialized = True
+        agent.tools = {k: v for k, v in self.tools.items() if k != "delegate_to"}
+        self.agents[agent_id] = agent
+        self._log(self.name, f"SPAWN: {role_name} ({agent_id})", "agent_spawn", self.mode)
+        return agent_id, agent

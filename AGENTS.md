@@ -14,10 +14,11 @@ ZervGen/
 │   ├── utils.py           # Token counting, context discovery,compression
 │   ├── core/
 │   │   ├── base_agent.py      # StemAgent execution engine
+│   │   ├── mcp_manager.py     # Model Context Protocol client
 │   │   ├── memory.py          # Three-tier memory (KG, ChromaDB, SessionDB)
 │   │   ├── orchestrator.py    # Metacognitive supervisor, multi-wave delegation
 │   │   ├── provider.py        # LLM provider wrappers base
-│   │   └── mcp_manager.py     # Model Context Protocol client
+│   │   └── runtime.py         # The Harness Core
 │   ├── providers/
 │   │   ├── anthropic.py       # Anthropic Claude provider
 │   │   ├── base.py            # Abstract provider interface
