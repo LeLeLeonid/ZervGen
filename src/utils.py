@@ -265,10 +265,13 @@ class ContextCompressor:
         try:
             r = await self.provider.generate_text([{"role":"user","content":prompt}], sys_prompt)
             s = (r.get("content","") if isinstance(r,dict) else str(r)).strip()
-            self._prev = s[:4000]
+            self._prev = s
         except Exception as e:
             logging.getLogger(__name__).error(f"[{e} and {len(middle)} messages trimmed]")
             return head + tail
+        if not self._prev:
+            return head + tail
+        return head + [{"role": "user", "content": f"<context-summary>\n{self._prev}\n</context-summary>"}] + tail
 
 
 class ModelCatalog:
