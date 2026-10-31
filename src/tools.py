@@ -13,6 +13,7 @@ import base64
 import hashlib
 import secrets
 import warnings
+from dataclasses import dataclass
 from typing import List
 from pathlib import Path
 from urllib.parse import quote, urlparse
@@ -239,33 +240,63 @@ async def get_weather(location: str, forecast: bool = False) -> str:
 
 # ─── SHELL ───────────────────────────────────────────────────────────────────
 
-async def shell(command: str, timeout: int = 60) -> str:
+@dataclass
+class ShellResult:
+    ok: bool
+    exit_code: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    blocked: bool = False
+    timed_out: bool = False
+    error: str | None = None
+    reason: str = ""
+    duration_ms: float = 0.0
+
+    def to_text(self) -> str:
+        if self.blocked:
+            return f"BLOCKED: {self.reason}"
+        if self.error:
+            return f"Error: {self.error}"
+        if self.timed_out:
+            return f"Timeout after {self.duration_ms / 1000:.0f}s"
+        if self.exit_code:
+            return f"Exit code: {self.exit_code}\nSTDOUT: {self.stdout}\nSTDERR: {self.stderr}"
+        return self.stdout or "(no output)"
+
+
+async def shell_exec(command: str, timeout: int = 60) -> ShellResult:
     if not command or not isinstance(command, str) or not command.strip():
-        return "Error: Empty command."
+        return ShellResult(ok=False, error="Empty command.")
     for pat, reason in _ANTI_PATTERNS:
         if re.search(pat, command, re.IGNORECASE):
-            return f"BLOCKED: {reason}. Command: {command[:100]}"
+            return ShellResult(ok=False, blocked=True, reason=f"{reason}. Command: {command[:100]}")
     try:
         from src.core.memory import memory_core
         for block in memory_core.get_runtime_blocks():
             detect = block.get("detect", "")
             if detect and detect.lower() in command.lower():
-                return f"BLOCKED: {block.get('reason', 'Known bad pattern')}. Fix: {block.get('fix', 'See error details')}"
+                return ShellResult(ok=False, blocked=True, reason=f"{block.get('reason', 'Known bad pattern')}. Fix: {block.get('fix', 'See error details')}")
     except Exception:
         pass
+    started = time.monotonic()
+    process = None
     try:
         process = await asyncio.create_subprocess_shell(command.strip(), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=int(timeout))
         out = stdout.decode('utf-8', errors='replace').strip()
         err = stderr.decode('utf-8', errors='replace').strip()
-        if process.returncode != 0:
-            return f"Exit code: {process.returncode}\nSTDOUT: {out}\nSTDERR: {err}"
-        return out or "(no output)"
+        return ShellResult(
+            ok=process.returncode == 0,
+            exit_code=process.returncode,
+            stdout=out,
+            stderr=err,
+            duration_ms=(time.monotonic() - started) * 1000,
+        )
     except asyncio.TimeoutError:
         if process:
             process.kill()
             await process.wait()
-        return f"Timeout after {timeout}s"
+        return ShellResult(ok=False, timed_out=True, duration_ms=(time.monotonic() - started) * 1000)
     except asyncio.CancelledError:
         if process:
             process.kill()
@@ -275,7 +306,11 @@ async def shell(command: str, timeout: int = 60) -> str:
         if process:
             process.kill()
             await process.wait()
-        return f"Error: {e}"
+        return ShellResult(ok=False, error=str(e), duration_ms=(time.monotonic() - started) * 1000)
+
+
+async def shell(command: str, timeout: int = 60) -> str:
+    return (await shell_exec(command, timeout)).to_text()
 
 
 # ─── FILESYSTEM ──────────────────────────────────────────────────────────────
@@ -888,7 +923,7 @@ def _generate_registry():
     current_module = sys.modules[__name__]
     registry = {}
     for name, func in inspect.getmembers(current_module, inspect.isfunction):
-        if not name.startswith("_") and func.__module__ == __name__ and name not in ('_generate_registry', 'get_tools_schema', 'download_and_open_image', 'reload_allowed_roots'):
+        if not name.startswith("_") and func.__module__ == __name__ and name not in ('_generate_registry', 'get_tools_schema', 'download_and_open_image', 'reload_allowed_roots', 'shell_exec'):
             registry[name] = func
     return registry
 
