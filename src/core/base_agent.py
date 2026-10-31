@@ -21,7 +21,7 @@ from src.core.memory import memory_core
 from src.core.provider import AIProvider, get_provider
 from src.skills_loader import load_role, SkillEngine
 from src.tools import TOOL_REGISTRY, shell_exec
-from src.utils import get_system_context, sanitize_for_prompt, generate_random_delimiter, count_tokens, add_global_tokens, add_provider_tokens, ContextCompressor, ModelCatalog, safe_run, GitManager
+from src.utils import get_system_context, sanitize_for_prompt, generate_random_delimiter, count_tokens, add_global_tokens, add_provider_tokens, ContextCompressor, ModelCatalog, safe_run, GitManager, truncate_to_tokens, context_ceiling
 from src.core.runtime import Run, ToolCall, ToolResult, Artifact, RunStatus, Task
 
 logger = logging.getLogger(__name__)
@@ -306,8 +306,10 @@ class StemAgent:
         except Exception as e:
             logger.debug(f"ModelCatalog context fetch failed: {e}")
         if limit is None:
-            limit = 128000
-        threshold = int(limit * 0.85)
+            limit = int(getattr(self.settings, "max_token_budget", 0) or 0)
+        if not limit:
+            return
+        threshold = context_ceiling(limit)
         current_tokens = count_tokens(self.history, "")[0]
         if current_tokens < threshold:
             return
@@ -418,12 +420,13 @@ class StemAgent:
             logger.debug("Prompt skills failed: %s", e)
             return ""
 
-    def _prompt_tools(self) -> str:
+    def _prompt_tools(self, declared_names: set[str] | None = None) -> str:
         active = self._active_tools()
         if not active:
             return ""
         from src.tools import get_tools_schema
-        return "--- AVAILABLE TOOLS ---\n" + get_tools_schema(active, compact=True)
+        subset = {k: v for k, v in active.items() if declared_names is None or k in declared_names}
+        return "--- AVAILABLE TOOLS ---\n" + get_tools_schema(subset, compact=True)
 
     def _prompt_project_rules(self) -> str:
         try:
@@ -443,18 +446,10 @@ class StemAgent:
         tools_schema = self._prompt_tools()
         protocol = f"--- EXECUTION PROTOCOL ---\n{ZG_PROTOCOL.strip()}"
         mcp_tools = self._prompt_mcp()
-        mem_text = self._prompt_memory(user_input)
-        if len(mem_text) > 500:
-            mem_text = mem_text[:500] + "\n[Memory truncated]"
-        peer_text = self._prompt_peer_cards(user_input)
-        if len(peer_text) > 1200:
-            peer_text = peer_text[:1200] + "\n[Peer cards truncated]"
-        skills_text = self._prompt_skills(user_input)
-        if len(skills_text) > 2000:
-            skills_text = skills_text[:2000] + "\n[Skill catalog truncated]"
-        rules_text = self._prompt_project_rules()
-        if len(rules_text) > 3000:
-            rules_text = rules_text[:3000] + "\n[Project rules truncated]"
+        mem_text = truncate_to_tokens(self._prompt_memory(user_input), 750, "\n[Memory truncated]")
+        peer_text = truncate_to_tokens(self._prompt_peer_cards(user_input), 500, "\n[Peer cards truncated]")
+        skills_text = truncate_to_tokens(self._prompt_skills(user_input), 1200, "\n[Skill catalog truncated]")
+        rules_text = truncate_to_tokens(self._prompt_project_rules(), 1500, "\n[Project rules truncated]")
         sections = [
             header,
             run_info,
