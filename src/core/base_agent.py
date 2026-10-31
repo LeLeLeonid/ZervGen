@@ -20,7 +20,7 @@ from src.config import MODES, GlobalSettings, load_config, ZG_PROTOCOL, RISK_ASK
 from src.core.memory import memory_core
 from src.core.provider import AIProvider, get_provider
 from src.skills_loader import load_role, SkillEngine
-from src.tools import TOOL_REGISTRY
+from src.tools import TOOL_REGISTRY, shell_exec
 from src.utils import get_system_context, sanitize_for_prompt, generate_random_delimiter, count_tokens, add_global_tokens, add_provider_tokens, ContextCompressor, ModelCatalog, safe_run, GitManager
 from src.core.runtime import Run, ToolCall, ToolResult, Artifact, RunStatus, Task
 
@@ -916,9 +916,9 @@ class StemAgent:
             return ""
         failures = []
         for command in commands:
-            result = await self._execute_tool("shell", {"command": command})
-            if str(result).startswith("Error"):
-                failures.append(f"{command}: {result}")
+            result = await shell_exec(command)
+            if not result.ok:
+                failures.append(f"{command}: {result.to_text()}")
         return "\n".join(failures)
 
     async def run(self, task: str) -> str:
