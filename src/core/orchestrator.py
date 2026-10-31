@@ -12,12 +12,18 @@ from src.core.base_agent import StemAgent
 from src.core.memory import memory_core
 from src.core.provider import AIProvider, get_provider
 from src.skills_loader import load_role, role_exists, skill_index, SkillEngine
-from src.tools import TOOL_REGISTRY, get_tools_schema
+from src.tools import TOOL_REGISTRY, get_tools_schema, shell_exec
 from src.utils import get_system_context, sanitize_for_prompt, generate_random_delimiter, count_tokens, add_global_tokens, add_provider_tokens, GitManager
 from src.core.runtime import CheckpointRef, Plan, Task, TaskStatus
 
 logger = logging.getLogger(__name__)
 console = Console()
+
+_FAILURE_MARKERS = re.compile(r"^(Error|BLOCKED|Timeout|TypeError|Exit code: [1-9]\d*)\b")
+
+
+def _looks_failed(text: str) -> bool:
+    return bool(_FAILURE_MARKERS.match(text.strip()))
 
 
 class Orchestrator(StemAgent):
@@ -164,9 +170,9 @@ class Orchestrator(StemAgent):
         for command in commands:
             if not str(command).strip():
                 continue
-            result = await self._execute_tool("shell", {"command": command})
-            if str(result).startswith("Error"):
-                failures.append(f"Verification command failed: {command}\n{result}")
+            result = await shell_exec(command)
+            if not result.ok:
+                failures.append(f"Verification command failed: {command}\n{result.to_text()}")
         if self._run:
             self._run.status = self._run.status.VERIFYING
             self._run.emit("verification", self.name, "artifacts", "passed" if not failures else "failed", output=failures or "artifact checks passed")
@@ -320,7 +326,7 @@ End with exactly one line: GRADE: [1-5]"""
                             task_obj.status = TaskStatus.FAILED
                             task_obj.result = f"{type(result).__name__}: {result}"
                         else:
-                            ok = bool(result) and not str(result).strip().startswith("Error")
+                            ok = bool(result) and not _looks_failed(str(result))
                             task_obj.status = TaskStatus.DONE if ok else TaskStatus.FAILED
                             task_obj.result = str(result)
                         child_id = next((aid for aid, sp in agent_id_map.items() if sp is spec), None)
