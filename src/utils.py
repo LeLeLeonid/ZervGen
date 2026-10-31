@@ -206,13 +206,42 @@ def discover_context_files(cwd: str = ".") -> str:
     return ""
 
 
+CONTEXT_RESERVE_SHARE = 0.15
+CONTEXT_RESERVE_MIN = 16_000
+
+_ENC = None
+
+
+def _encoder():
+    global _ENC
+    if _ENC is None:
+        import tiktoken
+        _ENC = tiktoken.get_encoding("cl100k_base")
+    return _ENC
+
+
 def count_tokens_tiktoken(text: str) -> int:
     try:
-        import tiktoken
-        enc = tiktoken.get_encoding("cl100k_base")
-        return len(enc.encode(text))
+        return len(_encoder().encode(text))
     except ImportError:
         return int(len(text.split()) * 1.3)
+
+
+def truncate_to_tokens(text: str, max_tokens: int, marker: str = "\n[truncated]") -> str:
+    if not text or max_tokens <= 0:
+        return ""
+    try:
+        enc = _encoder()
+    except ImportError:
+        return text[: max_tokens * 4]
+    ids = enc.encode(text)
+    if len(ids) <= max_tokens:
+        return text
+    return enc.decode(ids[:max_tokens]) + marker
+
+
+def context_ceiling(window: int) -> int:
+    return window - max(int(window * CONTEXT_RESERVE_SHARE), CONTEXT_RESERVE_MIN)
 
 
 def estimate_messages_tokens(messages: List[Dict]) -> int:
