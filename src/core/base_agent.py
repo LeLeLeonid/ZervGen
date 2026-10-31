@@ -314,12 +314,18 @@ class StemAgent:
         if self._compressor is None:
             self._compressor = ContextCompressor(self.provider)
         try:
-            self.history = await self._compressor.compress(self.history)
+            compressed = await self._compressor.compress(self.history)
+            if compressed:
+                self.history = compressed
         except Exception as e:
             logger.error(f"Compressor failed: {e}. Hard-trimming history.")
         if count_tokens(self.history, "")[0] > threshold:
             head = [m for m in self.history if m.get("role") == "system"]
-            self.history = head + self.history[-10:]
+            body = [m for m in self.history if m.get("role") != "system"]
+            cut = max(0, len(body) - 10)
+            while cut < len(body) and body[cut].get("role") in ("tool", "toolResult"):
+                cut += 1
+            self.history = head + body[cut:]
         self._cached_system_prompt = None
 
     def _prompt_header(self, role_cfg) -> str:
