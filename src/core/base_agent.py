@@ -687,6 +687,12 @@ class StemAgent:
             message = f"{message}\nMODEL OUTPUT:\n{captured}"
         self._log(self.name, message, "ptc_error", self.mode)
 
+    def _log_error_with_traceback(self, message: str, exc: Exception) -> None:
+        import traceback
+        tb = traceback.format_exc()
+        from src.utils import redact_traceback
+        self._log(self.name, f"{message}\n{redact_traceback(tb)}", "error", self.mode)
+
     async def _run_code(self, code: str, full_response: str = "") -> str:
         if not code:
             return "Error: Empty code"
@@ -827,7 +833,7 @@ class StemAgent:
             return f"Error: {err_msg}{hint}"
         except Exception as e:
             err_msg = f"{type(e).__name__}: {e}"
-            self._log(self.name, f"ERROR: {err_msg}", "ptc_error", self.mode)
+            self._log_error_with_traceback(f"ERROR: {err_msg}", e)
             err = f"Error: {err_msg}"
             self._log_ptc_error(err, full_response)
             self._record_error_tripwire(f"ptc:{err}")

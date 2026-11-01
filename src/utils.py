@@ -172,6 +172,15 @@ def redact_fast(text: str) -> str:
     return text
 
 
+def redact_traceback(tb_text: str) -> str:
+    """Redact credentials from a Python traceback string."""
+    if not tb_text:
+        return tb_text
+    for pat, repl in _REDACT_PATTERNS:
+        tb_text = re.sub(pat, repl, tb_text)
+    return tb_text
+
+
 def discover_context_files(cwd: str = ".") -> str:
     base = Path(cwd).resolve()
     search = [base]
