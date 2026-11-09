@@ -1,6 +1,8 @@
 import asyncio
 import ast
 import hashlib
+import html
+import inspect
 import os
 import platform
 import re
@@ -89,6 +91,7 @@ class TraceBus:
                  capture_chars: Optional[int] = None, root: Optional[Path] = None) -> None:
         self.role = role
         self.enabled = bool(load_config().trace_enabled) if enabled is None else bool(enabled)
+        self.paint = True
         self.capture_chars = int(capture_chars or 2000)
         self.root = Path(root or TRACE_ROOT)
         self.run_id = ""
@@ -139,7 +142,7 @@ class TraceBus:
             return
         self._seen.add(mark)
         self._record(kind, role, body, dict(data))
-        if not paint or kind in self.SILENT or kind in self.BUFFERED:
+        if not paint or not self.paint or kind in self.SILENT or kind in self.BUFFERED:
             return
         trace_line(role, kind, body)
         logging.getLogger(__name__).info("%s: %s", kind.upper(), _flat(body)[:400])
@@ -180,11 +183,12 @@ class TraceBus:
         self._record(kind, self.role, line, {"call_id": call_id, "name": name, "ok": ok,
                                              "duration": round(elapsed, 4),
                                              "chars": len(str(output or ""))})
-        trace_line(self.role, kind, line)
+        if self.paint:
+            trace_line(self.role, kind, line)
         logging.getLogger(__name__).info("%s: %s", kind.upper(), line[:400])
 
-    def answer(self, text: str) -> None:
-        """Record the final answer; render a receipt, never the text."""
+    def answer(self, text: str, streamed: bool = False) -> None:
+        """Record the final answer; paint a receipt only when the text is already shown."""
         if not self.enabled:
             return
         size = len(str(text or ""))
@@ -192,8 +196,9 @@ class TraceBus:
         if mark in self._seen:
             return
         self._seen.add(mark)
-        self._record("answer", self.role, str(text or ""), {"chars": size})
-        trace_line(self.role, "answer", f"answered ({size:,} chars)")
+        self._record("answer", self.role, str(text or ""), {"chars": size, "streamed": streamed})
+        if self.paint and streamed:
+            trace_line(self.role, "answer", f"answered ({size:,} chars)")
         logging.getLogger(__name__).info("ANSWER: %d chars", size)
 
     def close(self) -> None:
@@ -208,7 +213,24 @@ class TraceBus:
 
 # ─── TURN PARSING ────────────────────────────────────────────────────────
 
-SHORTHAND_RE = re.compile(r"^\s*::(?:tool\s+)?([A-Za-z_][\w.-]*)\s*(.*)$")
+SHORTHAND_RE = re.compile(r"^\s*::(?:(?:tool|call)\s+)?([A-Za-z_][\w.-]*)\s*(.*?)\s*$")
+XML_TAG_RE = re.compile(
+    r"<(?P<tag>[A-Za-z_][\w.-]*)(?P<attrs>(?:\s+[A-Za-z_][\w.-]*\s*=\s*(?:\"[^\"]*\"|'[^']*'))*)"
+    r"\s*(?:/>|>(?P<body>.*?)</(?P=tag)>)",
+    re.DOTALL,
+)
+XML_ARG_RE = re.compile(
+    r"<arg\s+name=[\"'](?P<key>[^\"']+)[\"']\s*>(?P<value>.*?)</arg>",
+    re.DOTALL | re.IGNORECASE,
+)
+XML_NAME_RE = re.compile(r"<name>\s*(?P<name>[^<]+?)\s*</name>", re.IGNORECASE)
+XML_ATTR_RE = re.compile(r"([A-Za-z_][\w.-]*)\s*=\s*(?:\"([^\"]*)\"|'([^']*)')")
+XML_CHILD_RE = re.compile(
+    r"<(?P<key>[A-Za-z_][\w.-]*)\s*(?:name=[\"'](?P<label>[^\"']+)[\"']\s*)?>(?P<value>[^<]*)</(?P=key)>",
+    re.DOTALL,
+)
+XML_WRAPPERS = {"tool", "tool_call", "call", "invoke", "function_call"}
+XML_NAME_KEYS = ("name", "tool", "function", "tool_name")
 PY_FENCE_RE = re.compile(r"```python\s*\n(.*?)\n\s*```", re.DOTALL)
 JSON_FENCE_RE = re.compile(r"```(?:json)?\s*\n?\s*(\{.*?\})\s*\n?\s*```", re.DOTALL)
 
@@ -237,24 +259,115 @@ class TurnIntent:
     answer: str = ""
     prose: str = ""
     raw: str = ""
-    source: str = ""             # shorthand | ptc | json | auto-ptc | prose
+    source: str = ""             # shorthand | call | xml | ptc | json | auto-ptc | prose
     reason: str = ""
 
 def _strip_fences(text: str) -> str:
     return re.sub(r"```.*?```", "", text or "", flags=re.DOTALL)
 
-def _parse_call_args(blob: str) -> Optional[Dict[str, Any]]:
-    blob = blob.strip()
-    if not blob:
+def _arg_names(spec: Any) -> List[str]:
+    """Parameter names of a callable, in declaration order."""
+    if spec is None:
+        return []
+    try:
+        sig = inspect.signature(spec)
+    except (TypeError, ValueError):
+        return []
+    return [p.name for p in sig.parameters.values()
+            if p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)]
+
+def _scalar(text: str) -> Any:
+    """Python literal if it is one, otherwise a bare string."""
+    text = text.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        return text[1:-1]
+    lowered = text.lower()
+    if lowered in ("true", "yes", "on"):
+        return True
+    if lowered in ("false", "no", "off"):
+        return False
+    if lowered in ("null", "none"):
+        return None
+    try:
+        return ast.literal_eval(text)
+    except Exception:
+        return text
+
+_BARE = {"true": True, "false": False, "null": None, "none": None, "nil": None}
+
+def _node_value(node: ast.AST) -> Any:
+    """Value of one argument expression; bare names stay strings."""
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name):
+        return _BARE.get(node.id.lower(), node.id)
+    try:
+        return ast.literal_eval(node)
+    except Exception:
+        pass
+    try:
+        return ast.unparse(node).strip()
+    except Exception:
+        return ""
+
+def _parse_kwargs(blob: str) -> Optional[Dict[str, Any]]:
+    """``a=1 b="two"`` argument list."""
+    pairs = re.findall(
+        r"([A-Za-z_][\w.-]*)\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s,]+)", blob
+    )
+    return {key: _scalar(value) for key, value in pairs} if pairs else None
+
+def _parse_call_expr(inner: str, spec: Any) -> Optional[Dict[str, Any]]:
+    """``a, b, c=1`` inside a call, mapped onto the callable's parameters."""
+    if not inner.strip():
         return {}
     try:
-        value = json.loads(blob)
-    except json.JSONDecodeError:
+        node = ast.parse(f"_f({inner})", mode="eval").body
+    except SyntaxError:
         return None
-    return value if isinstance(value, dict) else None
+    if not isinstance(node, ast.Call):
+        return None
+    names = _arg_names(spec)
+    args: Dict[str, Any] = {}
+    for index, value in enumerate(node.args):
+        if index >= len(names):
+            if names or len(node.args) > 1 or node.keywords:
+                return None
+            args["text"] = _node_value(value)
+            continue
+        args[names[index]] = _node_value(value)
+    for keyword in node.keywords:
+        if keyword.arg is None:
+            return None
+        args[keyword.arg] = _node_value(keyword.value)
+    return args
 
-def parse_shorthand(text: str, names: Optional[set[str]] = None) -> List[ToolCallSpec]:
-    """``::tool name {"path": "x"}`` lines outside fenced blocks."""
+def _parse_call_args(blob: str, spec: Any = None) -> Optional[Dict[str, Any]]:
+    """Arguments from JSON, ``(a, b)``, ``k=v`` or one bare value."""
+    blob = (blob or "").strip()
+    if not blob:
+        return {}
+    if blob[0] in "{[":
+        try:
+            value = json.loads(blob)
+        except json.JSONDecodeError:
+            return None
+        return value if isinstance(value, dict) else None
+    if blob.startswith("(") and blob.endswith(")"):
+        return _parse_call_expr(blob[1:-1], spec)
+    if "=" in blob:
+        return _parse_kwargs(blob)
+    names = _arg_names(spec)
+    if names:
+        return {names[0]: _scalar(blob)}
+    values = [v.strip() for v in blob.split(",")]
+    if len(values) > 1:
+        return {"args": [_scalar(v) for v in values]}
+    return {"value": _scalar(blob)}
+
+def parse_shorthand(text: str, names: Optional[set[str]] = None,
+                    specs: Optional[Dict[str, Any]] = None) -> List[ToolCallSpec]:
+    """``::name{json}``, ``::name(a, b)`` and ``::name a=1 b=2`` calls."""
     calls: List[ToolCallSpec] = []
     in_fence = False
     for line in (text or "").splitlines():
@@ -269,10 +382,97 @@ def parse_shorthand(text: str, names: Optional[set[str]] = None) -> List[ToolCal
         name, blob = match.group(1), match.group(2)
         if names is not None and name not in names:
             continue
-        args = _parse_call_args(blob)
+        args = _parse_call_args(blob, (specs or {}).get(name))
         if args is None:
             continue
-        calls.append(ToolCallSpec(name, args, "shorthand"))
+        calls.append(ToolCallSpec(name, args, "call" if blob.startswith("(") else "shorthand"))
+    return calls
+
+def _xml_scalar(text: str) -> Any:
+    raw = (text or "").strip()
+    return _scalar(raw) if raw else ""
+
+def _xml_attrs(blob: str) -> Dict[str, Any]:
+    return {
+        key: _xml_scalar(double or single)
+        for key, double, single in XML_ATTR_RE.findall(blob or "")
+    }
+
+def _xml_children(body: str, spec: Any) -> Dict[str, Any]:
+    """``<a>1</a><b>2</b>`` children mapped onto a callable's parameters."""
+    children = [
+        (child.group("label") or child.group("key"), _xml_scalar(child.group("value")))
+        for child in XML_CHILD_RE.finditer(body)
+    ]
+    return _map_slots(children, spec)
+
+def _map_slots(pairs: list, spec: Any) -> Dict[str, Any]:
+    slots = _arg_names(spec)
+    args: Dict[str, Any] = {}
+    for index, (key, value) in enumerate(pairs):
+        if slots and key not in slots and index < len(slots):
+            key = slots[index]
+        args[key] = value
+    return args
+
+def _xml_args(body: str, spec: Any, terminal: bool = False) -> Dict[str, Any]:
+    """Arguments from ``<arg name="k">v</arg>``, JSON, children or one scalar."""
+    body = (body or "").strip()
+    if not body:
+        return {}
+    args: Dict[str, Any] = {
+        arg.group("key").strip(): _xml_scalar(arg.group("value"))
+        for arg in XML_ARG_RE.finditer(body)
+    }
+    if not args and body.startswith("{"):
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            args = payload
+    if not args:
+        args = _xml_children(body, spec)
+    if not args:
+        slots = _arg_names(spec)
+        if slots:
+            args[slots[0]] = _xml_scalar(body)
+        elif terminal:
+            args["text"] = _xml_scalar(body)
+    return args
+
+def parse_xml_calls(text: str, names: Optional[set[str]] = None,
+                    specs: Optional[Dict[str, Any]] = None) -> List[ToolCallSpec]:
+    """``<tool name="x">…</tool>``, ``<x k="v"/>`` and ``<x><k>v</k></x>``."""
+    specs = specs or {}
+    calls: List[ToolCallSpec] = []
+    known = set(names or ())
+    for tag in XML_TAG_RE.finditer(text or ""):
+        name = tag.group("tag")
+        body = tag.group("body") or ""
+        attrs = _xml_attrs(tag.group("attrs"))
+        if name in XML_WRAPPERS:
+            name = next((str(attrs.pop(k)) for k in XML_NAME_KEYS if attrs.get(k)), "")
+            if not name:
+                found = XML_NAME_RE.search(body)
+                name = found.group("name").strip() if found else ""
+        elif known and name not in known:
+            continue
+        if not name or (known and name not in known):
+            continue
+        args = attrs or _xml_args(body, specs.get(name), name in TERMINAL_TOOLS)
+        calls.append(ToolCallSpec(name, args, "xml"))
+    if calls:
+        return calls
+    for tag in XML_TAG_RE.finditer(text or ""):
+        name = tag.group("tag")
+        if name in XML_WRAPPERS or (known and name not in known):
+            continue
+        attrs = _xml_attrs(tag.group("attrs"))
+        body = tag.group("body") or ""
+        if not attrs and not body.strip():
+            continue
+        calls.append(ToolCallSpec(name, attrs or _xml_args(body, specs.get(name), name in TERMINAL_TOOLS), "xml"))
     return calls
 
 def _json_calls(payload: Any, names: Optional[set[str]]) -> List[ToolCallSpec]:
@@ -326,30 +526,53 @@ def looks_like_markup(text: str) -> bool:
     markup = sum(1 for l in lines if l.startswith("<") and ">" in l)
     return markup > len(lines) * 0.6
 
-def strip_ptc(text: str) -> str:
-    """Prose with fenced blocks and ``::tool`` lines removed."""
-    kept = [line for line in _strip_fences(text).splitlines() if not SHORTHAND_RE.match(line)]
-    return "\n".join(kept).strip()
+def strip_ptc(text: str, names: Optional[set[str]] = None) -> str:
+    """Prose with fenced blocks and every tool-call surface removed."""
+    lines = []
+    in_fence = False
+    for line in (text or "").splitlines():
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence or SHORTHAND_RE.match(line):
+            continue
+        lines.append(line)
+    calls = set(names or ()) | XML_WRAPPERS
+    return XML_TAG_RE.sub(
+        lambda m: "" if m.group("tag") in calls else m.group(0),
+        "\n".join(lines),
+    ).strip()
 
-def parse_turn(text: str, names: Optional[set[str]] = None) -> TurnIntent:
+def _with_calls(source: str, calls: List[ToolCallSpec], raw: str,
+                names: Optional[set[str]]) -> TurnIntent:
+    terminal = [c for c in calls if c.name in TERMINAL_TOOLS]
+    if terminal:
+        return TurnIntent("answer", calls=[c for c in calls if c.name not in TERMINAL_TOOLS],
+                          answer=str(terminal[-1].args.get("text", "") or ""),
+                          prose=strip_ptc(raw, names), raw=raw, source=source)
+    prose = "" if source == "json" else strip_ptc(raw, names)
+    return TurnIntent("calls", calls=calls, prose=prose, raw=raw, source=source)
+
+def parse_turn(text: str, names: Optional[set[str]] = None,
+               specs: Optional[Dict[str, Any]] = None) -> TurnIntent:
     """Classify one model message into a single intent."""
     raw = text or ""
     body = raw.strip()
     if not body:
         return TurnIntent("retry", raw=raw, reason="empty response")
 
-    calls = parse_shorthand(raw, names)
+    calls = parse_shorthand(raw, names, specs)
     if calls:
-        terminal = [c for c in calls if c.name in TERMINAL_TOOLS]
-        if terminal:
-            return TurnIntent("answer", calls=[c for c in calls if c.name not in TERMINAL_TOOLS],
-                              answer=str(terminal[-1].args.get("text", "") or ""),
-                              prose=strip_ptc(raw), raw=raw, source="shorthand")
-        return TurnIntent("calls", calls=calls, prose=strip_ptc(raw), raw=raw, source="shorthand")
+        return _with_calls("shorthand" if calls[0].source == "shorthand" else "call",
+                           calls, raw, names)
+
+    xml_calls = parse_xml_calls(raw, names, specs)
+    if xml_calls:
+        return _with_calls("xml", xml_calls, raw, names)
 
     fenced = [block for block in PY_FENCE_RE.findall(raw) if block.strip()]
     if fenced:
-        return TurnIntent("calls", code="\n\n".join(fenced), prose=strip_ptc(raw),
+        return TurnIntent("calls", code="\n\n".join(fenced), prose=strip_ptc(raw, names),
                           raw=raw, source="ptc")
 
     for match in JSON_FENCE_RE.finditer(raw):
@@ -358,14 +581,8 @@ def parse_turn(text: str, names: Optional[set[str]] = None) -> TurnIntent:
         except json.JSONDecodeError:
             continue
         parsed = _json_calls(payload, names)
-        if not parsed:
-            continue
-        terminal = [c for c in parsed if c.name in TERMINAL_TOOLS]
-        if terminal:
-            return TurnIntent("answer", calls=[c for c in parsed if c.name not in TERMINAL_TOOLS],
-                              answer=str(terminal[-1].args.get("text", "") or ""),
-                              prose=strip_ptc(raw), raw=raw, source="json")
-        return TurnIntent("calls", calls=parsed, prose=strip_ptc(raw), raw=raw, source="json")
+        if parsed:
+            return _with_calls("json", parsed, raw, names)
 
     if body[0] in "{[":
         try:
@@ -373,18 +590,13 @@ def parse_turn(text: str, names: Optional[set[str]] = None) -> TurnIntent:
         except json.JSONDecodeError:
             parsed = []
         if parsed:
-            terminal = [c for c in parsed if c.name in TERMINAL_TOOLS]
-            if terminal:
-                return TurnIntent("answer", calls=[c for c in parsed if c.name not in TERMINAL_TOOLS],
-                                  answer=str(terminal[-1].args.get("text", "") or ""),
-                                  prose=strip_ptc(raw), raw=raw, source="json")
-            return TurnIntent("calls", calls=parsed, prose=strip_ptc(raw), raw=raw, source="json")
+            return _with_calls("json", parsed, raw, names)
 
     if looks_like_python(body):
         return TurnIntent("calls", code=body, raw=raw, source="auto-ptc")
 
     if looks_like_markup(body):
-        return TurnIntent("retry", raw=raw, prose=strip_ptc(raw), source="markup",
+        return TurnIntent("retry", raw=raw, prose=strip_ptc(raw, names), source="markup",
                           reason="raw XML/HTML instead of prose or a tool call")
 
     return TurnIntent("answer", answer=body, prose=body, raw=raw, source="prose")

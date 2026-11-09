@@ -184,3 +184,135 @@ def test_stream_error_frame_raises():
         raise AssertionError("ProviderError was not raised")
     finally:
         base_mod.get_http_client = original
+
+
+def test_openai_payload_carries_native_tools_and_parses_calls(monkeypatch):
+    import src.providers.base as base_mod
+
+    provider = _openai()
+    provider.native_tools = [{"name": "read_file", "description": "read",
+                              "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}]
+    payload = provider._payload([{"role": "user", "content": "hi"}], "sys", False)
+    assert payload["tools"] == [{"type": "function", "function": provider.native_tools[0]}]
+    assert payload["tool_choice"] == "auto"
+
+    reply = {"choices": [{"finish_reason": "tool_calls", "message": {
+        "content": "", "tool_calls": [{"function": {"name": "read_file",
+                                                    "arguments": '{"path": "src/cli.py"}'}}]}}]}
+    monkeypatch.setattr(base_mod, "get_http_client", lambda: FakeClient(reply))
+    text = asyncio.run(provider.generate_text([{"role": "user", "content": "hi"}], "sys"))
+    assert text == ""
+    assert provider.native_calls == [{"name": "read_file", "arguments": {"path": "src/cli.py"}}]
+
+
+def test_anthropic_payload_carries_native_tools_and_parses_tool_use(monkeypatch):
+    import src.providers.anthropic as anthropic_mod
+
+    provider = _anthropic()
+    provider.native_tools = [{"name": "read_file", "description": "read",
+                              "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}]
+    payload = provider._payload([{"role": "user", "content": "hi"}], "sys", False)
+    assert payload["tools"][0]["input_schema"] == provider.native_tools[0]["parameters"]
+    assert payload["tool_choice"] == {"type": "auto"}
+
+    reply = {"type": "message", "content": [
+        {"type": "tool_use", "name": "read_file", "input": {"path": "src/cli.py"}}]}
+    monkeypatch.setattr(anthropic_mod, "get_http_client", lambda: FakeClient(reply))
+    text = asyncio.run(provider.generate_text([{"role": "user", "content": "hi"}], "sys"))
+    assert text == ""
+    assert provider.native_calls == [{"name": "read_file", "arguments": {"path": "src/cli.py"}}]
+
+
+def test_gemini_payload_carries_declarations_and_parses_function_call(monkeypatch):
+    import src.providers.gemini as gemini_mod
+    from src.config import GeminiSettings
+
+    provider = gemini_mod.Provider(GeminiSettings(api_key="test-key", model="gemini-2.5-flash"))
+    provider.native_tools = [{"name": "read_file", "description": "read",
+                              "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}]
+    payload = provider._payload([{"role": "user", "content": "hi"}], "sys", False)
+    declaration = payload["tools"][0]["functionDeclarations"][0]
+    assert declaration["name"] == "read_file"
+    assert declaration["parameters"]["type"] == "OBJECT"
+
+    reply = {"candidates": [{"content": {"parts": [
+        {"functionCall": {"name": "read_file", "args": {"path": "src/cli.py"}}}]}}]}
+    monkeypatch.setattr(gemini_mod, "get_http_client", lambda: FakeClient(reply))
+    text = asyncio.run(provider.generate_text([{"role": "user", "content": "hi"}], "sys"))
+    assert text == ""
+    assert provider.native_calls == [{"name": "read_file", "arguments": {"path": "src/cli.py"}}]
+
+
+def test_anthropic_stream_accumulates_tool_use(monkeypatch):
+    import src.providers.anthropic as anthropic_mod
+
+    frames = [
+        {"type": "content_block_start", "index": 0,
+         "content_block": {"type": "tool_use", "name": "read_file"}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "input_json_delta", "partial_json": '{"path": '}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "input_json_delta", "partial_json": '"src/cli.py"}'}},
+    ]
+
+    class StreamResponse:
+        status_code = 200
+
+        async def aiter_lines(self):
+            for frame in frames:
+                yield "data: " + __import__("json").dumps(frame)
+
+    class StreamContext:
+        async def __aenter__(self):
+            return StreamResponse()
+
+        async def __aexit__(self, *args):
+            return False
+
+    class StreamClient:
+        def stream(self, *args, **kwargs):
+            return StreamContext()
+
+    monkeypatch.setattr(anthropic_mod, "get_http_client", lambda: StreamClient())
+    provider = _anthropic()
+    text = asyncio.run(provider.generate_text([{"role": "user", "content": "hi"}], "sys",
+                                              on_token=lambda t: None))
+    assert text == ""
+    assert provider.native_calls == [{"name": "read_file", "arguments": {"path": "src/cli.py"}}]
+
+
+def test_openai_stream_accumulates_tool_calls(monkeypatch):
+    import json as _json
+
+    import src.providers.base as base_mod
+
+    frames = [
+        {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"name": "read_file", "arguments": '{"pa'}}]}}]},
+        {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": 'th": "AGENTS.md"}'}}]}}]},
+    ]
+
+    class StreamResponse:
+        status_code = 200
+
+        async def aiter_lines(self):
+            for frame in frames:
+                yield "data: " + _json.dumps(frame)
+            yield "data: [DONE]"
+
+    class StreamContext:
+        async def __aenter__(self):
+            return StreamResponse()
+
+        async def __aexit__(self, *args):
+            return False
+
+    class StreamClient:
+        def stream(self, *args, **kwargs):
+            return StreamContext()
+
+    monkeypatch.setattr(base_mod, "get_http_client", lambda: StreamClient())
+    provider = _openai()
+    text = asyncio.run(provider.generate_text([{"role": "user", "content": "hi"}], "sys",
+                                              on_token=lambda t: None))
+    assert text == ""
+    assert provider.native_calls == [{"name": "read_file", "arguments": {"path": "AGENTS.md"}}]

@@ -88,7 +88,7 @@ class ZervGenCLI:
             "status": lambda a: CC.print(Panel(str(self.orchestrator.get_mode_status()), title="Status", border_style="cyan")),
             "stop": lambda a: CC.print("[yellow]Use Ctrl+C to interrupt.[/yellow]"),
             "dream": lambda a: self._toggle_dream(),
-            "mcp": lambda a: self._cmd_mcp(),
+            "mcp": lambda a: self._cmd_mcp(a),
             "provider": lambda a: self._handle_provider(a),
             "role": lambda a: self._handle_role(a),
             "mode": lambda a: self._handle_mode(a),
@@ -251,7 +251,13 @@ class ZervGenCLI:
                 return [("class:toolbar.busy", f" {self._status_text} ")]
             if self.orchestrator:
                 s = self.orchestrator.get_mode_status()
-                return [("class:toolbar", f" {s['mode']}:{s['role']} {self.config.provider.upper()} ")]
+                line = f" {s['mode']}:{s['role']} {self.config.provider.upper()} "
+                run = getattr(self.orchestrator, "_run", None)
+                status = getattr(getattr(run, "status", None), "value", "")
+                if run is not None and status == "running":
+                    cost = float(run.metadata.get("cost_usd", 0.0) or 0.0)
+                    line += f"· step {run.budget.steps} · ${cost:.4f} "
+                return [("class:toolbar", line)]
             return [("class:toolbar", " ")]
 
         commands = [f"/{k}" for k in self._cmd_table]
@@ -369,7 +375,9 @@ class ZervGenCLI:
             CC.print("[yellow]Cleared local history. Disk kept. /clear --hard = this session, /clear --all = all.[/yellow]")
         return True
 
-    async def _cmd_mcp(self) -> bool:
+    async def _cmd_mcp(self, args: Optional[str] = None) -> bool:
+        if (args or "").strip().lower() == "doctor":
+            return await self._mcp_doctor()
         self.config.mcp_enabled = not self.config.mcp_enabled
         self.config.save()
         state = "ENABLED" if self.config.mcp_enabled else "DISABLED"
@@ -380,6 +388,24 @@ class ZervGenCLI:
             self.orchestrator._mcp = None
             self.orchestrator._mcp_initialized = False
             await self._warm_mcp()
+        return True
+
+    async def _mcp_doctor(self) -> bool:
+        """Probe every configured server and print a per-server diagnosis."""
+        manager = getattr(self.orchestrator, "_mcp", None) if self.orchestrator else None
+        if manager is None:
+            CC.print("[yellow]MCP is not initialized.[/yellow]")
+            return True
+        rows = await manager.doctor()
+        table = Table(title="MCP DOCTOR", border_style=C)
+        table.add_column("Server", style="bold")
+        table.add_column("State")
+        table.add_column("Detail", style="dim")
+        tones = {"ready": "green", "starting": "yellow", "degraded": "yellow", "dead": "red", "off": "dim"}
+        for row in rows:
+            tone = tones.get(row["state"], "dim")
+            table.add_row(Text(row["server"]), Text(row["state"], style=tone), Text(str(row["detail"])))
+        CC.print(table)
         return True
 
     def _cmd_reload(self) -> bool:
@@ -728,7 +754,7 @@ class ZervGenCLI:
 /usage   - Toggle the Token Counter
 /compact - Compact short-term memory into long-term storage
 /reload  - Reload your skills
-/mcp     - Model Context Protocol
+/mcp     - Model Context Protocol (/mcp doctor to probe)
 /get     - List every setting, or show one: /get max_steps
 /set     - Change any setting: /set max_steps 80
 /key     - Set the API key for the current provider
@@ -1553,7 +1579,10 @@ class ZervGenCLI:
                 self.orchestrator._user_active = False
 
     def _already_shown(self, response: str) -> bool:
-        """Whether the streamed prose already carried this final answer."""
+        """Whether the final turn's stream already painted this answer."""
+        check = getattr(self.orchestrator, "_streamed_answer", None)
+        if callable(check):
+            return bool(check(response))
         if not getattr(self.orchestrator, "_last_streamed", False):
             return False
         streamed = getattr(self.orchestrator, "_last_streamed_text", "") or ""

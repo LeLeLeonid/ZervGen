@@ -21,6 +21,14 @@ MAX_NAME = 64
 MAX_DESCRIPTION = 1024
 MAX_DEPTH = 6
 SKIP_DIRS = {"node_modules", "__pycache__", "site-packages", ".git"}
+TOOL_ALIASES = {
+    "terminal": "shell",
+    "web_extract": "fetch_url",
+    "browser_exec": "shell",
+    "delegate_task": "delegate_to",
+    "read": "read_file",
+    "write": "write_file",
+}
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 
 
@@ -33,24 +41,45 @@ def _external_roots() -> List[Path]:
         return [Path("tmp").resolve()]
 
 
+def _as_list(value: Any) -> List[str]:
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def _meta(fm: dict) -> dict:
+    """Hermes/OpenClaw style namespaced metadata, flattened."""
+    merged = {}
+    for holder in ("metadata", "meta"):
+        nested = fm.get(holder)
+        if isinstance(nested, dict):
+            for key in ("hermes", "openclaw", "zervgen"):
+                if isinstance(nested.get(key), dict):
+                    merged.update(nested[key])
+    merged.update({k: v for k, v in fm.items() if k not in ("metadata", "meta")})
+    return merged
+
+
 def _parse_frontmatter(text: str) -> Optional[dict]:
     """Frontmatter of a skill file, or None when it is not a skill."""
     if not text.startswith("---"):
         return None
     try:
         end = text.index("---", 3)
-        fm = yaml.safe_load(text[3:end]) or {}
+        raw = yaml.safe_load(text[3:end]) or {}
     except Exception:
         return None
-    if not isinstance(fm, dict) or not fm.get("name") or not fm.get("description"):
+    if not isinstance(raw, dict) or not raw.get("name") or not raw.get("description"):
         return None
-    tags = fm.get("tags", [])
-    if isinstance(tags, str):
-        fm["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
-    elif isinstance(tags, list):
-        fm["tags"] = [str(t) for t in tags]
-    else:
-        fm["tags"] = []
+    flat = _meta(raw)
+    fm = dict(raw)
+    fm["tags"] = _as_list(flat.get("tags") or flat.get("keywords"))
+    fm["related"] = _as_list(flat.get("related_skills") or flat.get("related"))
+    fm["category"] = str(flat.get("category") or "").strip().lower()
+    fm["version"] = str(flat.get("version") or "").strip()
+    fm["license"] = str(flat.get("license") or "").strip()
 
     name = str(fm["name"]).strip()
     description = " ".join(str(fm["description"]).split())
@@ -61,6 +90,18 @@ def _parse_frontmatter(text: str) -> Optional[dict]:
         description = description[:MAX_DESCRIPTION]
     fm["name"], fm["description"] = name, description
     return fm
+
+
+def _category(path: Path, root: Optional[Path] = None) -> str:
+    """Top-level folder a skill lives in, relative to its skills root."""
+    base = Path(root).resolve() if root else SKILLS_DIR.resolve()
+    try:
+        parts = Path(path).resolve().relative_to(base).parts
+    except ValueError:
+        return "general"
+    if len(parts) >= 2:
+        return parts[0]
+    return "general"
 
 
 def _iter_skill_files(root: Path):
@@ -96,6 +137,8 @@ def list_resources(path: Path) -> List[str]:
         if not area.is_dir():
             continue
         for item in sorted(area.rglob("*")):
+            if any(part in SKIP_DIRS or part.startswith(".") for part in item.parts):
+                continue
             if item.is_file() and not item.is_symlink():
                 found.append(str(item.relative_to(base)))
     return found[:60]
@@ -150,6 +193,8 @@ def rebuild_catalog(force: bool = False) -> dict:
                 "description": fm["description"],
                 "tags": tags,
                 "files": list_resources(md),
+                "category": (fm["category"] or _category(md, root)).lower(),
+                "related": fm["related"],
             }
     if collisions:
         logger.info("Skill catalog: %d duplicate name(s) ignored", collisions)
@@ -232,6 +277,10 @@ class SkillDef:
     path: str = ""
     files: List[str] = field(default_factory=list)
     external: bool = False
+    category: str = ""
+    related: List[str] = field(default_factory=list)
+    version: str = ""
+    license: str = ""
 
     @property
     def base_dir(self) -> str:
@@ -239,13 +288,19 @@ class SkillDef:
         return str(Path(self.path).parent) if self.path else ""
 
     def match_trigger(self, user_input: str) -> bool:
+        """True when the request shares a word (or a 4+ letter stem) with a tag."""
         if not self.tags:
             return False
-        input_lower = user_input.lower()
+        words = set(re.findall(r"[a-z0-9]+", (user_input or "").lower()))
+        if not words:
+            return False
         for tag in self.tags:
-            pattern = r'\b' + re.escape(tag.lower()) + r'\b'
-            if re.search(pattern, input_lower):
-                return True
+            for word in re.findall(r"[a-z0-9]+", tag.lower()):
+                if word in words:
+                    return True
+                if len(word) >= 4 and any(other.startswith(word) or word.startswith(other)
+                                          for other in words if len(other) >= 4):
+                    return True
         return False
     
     @property
@@ -282,49 +337,43 @@ class SkillRegistry:
                     path=meta["path"],
                     files=list(meta.get("files") or []),
                     external=True,
+                    category=meta.get("category", ""),
+                    related=list(meta.get("related") or []),
                 )
 
     def _load_all(self):
-        for md_file in AGENTS_DIR.glob("*.md"):
-            self._load_file(md_file)
-        for md_file in SKILLS_DIR.rglob("*.md"):
-            if md_file.parent == AGENTS_DIR:
+        """Built-in skills: ``SKILL.md`` bundles plus loose category markdown."""
+        for md_file in sorted(SKILLS_DIR.rglob("*.md")):
+            relative = md_file.relative_to(SKILLS_DIR)
+            if AGENTS_DIR in md_file.parents:
                 continue
-            if md_file.parent == SKILLS_DIR and md_file.stem == "system":
+            if md_file.name != SKILL_FILE and len(relative.parts) != 2:
                 continue
             self._load_file(md_file)
 
     def _load_file(self, path: Path):
         try:
-            content = path.read_text(encoding="utf-8")
-            if not content.startswith("---"):
+            fm = _parse_frontmatter(path.read_text(encoding="utf-8"))
+            if not fm:
                 return
-            parts = content.split("---", 2)
-            if len(parts) < 3:
-                return
-            meta = yaml.safe_load(parts[1]) or {}
-            tags = meta.get("tags", [])
-            if isinstance(tags, str):
-                tags = [t.strip() for t in tags.split(",") if t.strip()]
-            name = meta.get("name") or path.stem
-            if not tags and not meta.get("name"):
-                return
-            contract = meta.get("contract", {})
-            body = parts[2].strip()
-            self.skills[name] = SkillDef(
-                name=name,
-                description=meta.get("description", ""),
-                tags=tags,
-                tools=meta.get("tools", []),
+            contract = fm.get("contract") or {}
+            self.skills[fm["name"]] = SkillDef(
+                name=fm["name"],
+                description=fm["description"],
+                tags=fm["tags"],
+                tools=fm.get("tools", []),
                 pre=contract.get("pre", {}),
                 post=contract.get("post", {}),
-                procedure=meta.get("procedure", []),
-                dependencies=meta.get("dependencies", []),
-                verification=meta.get("verification", "checklist"),
-                body=body,
+                procedure=fm.get("procedure", []),
+                dependencies=fm.get("dependencies", []),
+                verification=fm.get("verification", "checklist"),
+                body="",
                 path=str(path),
                 files=list_resources(path),
-                external=False,
+                category=fm["category"] or _category(path),
+                related=fm["related"],
+                version=fm["version"],
+                license=fm["license"],
             )
         except Exception as e:
             logger.warning(f"Skill load failed: {path} -> {e}")
@@ -367,6 +416,103 @@ class SkillRegistry:
             return list(self.skills.values())
         return [skill for skill in self.skills.values() if not skill.external]
 
+    def categories(self) -> Dict[str, List[SkillDef]]:
+        grouped: Dict[str, List[SkillDef]] = {}
+        for skill in self.visible():
+            grouped.setdefault(skill.category or "general", []).append(skill)
+        for group in grouped.values():
+            group.sort(key=lambda s: s.name)
+        return grouped
+
+    def related(self, name: str, depth: int = 1) -> List[str]:
+        """Neighbours of a skill, breadth-first, excluding the skill itself."""
+        seen = {name}
+        order: List[str] = []
+        frontier = [name]
+        for _ in range(max(0, depth)):
+            following = []
+            for item in frontier:
+                skill = self.skills.get(item)
+                if not skill:
+                    continue
+                for neighbour in skill.related:
+                    if neighbour in seen:
+                        continue
+                    seen.add(neighbour)
+                    order.append(neighbour)
+                    following.append(neighbour)
+            frontier = [item for item in following if item in self.skills]
+        return [item for item in order if item in self.skills]
+
+    def search(self, tags: list, limit: int = 5) -> List["SkillDef"]:
+        """Skills ranked by name, tag and description overlap with a query."""
+        wanted = set()
+        for tag in tags:
+            words = re.findall(r"[a-z0-9]+", str(tag).lower())
+            wanted.update(words)
+            wanted.add("".join(words))
+        if not wanted:
+            return []
+        ranked = []
+        for skill in self.visible():
+            name_words = set(re.findall(r"[a-z0-9]+", skill.name.lower()))
+            tag_words = set()
+            for tag in skill.tags:
+                words = re.findall(r"[a-z0-9]+", tag.lower())
+                tag_words.update(words)
+                tag_words.add("".join(words))
+            desc_words = set(re.findall(r"[a-z0-9]+", skill.description.lower()))
+            score = 4 * len(wanted & name_words) + 3 * len(wanted & tag_words) + len(wanted & desc_words)
+            score += sum(1 for word in wanted if len(word) >= 4 and any(
+                other.startswith(word) for other in name_words | tag_words))
+            if score:
+                ranked.append((score, skill.name, skill))
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        return [skill for _, _, skill in ranked[:max(1, limit)]]
+
+    @staticmethod
+    def _render_index(skills: List[SkillDef], desc_chars: int, matched: set) -> str:
+        lines, category = [], None
+        for skill in skills:
+            group = skill.category or "general"
+            if group != category:
+                category = group
+                lines.append(f"{group}:")
+            entry = f"  - {skill.name}"
+            if desc_chars and skill.description:
+                entry += ": " + skill.description[:desc_chars]
+            if skill.name in matched:
+                entry += "  [match]"
+            lines.append(entry)
+        return "\n".join(lines)
+
+    def index(self, budget_chars: int = 7000, desc_chars: int = 90,
+              max_skills: int = 150, matched: Optional[set] = None,
+              skills: Optional[List[SkillDef]] = None) -> str:
+        """Category-grouped catalog, degraded instead of cut mid-entry."""
+        matched = set(matched or ())
+        pool = sorted(skills if skills is not None else self.visible(),
+                      key=lambda s: (s.category or "general", s.name))
+        if not pool:
+            return ""
+        head = ("--- SKILL INDEX ---\n"
+                "Load a skill with load_skill(name) when its description matches the task.")
+        budget = max(400, int(budget_chars))
+        shown = pool[:max(1, int(max_skills))]
+        omitted = len(pool) - len(shown)
+        tail = f"\n({omitted} more skills omitted; use find_skill(tags))" if omitted else ""
+        if matched:
+            tail += "\n[match] = relevant to this request; load it before acting."
+        for width in (desc_chars, 40, 0):
+            text = f"{head}\n{self._render_index(shown, width, matched)}{tail}"
+            if len(text) <= budget:
+                return text
+        while shown and len(head) + len(tail) + len(self._render_index(shown, 0, matched)) > budget:
+            shown = shown[:-1]
+        if not shown:
+            return ""
+        return f"{head}\n{self._render_index(shown, 0, matched)}{tail}"
+
     def get_body(self, name: str) -> str:
         """The skill's instructions, read from disk the first time it is used."""
         skill = self.skills.get(name)
@@ -402,6 +548,18 @@ class SkillRegistry:
         skill.tags.append("favorite")
         return f"'{name}' pinned as favorite."
 
+    def aliases(self, name: str) -> List[tuple]:
+        """Foreign tool names a skill mentions, paired with this harness's name."""
+        skill = self.skills.get(name)
+        if not skill or not skill.path:
+            return []
+        try:
+            body = Path(skill.path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return []
+        return [(foreign, local) for foreign, local in TOOL_ALIASES.items()
+                if re.search(r"\b" + re.escape(foreign) + r"\b", body)]
+
     def get_resource(self, name: str, relative: str) -> str:
         """Read one bundled file, confined to the skill's own directory."""
         skill = self.skills.get(name)
@@ -433,19 +591,8 @@ class SkillRegistry:
         return None
 
     def find_by_tags(self, tags: List[str]) -> Optional[SkillDef]:
-        tags_lower = [t.lower() for t in tags]
-        patterns = [re.compile(r'\b' + re.escape(t) + r'\b') for t in tags_lower]
-        for skill in self.visible():
-            name_lower = skill.name.lower()
-            if skill.name.lower() in tags_lower:
-                return skill
-            if any(p.search(name_lower) for p in patterns):
-                return skill
-            if any(p.search(tag.lower()) for tag in skill.tags for p in patterns):
-                return skill
-            if any(p.search(tool.lower()) for tool in skill.tools for p in patterns):
-                return skill
-        return None
+        matches = self.search(tags, limit=1)
+        return matches[0] if matches else None
 
     def reload(self):
         """Drop every skill and rescan, including the external catalog."""

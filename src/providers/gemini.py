@@ -28,6 +28,42 @@ logger = logging.getLogger(__name__)
 
 class Provider(AIProvider):
     META = META
+    NATIVE_TOOLS = True
+
+    @staticmethod
+    def _schema(spec: Dict[str, Any]) -> Dict[str, Any]:
+        """Gemini wants upper-case JSON-schema types and no defaults."""
+        types = {"object": "OBJECT", "string": "STRING", "integer": "INTEGER",
+                 "number": "NUMBER", "boolean": "BOOLEAN", "array": "ARRAY"}
+
+        def clean(value: Any) -> Any:
+            if isinstance(value, dict):
+                out = {}
+                for key, item in value.items():
+                    if key == "default":
+                        continue
+                    out[key] = types.get(item, item) if key == "type" and isinstance(item, str) else clean(item)
+                return out
+            if isinstance(value, list):
+                return [clean(item) for item in value]
+            return value
+
+        return {
+            "name": spec["name"],
+            "description": spec.get("description", ""),
+            "parameters": clean(spec.get("parameters") or {"type": "object", "properties": {}}),
+        }
+
+    def _calls(self, parts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """functionCall parts from a candidate, arguments already objects."""
+        calls = []
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            call = part.get("functionCall") or {}
+            if isinstance(call, dict) and call.get("name"):
+                calls.append({"name": call["name"], "arguments": dict(call.get("args") or {})})
+        return calls
 
     def __init__(self, settings: GeminiSettings):
         if not settings.api_key:
@@ -71,6 +107,8 @@ class Provider(AIProvider):
         }
         if system:
             payload["systemInstruction"] = {"parts": [{"text": system}]}
+        if self.native_tools:
+            payload["tools"] = [{"functionDeclarations": [self._schema(spec) for spec in self.native_tools]}]
         return payload
 
     def _track_usage(self, data: Dict[str, Any]) -> None:
@@ -91,7 +129,8 @@ class Provider(AIProvider):
             )
         parts = (candidates[0].get("content") or {}).get("parts") or []
         content = "".join(str(p.get("text", "")) for p in parts if isinstance(p, dict)).strip()
-        if not content:
+        self.native_calls = self._calls(parts)
+        if not content and not self.native_calls:
             reason = candidates[0].get("finishReason", "unknown")
             raise ProviderError(f"{self.name} returned empty content (finishReason={reason})", retryable=False)
         return content
@@ -106,6 +145,7 @@ class Provider(AIProvider):
 
     async def _stream(self, payload: Dict[str, Any], on_token: Callable[[str], None]) -> str:
         full = ""
+        calls: List[Dict[str, Any]] = []
         async with get_http_client().stream(
             "POST", self._endpoint("streamGenerateContent", True), json=payload
         ) as response:
@@ -131,12 +171,15 @@ class Provider(AIProvider):
                     raise ProviderError(f"{self.name} stream error: {message}", retryable=True, stream_started=True)
                 self._track_usage(event)
                 for candidate in event.get("candidates") or []:
-                    for part in (candidate.get("content") or {}).get("parts") or []:
+                    parts = (candidate.get("content") or {}).get("parts") or []
+                    calls.extend(self._calls(parts))
+                    for part in parts:
                         delta = part.get("text") or ""
                         if delta:
                             full += delta
                             on_token(delta)
-        if not full.strip():
+        self.native_calls = calls
+        if not full.strip() and not self.native_calls:
             raise ProviderError(f"{self.name} streamed empty content", retryable=True)
         return full
 

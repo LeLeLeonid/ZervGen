@@ -130,13 +130,20 @@ class CircuitBreaker:
 _circuit_breaker = CircuitBreaker()
 
 
+#: Providers whose wire format carries native tool definitions.
+NATIVE_TOOL_PROVIDERS = {"openai", "anthropic", "gemini", "google", "openrouter"}
+
+
 class AIProvider:
     name = ""
     META = None
+    NATIVE_TOOLS = False
 
     def __init__(self, base_url: str, api_key: str = "", model: str = "", headers: Optional[Dict[str, str]] = None, timeout: float = 30.0):
         self.base_url = (base_url or "").rstrip("/")
         self.api_key = api_key or ""
+        self.native_tools: List[Dict[str, Any]] = []
+        self.native_calls: List[Dict[str, Any]] = []
         self.headers = dict(headers) if headers is not None else {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -148,6 +155,7 @@ class AIProvider:
     def _reset_usage(self) -> None:
         self._last_usage: Dict[str, Any] = {}
         self._last_cost = 0.0
+        self.native_calls: List[Dict[str, Any]] = []
 
     def _preflight(self) -> None:
         self._reset_usage()
@@ -175,6 +183,10 @@ class AIProvider:
 
     async def generate_text(self, history: List[Dict], system_prompt: str, on_token: callable = None) -> str:
         raise NotImplementedError
+
+    @property
+    def supports_native_tools(self) -> bool:
+        return bool(getattr(self, "NATIVE_TOOLS", False)) or str(self.name) in NATIVE_TOOL_PROVIDERS
 
     async def close(self) -> None:
         pass

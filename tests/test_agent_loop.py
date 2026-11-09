@@ -171,3 +171,81 @@ def test_trace_bus_drops_duplicate_within_step(tmp_path, monkeypatch, capsys):
     bus.step(2)
     bus.emit("state", "t", "same")
     assert len(capsys.readouterr().out.strip().splitlines()) == 1
+
+
+def test_xml_tool_call_runs_through_the_same_loop(tmp_path, monkeypatch):
+    (tmp_path / "note.txt").write_text("hello", encoding="utf-8")
+    agent = _agent(tmp_path, monkeypatch,
+                   ['<tool name="read_file" path="note.txt"/>', "Read it."])
+    output = asyncio.run(agent.run("read note"))
+    assert output == "Read it."
+    assert [c.name for c in agent._run.tool_calls] == ["read_file"]
+
+
+def test_positional_shorthand_binds_tool_parameters(tmp_path, monkeypatch):
+    (tmp_path / "note.txt").write_text("hello", encoding="utf-8")
+    agent = _agent(tmp_path, monkeypatch, ['::read_file("note.txt", 0, 5)', "Read it."])
+    asyncio.run(agent.run("read note"))
+    call = agent._run.tool_calls[0]
+    assert call.name == "read_file"
+    assert call.arguments == {"path": "note.txt", "offset": 0, "max_chars": 5}
+
+
+def test_shorthand_response_ends_the_turn_without_a_tool_row(tmp_path, monkeypatch):
+    agent = _agent(tmp_path, monkeypatch, ["::response(text=\"final\")"])
+    output = asyncio.run(agent.run("answer now"))
+    assert output == "final"
+    assert [c.name for c in agent._run.tool_calls] == []
+
+
+class NativeProvider:
+    name = "fake"
+    supports_native_tools = True
+
+    def __init__(self, replies, calls):
+        self.replies = list(replies)
+        self.scripted = list(calls)
+        self.native_tools = []
+        self.native_calls = []
+        self._last_cost = 0.0
+        self.calls = 0
+
+    async def generate_text(self, history, system_prompt, on_token=None):
+        self.calls += 1
+        self.native_calls = self.scripted.pop(0) if self.scripted else []
+        return self.replies.pop(0) if self.replies else ""
+
+
+def test_native_calls_enter_the_same_dispatch(tmp_path, monkeypatch):
+    (tmp_path / "note.txt").write_text("hello", encoding="utf-8")
+    agent = _agent(tmp_path, monkeypatch, [])
+    agent.provider = NativeProvider(
+        ["", "Read note.txt (5 chars)."],
+        [[{"name": "read_file", "arguments": {"path": "note.txt"}}]],
+    )
+    agent.settings.tool_protocol = "native"
+    output = asyncio.run(agent.run("read note"))
+    assert output == "Read note.txt (5 chars)."
+    names = [c.name for c in agent._run.tool_calls]
+    assert "read_file" in names
+    assert agent.provider.native_tools
+
+
+def test_ptc_protocol_sends_no_native_tools(tmp_path, monkeypatch):
+    agent = _agent(tmp_path, monkeypatch, ["done"])
+    agent.provider = NativeProvider(["done"], [])
+    agent.settings.tool_protocol = "ptc"
+    asyncio.run(agent.run("hi"))
+    assert agent.provider.native_tools == []
+
+
+def test_prompt_reports_degraded_server_with_cached_tools(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    agent = _agent(tmp_path, monkeypatch, [])
+    agent.settings.prompt_show_mcp_tools = True
+    agent._mcp = SimpleNamespace(servers={"alpha": SimpleNamespace(
+        state="degraded", connected=False, tools={"search": object(), "add": object()})})
+    text = agent._prompt_mcp()
+    assert "alpha: degraded (2 cached tools)" in text
+    assert "mcp_execute" in text

@@ -23,8 +23,17 @@ ANTHROPIC_VERSION = "2023-06-01"
 MAX_TOKENS = 8192
 
 
+def _decode(raw: str) -> Dict[str, Any]:
+    try:
+        value = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 class Provider(AIProvider):
     META = META
+    NATIVE_TOOLS = True
 
     def __init__(self, settings: AnthropicSettings):
         if not settings.api_key:
@@ -64,6 +73,13 @@ class Provider(AIProvider):
         }
         if system:
             payload["system"] = system
+        if self.native_tools:
+            payload["tools"] = [
+                {"name": spec["name"], "description": spec.get("description", ""),
+                 "input_schema": spec.get("parameters") or {"type": "object", "properties": {}}}
+                for spec in self.native_tools
+            ]
+            payload["tool_choice"] = {"type": "auto"}
         return payload
 
     def _track_usage(self, usage: Dict[str, Any]) -> None:
@@ -76,20 +92,31 @@ class Provider(AIProvider):
     def _content(self, blocks: List[Dict[str, Any]]) -> str:
         return "".join(str(block.get("text", "")) for block in blocks if isinstance(block, dict)).strip()
 
+    def _calls(self, blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Tool calls from the assistant content blocks."""
+        return [
+            {"name": block["name"], "arguments": block.get("input") or {}}
+            for block in blocks
+            if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name")
+        ]
+
     async def _non_stream(self, payload: Dict[str, Any]) -> str:
         response = await get_http_client().post(self.base_url, headers=self.headers, json=payload)
         raise_for_status(response, self.name)
         data = response.json()
         if data.get("type") == "error":
             raise ProviderError(f"{self.name} error: {data.get('error')}", retryable=True)
-        content = self._content(data.get("content") or [])
-        if not content:
+        blocks = data.get("content") or []
+        content = self._content(blocks)
+        self.native_calls = self._calls(blocks)
+        if not content and not self.native_calls:
             raise ProviderError(f"{self.name} returned empty content", retryable=False)
         self._track_usage(data.get("usage") or {})
         return content
 
     async def _stream(self, payload: Dict[str, Any], on_token: Callable[[str], None]) -> str:
         full = ""
+        blocks: Dict[int, Dict[str, Any]] = {}
         async with get_http_client().stream("POST", self.base_url, headers=self.headers, json=payload) as response:
             if response.status_code != 200:
                 body = (await response.aread()).decode(errors="replace")[:300]
@@ -113,12 +140,23 @@ class Provider(AIProvider):
                     self._track_usage((event.get("message") or {}).get("usage") or {})
                 elif event_type == "message_delta":
                     self._track_usage(event.get("usage") or {})
+                elif event_type == "content_block_start":
+                    block = event.get("content_block") or {}
+                    if block.get("type") == "tool_use":
+                        blocks[int(event.get("index") or 0)] = {"name": block.get("name", ""), "json": ""}
                 elif event_type == "content_block_delta":
-                    text = (event.get("delta") or {}).get("text") or ""
+                    delta = event.get("delta") or {}
+                    if delta.get("type") == "input_json_delta":
+                        slot = blocks.setdefault(int(event.get("index") or 0), {"name": "", "json": ""})
+                        slot["json"] += delta.get("partial_json") or ""
+                        continue
+                    text = delta.get("text") or ""
                     if text:
                         full += text
                         on_token(text)
-        if not full.strip():
+        self.native_calls = [{"name": item["name"], "arguments": _decode(item["json"])}
+                             for item in blocks.values() if item["name"]]
+        if not full.strip() and not self.native_calls:
             raise ProviderError(f"{self.name} streamed empty content", retryable=True)
         return full
 

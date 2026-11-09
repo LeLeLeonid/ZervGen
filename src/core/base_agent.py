@@ -12,7 +12,7 @@ import sys
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
@@ -20,7 +20,7 @@ from src.config import MODES, GlobalSettings, load_config, ZG_PROTOCOL
 from src.core.memory import memory_core
 from src.core.provider import AIProvider, get_provider
 from src.skills_loader import load_role, SkillEngine
-from src.tools import TOOL_REGISTRY, current_agent, shell_exec, _mcp_schema, _schema_signature, _schema_doc
+from src.tools import TOOL_REGISTRY, current_agent, shell_exec, _mcp_schema, _schema_signature, _schema_doc, _native_tool_schemas
 from src.utils import get_system_context, sanitize_for_prompt, generate_random_delimiter, count_tokens, add_global_tokens, add_provider_tokens, ContextCompressor, ModelCatalog, safe_run, GitManager, truncate_to_tokens, context_ceiling
 from src.core.runtime import (
     Run, ToolCall, ToolResult, Artifact, RunStatus, Task,
@@ -153,14 +153,18 @@ class StemAgent:
         self._tripwire_errors: Dict[str, int] = {}
         self._terminal_calls: set[str] = set()
         self._task_query = ""
+        self._sensor_attempts = 0
         self._last_streamed = False
         self._last_streamed_text = ""
+        self._answer_painted = False
+        self._status_base = ""
         self._background_tasks: set[asyncio.Task] = set()
         self.trace = TraceBus(
             role=name,
             enabled=bool(getattr(self.settings, "trace_enabled", True)),
             capture_chars=int(getattr(self.settings, "trace_capture_chars", 2000) or 2000),
         )
+        self.trace.paint = not silent
         self._load_tools()
         self.tools["set_mode"] = self._tool_set_mode
         self._runtime = None
@@ -283,7 +287,9 @@ class StemAgent:
         if self.skill_name == "system" or "all" in allowed:
             allowed = set(TOOL_REGISTRY.keys())
         else:
-            allowed.update({"response", "load_skill", "find_skill", "search_memory", "search_tgs", "list_skills", "list_mcp_servers", "set_external_skills"})
+            allowed.update({"response", "load_skill", "find_skill", "search_skill_hub", "install_skill",
+                            "search_memory", "search_tgs", "list_skills", "list_mcp_servers",
+                            "set_external_skills", "scan_tools"})
         self.tools = {k: v for k, v in TOOL_REGISTRY.items() if k in allowed}
 
     def _mcp_tools(self) -> Dict[str, Any]:
@@ -308,6 +314,42 @@ class StemAgent:
         if self.mode == "BUILD":
             return tools
         return {k: v for k, v in tools.items() if k not in write_set}
+
+    def _tool_specs(self) -> Dict[str, Any]:
+        """Active tool callables, keyed by public name (for argument binding)."""
+        return {name: func for name, func in self._active_tools().items()
+                if name not in TERMINAL_TOOLS}
+
+    def _native_specs(self) -> List[Dict[str, Any]]:
+        """Canonical tool descriptions, or [] when the wire stays text-only.
+
+        ``auto`` only opts known tool-capable backends in: a third-party
+        OpenAI-compatible preset may reject ``tools`` outright, and failing
+        every turn is worse than using shorthand there.
+        """
+        protocol = str(getattr(self.settings, "tool_protocol", "auto") or "auto").lower()
+        if protocol not in ("native", "auto") or self.provider is None:
+            return []
+        if not getattr(self.provider, "supports_native_tools", False):
+            return []
+        if protocol == "auto":
+            from src.core.provider import NATIVE_TOOL_PROVIDERS
+            if str(getattr(self.provider, "name", "")) not in NATIVE_TOOL_PROVIDERS:
+                return []
+        return _native_tool_schemas(self._tool_specs())
+
+    @staticmethod
+    def _native_markup(calls: Iterable[Dict[str, Any]]) -> str:
+        """Native calls re-enter the loop as the shorthand it already parses."""
+        lines = []
+        for call in calls:
+            name = str(call.get("name") or "").strip()
+            if not name:
+                continue
+            args = call.get("arguments")
+            arguments = args if isinstance(args, dict) else {}
+            lines.append(f"::tool {name} {json.dumps(arguments, ensure_ascii=False)}")
+        return "\n".join(lines)
 
     async def _response_verb(self, text: Optional[str] = None) -> str:
         """End the turn with a user-facing answer. Never reaches ToolRuntime."""
@@ -355,6 +397,8 @@ class StemAgent:
             from src.core.mcp_manager import MCPManager
             self._mcp = MCPManager(self.settings)
             self._mcp_initialized = True
+            if getattr(self.settings, "mcp_connect_on_start", True):
+                await self._mcp.connect_all()
         except Exception as e:
             logger.warning(f"MCP init failed (will retry): {e}")
 
@@ -393,6 +437,7 @@ class StemAgent:
     
     def invalidate_cache(self):
         self._cached_system_prompt = None
+        self._prompt_hash = None
 
     async def request_permission(self, question: str, details: str = "", default: bool = False) -> bool:
         mode = getattr(self.settings, "permission_mode", "ASK")
@@ -538,10 +583,12 @@ class StemAgent:
         for name, srv in self._mcp.servers.items():
             if srv.connected:
                 active.append(f"- {name}: {len(srv.tools)} tools")
+            elif srv.state in ("degraded", "dead"):
+                active.append(f"- {name}: {srv.state} ({len(srv.tools)} cached tools) — call mcp_execute to retry")
         return "--- MCP ---\n" + "\n".join(active) if active else ""
 
     def _prompt_skills(self, user_input: str) -> str:
-        """Skill catalog: names and descriptions only; bodies load on demand."""
+        """Skill topology: a category-grouped index; bodies load on demand."""
         try:
             from src.skills_loader import skill_index
             show_internal = bool(getattr(self.settings, "prompt_show_internal_skills"))
@@ -550,41 +597,31 @@ class StemAgent:
             auto_external = bool(getattr(self.settings, "prompt_auto_trigger_external_skills"))
             limit = max(1, int(getattr(self.settings, "prompt_max_skills", 150) or 150))
             desc_chars = max(20, int(getattr(self.settings, "prompt_skill_description_chars", 90) or 90))
-            visible = skill_index.visible()
-            sections = []
-            if auto_internal or auto_external:
-                seen = self.memory._triggered_this_session if self.memory else set()
-                for skill in visible:
-                    if skill.name in seen or not skill.match_trigger(user_input):
-                        continue
-                    if skill.external and not auto_external:
-                        continue
-                    if not skill.external and not auto_internal:
-                        continue
-                    body = skill_index.get_body(skill.name)
-                    if not body.startswith("Error:"):
-                        sections.append(f"--- TRIGGERED SKILL: {skill.name} ---\n{body}")
-                    if self.memory:
-                        self.memory._triggered_this_session.add(skill.name)
-            names = []
-            for skill in visible:
-                if skill.external and not show_external:
-                    continue
-                if not skill.external and not show_internal:
-                    continue
-                names.append(f"- {skill.name}: {skill.description[:desc_chars]}")
-            if len(names) > limit:
-                names = names[:limit] + [f"- [{len(names) - limit} more skills omitted; use find_skill(tags)]"]
-            if names:
-                sections.append(
-                    "--- SKILL INDEX ---\n"
-                    "Load a skill with load_skill(name) only when its description matches the task.\n"
-                    + "\n".join(names)
-                )
-            return "\n\n".join(sections)
+            budget = max(500, int(getattr(self.settings, "prompt_skills_chars", 7000) or 7000))
+            visible = [
+                skill for skill in skill_index.visible()
+                if (show_external if skill.external else show_internal)
+            ]
+            matched = {
+                skill.name for skill in visible
+                if (auto_external if skill.external else auto_internal)
+                and skill.match_trigger(user_input)
+            }
+            return skill_index.index(
+                budget_chars=budget, desc_chars=desc_chars, max_skills=limit,
+                matched=matched, skills=[s for s in visible if s.category],
+            )
         except Exception as e:
             logger.debug("Prompt skills failed: %s", e)
             return ""
+
+    def _prompt_protocol(self) -> str:
+        """Execution protocol; native backends get the tool-first variant."""
+        text = ZG_PROTOCOL.strip()
+        if self._native_specs():
+            text += ("\n- Native tool calls are enabled: call a tool directly and end with a plain answer."
+                     " Do not print the call as text.")
+        return f"--- EXECUTION PROTOCOL ---\n{text}"
 
     def _prompt_tools(self, declared_names: set[str] | None = None) -> str:
         active = self._active_tools()
@@ -606,37 +643,30 @@ class StemAgent:
             return ""
 
     def _build_system_prompt(self, role_cfg, include_roles: bool = False, user_input: str = "") -> str:
-        header = self._prompt_header(role_cfg)
-        run_info = self._prompt_run()
-        ctx = f"--- CONTEXT ---\n{get_system_context()}"
-        tools_schema = self._prompt_tools()
-        protocol = f"--- EXECUTION PROTOCOL ---\n{ZG_PROTOCOL.strip()}"
-        mcp_tools = self._prompt_mcp()
-        mem_text = truncate_to_tokens(self._prompt_memory(user_input), 750, "\n[Memory truncated]")
-        peer_text = truncate_to_tokens(self._prompt_peer_cards(user_input), 500, "\n[Peer cards truncated]")
-        skill_chars = max(500, int(getattr(self.settings, "prompt_skills_chars", 7000) or 7000))
-        skills_text = self._prompt_skills(user_input)[:skill_chars]
-        rules_text = truncate_to_tokens(self._prompt_project_rules(), 1500, "\n[Project rules truncated]")
         sections = [
-            header,
-            run_info,
-            ctx,
-            mem_text,
-            peer_text,
-            mcp_tools,
-            skills_text,
-            tools_schema,
-            rules_text,
-            protocol,
+            ("header", self._prompt_header(role_cfg), 0),
+            ("run", self._prompt_run(), 1),
+            ("protocol", self._prompt_protocol(), 0),
+            ("rules", truncate_to_tokens(self._prompt_project_rules(), 1500, "\n[Project rules truncated]"), 2),
+            ("tools", self._prompt_tools(), 3),
+            ("skills", self._prompt_skills(user_input), 4),
+            ("mcp", self._prompt_mcp(), 5),
+            ("memory", truncate_to_tokens(self._prompt_memory(user_input), 750, "\n[Memory truncated]"), 6),
+            ("peers", truncate_to_tokens(self._prompt_peer_cards(user_input), 500, "\n[Peer cards truncated]"), 7),
+            ("context", f"--- CONTEXT ---\n{get_system_context()}", 8),
         ]
-        prompt = "\n\n".join(s for s in sections if s)
+        prompt = "\n\n".join(text for _, text, _ in sections if text)
         cap = int(getattr(self.settings, "prompt_max_chars", 0) or 0)
         if cap and len(prompt) > cap:
-            for idx in (9, 8, 7, 6, 5, 4):
+            dropped: set[str] = set()
+            for name, text, priority in sorted(sections, key=lambda s: -s[2]):
                 if len(prompt) <= cap:
                     break
-                sections[idx] = ""
-                prompt = "\n\n".join(s for s in sections if s)
+                if not text or name in dropped or priority < 1:
+                    continue
+                dropped.add(name)
+                prompt = "\n\n".join(t for n, t, _ in sections if t and n not in dropped)
+                self.trace.record("prompt_drop", self.name, f"{name} ({len(text)} chars)")
             if len(prompt) > cap:
                 prompt = prompt[:cap] + "\n[System prompt truncated]"
         self._prompt_obj_ref = prompt
@@ -682,6 +712,11 @@ class StemAgent:
                 path = str(args.get("path", ""))
                 if path:
                     self._run.artifacts.append(Artifact(path=path))
+                    if getattr(self.settings, "sensors_enabled", True):
+                        problem = self._check_file(Path(path))
+                        if problem:
+                            self.trace.record("sensor", self.name, problem)
+                            output = f"{output}\nSENSOR: {problem}".strip()
             if tool_name in ("read_file", "fetch_url") and output and len(output) <= 500_000:
                 try:
                     d = Path("tmp/trace")
@@ -934,16 +969,29 @@ class StemAgent:
     def _live_thought(self, text: str):
         self._set_status(True, f"▶ {text}")
 
+    def _streamed_answer(self, answer: str) -> bool:
+        """Whether the final turn's stream already painted this answer."""
+        if not self._last_streamed or not answer:
+            return False
+        streamed = " ".join(self._last_streamed_text.split())
+        head = " ".join(answer.split())[:200]
+        return bool(head) and head in streamed
+
     def _set_status(self, enabled: bool, label: str = "") -> None:
         if self._silent:
             return
         cb = getattr(self, "status_cb", None)
         if cb:
-            cb(label if (enabled and label) else ("thinking..." if enabled else ""))
+            if not enabled:
+                cb("")
+            elif label:
+                cb(label)
+            else:
+                cb(getattr(self, "_status_base", "") or "thinking...")
             return
         if enabled:
             if self._status is None:
-                self._status = console.status("", spinner="dots")
+                self._status = console.status(getattr(self, "_status_base", ""), spinner="dots")
                 self._status.__enter__()
         else:
             if self._status is not None:
@@ -969,6 +1017,7 @@ class StemAgent:
             self._set_status(False)
             console.print(Panel(Text(full_prompt), title="[purple]INPUT[/purple]"))
         response = None
+        self.provider.native_tools = self._native_specs()
         try:
             if use_streaming:
                 self._set_status(False)
@@ -995,10 +1044,16 @@ class StemAgent:
             p_name = self.provider.name if hasattr(self.provider, 'name') else (self.provider.META.name if hasattr(self.provider, 'META') else self.settings.provider)
             _record_failure(p_name)
             raise
-        response = response.strip()
-        self._emit_run("model_output", self.name, "llm", "received", output=response[:2000])
+        response = (response or "").strip()
         if response.startswith(delim) and response.endswith(delim):
             response = response[len(delim):-len(delim)].strip()
+        native = list(getattr(self.provider, "native_calls", []) or [])
+        if native:
+            known = set(self._active_tools()) | TERMINAL_TOOLS
+            markup = self._native_markup(call for call in native if call.get("name") in known)
+            if markup:
+                response = f"{response}\n{markup}".strip() if response else markup
+        self._emit_run("model_output", self.name, "llm", "received", output=response[:2000])
         in_tok, out_tok = count_tokens(self.history, response)
         add_global_tokens(in_tok + out_tok)
         if self.provider:
@@ -1014,15 +1069,85 @@ class StemAgent:
         return response
 
     async def _run_verification_sensors(self) -> str:
+        failures = [self._file_sensor_failures()]
         commands = list(getattr(self.settings, "verification_commands", []) or [])
-        if self.mode != "BUILD" or not commands or "shell" not in self._active_tools():
+        if self.mode == "BUILD" and commands and "shell" in self._active_tools():
+            for command in commands:
+                result = await shell_exec(command)
+                if not result.ok:
+                    failures.append(f"{command}: {result.to_text()}")
+        return "\n".join(failure for failure in failures if failure)
+
+    def _file_sensor_failures(self) -> str:
+        """Compile or parse every artifact this run wrote; report what broke."""
+        if not getattr(self, "_run", None) or not getattr(self.settings, "sensors_enabled", True):
             return ""
-        failures = []
-        for command in commands:
-            result = await shell_exec(command)
-            if not result.ok:
-                failures.append(f"{command}: {result.to_text()}")
+        failures, seen = [], set()
+        for artifact in self._run.artifacts:
+            if artifact.path in seen:
+                continue
+            seen.add(artifact.path)
+            reason = self._check_file(Path(artifact.path))
+            if reason:
+                failures.append(reason)
         return "\n".join(failures)
+
+    @staticmethod
+    def _check_file(path: Path) -> str:
+        """Computational check for one written file: exists and parses."""
+        try:
+            if not path.is_file():
+                return f"{path}: missing"
+            suffix = path.suffix.lower()
+            if suffix == ".py":
+                compile(path.read_text(encoding="utf-8"), str(path), "exec")
+            elif suffix == ".json":
+                json.loads(path.read_text(encoding="utf-8"))
+            elif suffix in (".yaml", ".yml"):
+                try:
+                    import yaml
+                except ImportError:
+                    return ""
+                yaml.safe_load(path.read_text(encoding="utf-8"))
+        except SyntaxError as e:
+            return f"{path}:{e.lineno}: {e.msg}"
+        except json.JSONDecodeError as e:
+            return f"{path}:{e.lineno}: invalid JSON: {e.msg}"
+        except Exception as e:
+            return f"{path}: {type(e).__name__}: {e}"
+        return ""
+
+    async def _verify_or_repair(self) -> Tuple[bool, Optional[str]]:
+        """Run sensors. Returns (handled, terminal): a repair turn was queued, or the run ended."""
+        failures = await self._run_verification_sensors()
+        if not failures:
+            self._sensor_attempts = 0
+            return False, None
+        self._sensor_attempts = getattr(self, "_sensor_attempts", 0) + 1
+        limit = max(1, int(getattr(self.settings, "sensor_max_attempts", 3) or 3))
+        self._record_incident(failures)
+        if self._sensor_attempts >= limit:
+            packet = (f"DECISION REQUIRED: verification still fails after {self._sensor_attempts} attempts.\n"
+                      f"{failures[:1000]}\nSafest default: stop and report the failure.")
+            self._log(self.name, packet, "sensor", self.mode)
+            return True, self._finish(RunStatus.FAILED, packet)
+        self._log(self.name, failures, "sensor", self.mode)
+        self.history.append({"role": "user", "content":
+                             f"Verification failed:\n{failures[:2000]}\nFix the failure and verify again."})
+        self.invalidate_cache()
+        return True, None
+
+    def _record_incident(self, failures: str) -> None:
+        """Append the failure to tmp/state/incidents.jsonl so it is never re-derived."""
+        try:
+            path = Path("tmp/state/incidents.jsonl")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"ts": round(time.time(), 3), "agent": self.name,
+                                         "attempt": getattr(self, "_sensor_attempts", 0),
+                                         "failures": failures[:2000]}, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
 
     def _finish(self, status: RunStatus, message: str) -> str:
         """Close the run with a terminal status exactly once."""
@@ -1030,10 +1155,28 @@ class StemAgent:
             final = self.coordinator.finish(status, self._run)
             if final is not None:
                 self._emit_run("run_end", self.name, status=final.value, output=message)
+            self._record_run_summary(status, message)
         self.trace.close()
         self._set_status(False)
         self._score_recalled_memory(status)
         return message
+
+    def _record_run_summary(self, status: RunStatus, message: str) -> None:
+        """One line per finished run in tmp/state/runs.jsonl."""
+        run = self._run
+        try:
+            path = Path("tmp/state/runs.jsonl")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            duration = round((run.ended_at or time.time()) - run.created_at, 2)
+            record = {"run_id": run.id, "parent_id": run.parent_run_id, "agent": self.name,
+                      "status": status.value, "steps": run.budget.steps,
+                      "tools": len(run.tool_calls), "cost_usd": round(float(run.metadata.get("cost_usd", 0.0)), 6),
+                      "duration_s": duration, "goal": (run.goal or "")[:120],
+                      "answer_chars": len(message or "")}
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
 
     def _score_recalled_memory(self, status: RunStatus) -> None:
         """Feed the task outcome back into the facts this run recalled."""
@@ -1050,14 +1193,13 @@ class StemAgent:
         self._response_called = False
         self._repeat_count = 0
         self._last_stable_result = None
-        sensor_error = await self._run_verification_sensors()
-        if sensor_error:
-            self._log(self.name, sensor_error, "state", self.mode)
-            self.history.append({"role": "user", "content": f"Verification failed:\n{sensor_error}\nFix the failure and verify again."})
-            self.invalidate_cache()
+        queued, terminal = await self._verify_or_repair()
+        if terminal is not None:
+            return terminal
+        if queued:
             return None
         answer = self._response_value or ""
-        self.trace.answer(answer or "(empty)")
+        self.trace.answer(answer or "(empty)", streamed=self._streamed_answer(answer))
         if answer and (not self.history or self.history[-1].get("content") != answer):
             self.history.append({"role": "assistant", "content": answer})
         return self._finish(RunStatus.DONE, answer)
@@ -1094,10 +1236,13 @@ class StemAgent:
         self.invalidate_cache()
         self._response_called = False
         self._response_value = ""
+        self._answer_painted = False
         self._set_status(True)
         self._run = Run.create(task, self.name, max_steps=max_steps, parent_run_id=getattr(getattr(self, "_parent_run", None), "id", None))
         self._run.status = RunStatus.RUNNING
         self.trace.bind(self._run.id)
+        self.trace.paint = not self._silent
+        self.trace.paint = not self._silent
         self.coordinator.begin()
         self._runtime = self._build_runtime()
         self._run.budget.max_tool_calls = getattr(self.settings, "max_tool_calls", 200)
@@ -1131,6 +1276,17 @@ class StemAgent:
                 if self._cached_system_prompt is None:
                     role_cfg = load_role(self.skill_name) or load_role("system")
                     self._cached_system_prompt = self._build_system_prompt(role_cfg, include_roles=self.skill_name == "system", user_input=task)
+                    self._prompt_hash = hashlib.sha1(self._cached_system_prompt.encode("utf-8", "replace")).hexdigest()[:12]
+                tokens = count_tokens(self.history, "")[0]
+                cost = float(self._run.metadata.get("cost_usd", 0.0) or 0.0)
+                self.trace.emit(
+                    "step", self.name,
+                    f"step {step}/{max_steps} · {tokens:,} ctx · ${cost:.4f}",
+                    prompt_hash=self._prompt_hash, prompt_chars=len(self._cached_system_prompt or ""),
+                    history_tokens=tokens, cost_usd=round(cost, 6),
+                )
+                self._status_base = f"step {step}/{max_steps} · {tokens:,} ctx · ${cost:.4f}"
+                self._set_status(True)
                 response = None
                 attempt = 0
                 while response is None:
@@ -1174,7 +1330,8 @@ class StemAgent:
                             self._log(self.name, f"{type(e).__name__}: {e}\n{traceback.format_exc()[-800:]}", "ptc_error", self.mode)
                             return self._finish(RunStatus.FAILED, f"Error: {e}")
                 # One decision per turn: what does this message ask the loop to do?
-                intent = parse_turn(response, set(self._active_tools()) | TERMINAL_TOOLS)
+                specs = self._tool_specs()
+                intent = parse_turn(response, set(specs) | TERMINAL_TOOLS, specs)
                 if intent.source == "auto-ptc" and not getattr(self.settings, "ptc_auto_detect", True):
                     intent = TurnIntent("answer", answer=response.strip(), prose=response.strip(),
                                         raw=response, source="prose")
@@ -1265,7 +1422,7 @@ class StemAgent:
                         self.history.append({"role": "assistant", "content": f"{call.name} -> {result}"})
                 clean_response = (intent.answer or "").strip()
                 if intent.source == "prose":
-                    clean_response = strip_ptc(clean_response)
+                    clean_response = strip_ptc(clean_response, set(specs))
                 if not clean_response.strip():
                     self._empty_count = getattr(self, "_empty_count", 0) + 1
                     if self._empty_count >= 3:
@@ -1273,13 +1430,12 @@ class StemAgent:
                         self.history.append({"role": "user", "content": "[LOOP] Emit a ```python block or a final answer now."})
                     self.invalidate_cache()
                     continue
-                sensor_error = await self._run_verification_sensors()
-                if sensor_error:
-                    self._log(self.name, sensor_error, "state", self.mode)
-                    self.history.append({"role": "user", "content": f"Verification failed:\n{sensor_error}\nFix the failure and verify again."})
-                    self.invalidate_cache()
+                queued, terminal = await self._verify_or_repair()
+                if terminal is not None:
+                    return terminal
+                if queued:
                     continue
-                self.trace.answer(clean_response)
+                self.trace.answer(clean_response, streamed=self._streamed_answer(clean_response))
                 self.history.append({"role": "assistant", "content": clean_response})
                 if not self._is_delegated and self._memory_on and len(clean_response) > 20:
                     task = asyncio.create_task(self.memory.add_memory(f"TASK: {task[:250]} => OUTCOME: {clean_response[:250]}", category="lesson", tier="recent", source="auto"))

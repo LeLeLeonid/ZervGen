@@ -635,17 +635,27 @@ async def find_skill(tags) -> str:
     else:
         tags = [str(tags).lower()]
     if not tags or "*" in tags or "all" in tags:
-        return json.dumps([{"name": s.name, "description": s.description} for s in visible])
-    skill = skill_index.find_by_tags(tags)
-    if skill:
-        return json.dumps({"name": skill.name, "description": skill.description, "external": skill_index.is_external(skill.name)})
-    return "Error: No matching skill found"
+        return json.dumps([{"name": s.name, "category": s.category, "description": s.description}
+                           for s in visible])
+    matches = skill_index.search(tags, limit=5)
+    if not matches:
+        return "Error: No matching skill found"
+    return json.dumps([
+        {"name": skill.name, "category": skill.category,
+         "description": skill.description, "tags": skill.tags[:6],
+         "related": skill.related[:5], "external": skill_index.is_external(skill.name)}
+        for skill in matches
+    ])
 
 
 async def list_skills() -> str:
     from src.skills_loader import skill_index, get_all_roles
     roles = ", ".join(get_all_roles().keys())
-    skills = ", ".join(s.name for s in skill_index.visible())
+    groups = skill_index.categories()
+    skills = "\n".join(
+        f"{category}: " + ", ".join(skill.name for skill in members)
+        for category, members in sorted(groups.items())
+    )
     out = []
     if roles:
         out.append(f"Agents:\n{roles}")
@@ -675,6 +685,17 @@ async def load_skill(name: str, file: str = "") -> str:
     if skill.files:
         shown = ", ".join(skill.files[:20])
         head += f"\nBundled files (load_skill(name, file=...)): {shown}"
+    if skill.category:
+        head += f"\nCategory: {skill.category}"
+    if skill.license:
+        head += f"\nLicense: {skill.license}"
+    related = skill_index.related(name)
+    if related:
+        head += f"\nRelated skills: {', '.join(related)}"
+    aliases = skill_index.aliases(name)
+    if aliases:
+        head += "\nTool names in this skill: " + ", ".join(
+            f"{foreign} -> {local}" for foreign, local in aliases)
     return f"{head}\n{body}"
 
 
@@ -692,6 +713,86 @@ async def add_favorite(skill_name: str) -> str:
     from src.skills_loader import skill_index
 
     return skill_index.pin(skill_name)
+
+
+# ─── SKILL HUB ────────────────────────────────────────────────────────────────
+
+SKILL_HUB_URL = "https://skills.sh/api/search"
+SKILL_RAW_URL = "https://raw.githubusercontent.com/{source}/HEAD/{path}"
+SKILL_GUARD = (
+    (r"curl[^\n|]*\|\s*(?:ba)?sh", "pipes a download into a shell"),
+    (r"wget[^\n|]*\|\s*(?:ba)?sh", "pipes a download into a shell"),
+    (r"rm\s+-rf\s+/(?:\s|$)", "deletes the filesystem root"),
+    (r"chmod\s+777", "makes a file world-writable"),
+    (r"(?:API_KEY|TOKEN|SECRET|PASSWORD)\w*\s*=\s*['\"][^'\"]{8,}", "hardcodes a secret"),
+    (r"~/?\.(?:ssh|aws|gnupg)/", "reads private credentials"),
+    (r"\b(?:eval|exec)\s*\(\s*base64", "runs obfuscated code"),
+)
+SKILL_FETCH_PATHS = ("skills/{slug}/SKILL.md", "{slug}/SKILL.md",
+                     "src/skills/{slug}/SKILL.md", "SKILL.md")
+
+
+def _skill_guard(text: str) -> str:
+    """Reason a skill body is unsafe to install, or an empty string."""
+    for pattern, reason in SKILL_GUARD:
+        if re.search(pattern, text, re.IGNORECASE):
+            return reason
+    return ""
+
+
+async def search_skill_hub(query: str, limit: int = 8) -> str:
+    """Search the public skills.sh index; install with install_skill(id)."""
+    try:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            response = await client.get(SKILL_HUB_URL, params={"q": query, "limit": max(1, min(50, limit))})
+            response.raise_for_status()
+            hits = response.json().get("skills") or []
+    except Exception as e:
+        return f"Error: skill hub unavailable: {e}"
+    if not hits:
+        return f"No skills found for '{query}'."
+    lines = [f"{h.get('id')}  [{h.get('installs', 0)} installs]  {h.get('source', '')}" for h in hits]
+    return "\n".join(lines) + "\nInstall one with install_skill(skill_id)."
+
+
+async def install_skill(skill_id: str, enable: bool = False) -> str:
+    """Install a skill from skills.sh into ~/.zervgen/skills after a safety scan."""
+    from src.config import load_config
+    from src.skills_loader import _parse_frontmatter, skill_index
+
+    parts = skill_id.strip().strip("/").split("/")
+    if len(parts) < 3:
+        return "Error: skill id must look like owner/repo/skill."
+    source, slug = "/".join(parts[:2]), parts[-1]
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+        body = ""
+        for path in SKILL_FETCH_PATHS:
+            url = SKILL_RAW_URL.format(source=source, path=path.format(slug=slug))
+            try:
+                response = await client.get(url)
+            except Exception:
+                continue
+            if response.status_code == 200 and response.text.startswith("---"):
+                body = response.text
+                break
+    if not body:
+        return f"Error: could not fetch '{skill_id}' from {source}."
+    if _parse_frontmatter(body) is None:
+        return f"Error: '{skill_id}' has no valid SKILL.md frontmatter."
+    violation = _skill_guard(body)
+    if violation:
+        return f"Error: '{skill_id}' rejected by the skill guard: {violation}."
+    name = _parse_frontmatter(body)["name"]
+    target = Path(load_config().external_skill_roots[0]).expanduser() / name
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "SKILL.md").write_text(body, encoding="utf-8")
+    if enable:
+        settings = load_config()
+        settings.external_skills_enabled = True
+        settings.save()
+    skill_index.reload()
+    shown = "enabled" if enable or load_config().external_skills_enabled else "installed; external skills are off (set_external_skills(True))"
+    return f"Skill '{name}' {shown}: {target / 'SKILL.md'}"
 
 
 # ─── MEMORY ──────────────────────────────────────────────────────────────────
@@ -903,9 +1004,12 @@ async def list_mcp_servers() -> dict:
             )
         out[name] = {
             "enabled": bool(cfg.enabled),
+            "state": srv.state if srv else ("installed" if installed else "missing"),
             "connected": bool(srv and srv.connected),
             "installed": installed,
             "tools": len(srv.tools) if srv else 0,
+            "attempts": srv._failures if srv else 0,
+            "retry_in": srv.retry_in if srv else 0.0,
             "error": srv._last_error if srv and srv._last_error else None,
             "cmd": cfg.url if cfg.kind != "stdio" else cfg.command,
         }
@@ -951,18 +1055,19 @@ async def mcp_execute(server: str, tool: str = "", arguments: str = "{}", args: 
 
 # ─── DISCOVERY ───────────────────────────────────────────────────────────────
 
-async def scan_tools() -> str:
-    import inspect
-    frame = inspect.currentframe()
-    agent = None
-    while frame:
-        agent = frame.f_globals.get("_orchestrator")
-        if agent is not None and hasattr(agent, "tools"):
-            break
-        agent = None
-        frame = frame.f_back
-    names = list(agent.tools.keys()) if agent else list(TOOL_REGISTRY.keys())
-    return "Available tools:\n" + "\n".join(f"- {n}" for n in names)
+async def scan_tools(name: str = "") -> str:
+    """List active tools, or show one tool's full signature and arguments."""
+    agent = _resolve_agent()
+    tools = dict(getattr(agent, "tools", None) or TOOL_REGISTRY)
+    if name:
+        func = tools.get(name)
+        if func is None:
+            return f"Error: tool '{name}' is not active."
+        return f"- {name}{_signature_text(func)}: {' '.join((inspect.getdoc(func) or '').split())}"
+    return "Available tools:\n" + "\n".join(
+        f"- {key}{_signature_text(func)}: {' '.join((inspect.getdoc(func) or '').split())[:120]}"
+        for key, func in tools.items()
+    )
 
 
 # ─── REGISTRY ────────────────────────────────────────────────────────────────
@@ -974,6 +1079,34 @@ def _generate_registry():
         if not name.startswith("_") and func.__module__ == __name__ and name not in ('_generate_registry', 'get_tools_schema', 'download_and_open_image', 'reload_allowed_roots', 'shell_exec'):
             registry[name] = func
     return registry
+
+
+def _native_tool_schemas(tools: dict) -> List[Dict[str, Any]]:
+    """Provider-neutral descriptions for native tool calling."""
+    kinds = {int: "integer", float: "number", bool: "boolean", list: "array",
+             dict: "object", str: "string"}
+    schemas = []
+    for name, func in (tools or {}).items():
+        try:
+            sig = inspect.signature(func)
+        except (TypeError, ValueError):
+            continue
+        properties, required = {}, []
+        for param in sig.parameters.values():
+            if param.kind in (param.VAR_KEYWORD, param.VAR_POSITIONAL):
+                continue
+            meta: Dict[str, Any] = {"type": kinds.get(param.annotation, "string")}
+            if param.default is not param.empty:
+                meta["default"] = param.default
+            else:
+                required.append(param.name)
+            properties[param.name] = meta
+        params: Dict[str, Any] = {"type": "object", "properties": properties}
+        if required:
+            params["required"] = required
+        doc = " ".join((inspect.getdoc(func) or "").split())
+        schemas.append({"name": name, "description": doc[:240], "parameters": params})
+    return schemas
 
 
 def _mcp_schema(spec: Any) -> Dict[str, Any]:

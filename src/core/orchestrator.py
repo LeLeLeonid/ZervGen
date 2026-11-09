@@ -441,6 +441,7 @@ End with exactly one line: GRADE: [1-5]"""
         )
         agent._ask_user = self._ask_user
         agent.status_cb = self.status_cb
+        agent.trace.paint = False
         agent._max_steps_override = max_steps or self._get_max_steps()
         agent._is_delegated = True
         agent._mcp = self._mcp

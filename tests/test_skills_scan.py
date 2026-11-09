@@ -103,3 +103,104 @@ def test_get_resource_confines_reads_to_the_skill_dir(tmp_path, monkeypatch):
     assert registry.get_resource("alpha", "references/guide.md") == "inside"
     assert registry.get_resource("alpha", "../escape.md").startswith("Error:")
     assert registry.get_resource("alpha", "/etc/passwd").startswith("Error:")
+
+def _registry(tmp_path, monkeypatch, skills):
+    root = tmp_path / "root"
+    for name, extra in skills.items():
+        _skill(root / "software-development", name, extra=extra)
+    internal = tmp_path / "internal"
+    internal.mkdir()
+    monkeypatch.setattr(loader, "SKILLS_DIR", internal)
+    monkeypatch.setattr(loader, "_external_roots", lambda: [root])
+    monkeypatch.setattr(loader, "CATALOG_PATH", tmp_path / "catalog.json")
+    loader.SkillRegistry._instance = None
+    registry = loader.SkillRegistry()
+    monkeypatch.setattr(registry, "_external_enabled", lambda: True)
+    return registry
+
+
+def test_frontmatter_reads_namespaced_topology(tmp_path, monkeypatch):
+    registry = _registry(tmp_path, monkeypatch, {
+        "alpha": "metadata:\n  hermes:\n    tags: [one, two]\n"
+                 "    category: software-development\n"
+                 "    related_skills: [beta]\n",
+    })
+    skill = registry.skills["alpha"]
+    assert skill.tags == ["one", "two"]
+    assert skill.category == "software-development"
+    assert skill.related == ["beta"]
+
+
+def test_index_groups_by_category_and_marks_matches(tmp_path, monkeypatch):
+    registry = _registry(tmp_path, monkeypatch, {"alpha": "", "beta": ""})
+    text = registry.index(desc_chars=40, matched={"alpha"})
+    assert "software-development:" in text
+    assert "[match]" in text
+    assert text.index("alpha") < text.index("beta")
+
+
+def test_index_degrades_by_dropping_descriptions_not_entries(tmp_path, monkeypatch):
+    long = "word " * 60
+    names = [f"alpha{index}" for index in range(10)]
+    registry = _registry(tmp_path, monkeypatch, {name: f"description: {long}\n" for name in names})
+    text = registry.index(budget_chars=400, desc_chars=200)
+    assert all(name in text for name in names)
+    assert "word word" not in text
+    assert len(text) <= 400
+
+
+def test_related_is_a_bounded_closure(tmp_path, monkeypatch):
+    registry = _registry(tmp_path, monkeypatch, {
+        "alpha": "metadata:\n  hermes:\n    related_skills: [beta]\n",
+        "beta": "metadata:\n  hermes:\n    related_skills: [gamma]\n",
+        "gamma": "metadata:\n  hermes:\n    related_skills: [alpha]\n",
+    })
+    assert registry.related("alpha", depth=1) == ["beta"]
+    assert registry.related("alpha", depth=5) == ["beta", "gamma"]
+
+
+def test_search_ranks_name_then_tags(tmp_path, monkeypatch):
+    registry = _registry(tmp_path, monkeypatch, {
+        "alpha": "metadata:\n  hermes:\n    tags: [deployment]\n",
+        "beta": "metadata:\n  hermes:\n    tags: [alpha, other]\n",
+    })
+    assert [skill.name for skill in registry.search(["alpha"])] == ["alpha", "beta"]
+
+
+def test_bundled_skill_md_loads_with_resources_and_category(tmp_path, monkeypatch):
+    root = tmp_path / "internal"
+    bundle = root / "software-development" / "review"
+    (bundle / "references").mkdir(parents=True)
+    (bundle / "SKILL.md").write_text(
+        "---\nname: review\ndescription: review code\nmetadata:\n  tags: [quality]\n---\nBody.\n",
+        encoding="utf-8",
+    )
+    (bundle / "references" / "checklist.md").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(loader, "SKILLS_DIR", root)
+    monkeypatch.setattr(loader, "AGENTS_DIR", root / "AGENTS")
+    monkeypatch.setattr(loader, "_external_roots", lambda: [])
+    monkeypatch.setattr(loader, "CATALOG_PATH", tmp_path / "catalog.json")
+    loader.SkillRegistry._instance = None
+    registry = loader.SkillRegistry()
+    skill = registry.get("review")
+    assert skill is not None
+    assert skill.category == "software-development"
+    assert skill.files == ["references/checklist.md"]
+    assert registry.categories()["software-development"][0].name == "review"
+
+
+def test_builtin_roles_all_load():
+    roles = loader.get_all_roles()
+    assert set(roles) >= {"system", "code", "architect", "researcher"}
+    assert all(role.prompt.strip() for role in roles.values())
+
+
+def test_builtin_skills_load_with_bodies():
+    loader.SkillRegistry._instance = None
+    try:
+        registry = loader.SkillRegistry()
+        names = {skill.name for skill in registry.visible()}
+        assert {"systematic-debugging", "test-driven-development", "pdf"} <= names
+        assert registry.get_body("test-driven-development").strip()
+    finally:
+        loader.SkillRegistry._instance = None

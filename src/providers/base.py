@@ -15,7 +15,18 @@ from src.core.provider import (
 logger = logging.getLogger(__name__)
 
 
+def _decode(raw: str) -> Dict[str, Any]:
+    """Parse streamed JSON arguments; an unfinished object becomes empty."""
+    try:
+        value = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 class OpenAIProvider(AIProvider):
+    NATIVE_TOOLS = True
+
     def __init__(self, name: str, base_url: str, headers: Dict[str, str], model: str):
         endpoint = (base_url or "").rstrip("/")
         if not endpoint.endswith("/chat/completions"):
@@ -44,6 +55,9 @@ class OpenAIProvider(AIProvider):
         }
         if not self._is_reasoning_model():
             payload["temperature"] = 0.7
+        if self.native_tools:
+            payload["tools"] = [{"type": "function", "function": spec} for spec in self.native_tools]
+            payload["tool_choice"] = "auto"
         return payload
 
     def _content(self, message: Dict[str, Any]) -> str:
@@ -74,12 +88,28 @@ class OpenAIProvider(AIProvider):
         choices = data.get("choices") or []
         if not choices:
             raise ProviderError(f"{self.name} returned no choices", retryable=True)
-        content = self._content(choices[0].get("message") or {})
-        if not content:
+        message = choices[0].get("message") or {}
+        content = self._content(message)
+        self.native_calls = self._calls(message)
+        if not content and not self.native_calls:
             finish = choices[0].get("finish_reason", "unknown")
             raise ProviderError(f"{self.name} returned empty content (finish_reason={finish})", retryable=False)
         self._record_usage(data.get("usage"))
         return content
+
+    @staticmethod
+    def _calls(message: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Tool calls from one assistant message, arguments decoded."""
+        calls = []
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            try:
+                arguments = json.loads(function.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                arguments = {}
+            if function.get("name"):
+                calls.append({"name": function["name"], "arguments": arguments if isinstance(arguments, dict) else {}})
+        return calls
 
     async def _stream(self, payload: Dict[str, Any], on_token: Callable[[str], None]) -> str:
         kwargs: Dict[str, Any] = {"headers": self.headers, "json": payload}
@@ -87,6 +117,7 @@ class OpenAIProvider(AIProvider):
         if timeout is not None:
             kwargs["timeout"] = timeout
         full = ""
+        partial: List[Dict[str, str]] = []
         async with get_http_client().stream("POST", self.base_url, **kwargs) as response:
             if response.status_code != 200:
                 body = (await response.aread()).decode(errors="replace")[:300]
@@ -115,11 +146,23 @@ class OpenAIProvider(AIProvider):
                 choices = event.get("choices") or []
                 if not choices:
                     continue
-                text = self._delta(choices[0].get("delta") or {})
+                delta = choices[0].get("delta") or {}
+                for call in delta.get("tool_calls") or []:
+                    slot = int(call.get("index") or 0)
+                    while len(partial) <= slot:
+                        partial.append({"name": "", "arguments": ""})
+                    function = call.get("function") or {}
+                    if function.get("name"):
+                        partial[slot]["name"] = function["name"]
+                    if function.get("arguments"):
+                        partial[slot]["arguments"] += function["arguments"]
+                text = self._delta(delta)
                 if text:
                     full += text
                     on_token(text)
-        if not full.strip():
+        self.native_calls = [{"name": item["name"], "arguments": _decode(item["arguments"])}
+                             for item in partial if item["name"]]
+        if not full.strip() and not self.native_calls:
             raise ProviderError(f"{self.name} streamed empty content", retryable=True)
         return full
 

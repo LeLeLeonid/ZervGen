@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from typing import Any, Dict, List, Optional
 
 from src.config import GlobalSettings, MCPServerConfig, load_config
@@ -43,6 +44,9 @@ except ImportError:
 _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _UNSAFE = re.compile(r"[^A-Za-z0-9_]")
 _MAX_TOOL_NAME = 64
+BACKOFF_START = 30.0
+BACKOFF_MAX = 600.0
+DEAD_AFTER = 5
 
 
 def _unwrap(exc: BaseException) -> BaseException:
@@ -72,6 +76,7 @@ class MCPServer:
         self.config = config
         self.tools: Dict[str, Any] = {}
         self.public_names: Dict[str, str] = {}
+        self.state = "idle"
         self._session: Optional[ClientSession] = None
         self._client = None
         self._http = None
@@ -80,6 +85,16 @@ class MCPServer:
         self._ready = asyncio.Event()
         self._last_error: Optional[str] = None
         self._errlog = None
+        self._failures = 0
+        self._retry_at = 0.0
+
+    @property
+    def in_backoff(self) -> bool:
+        return bool(self._retry_at) and time.monotonic() < self._retry_at
+
+    @property
+    def retry_in(self) -> float:
+        return round(max(0.0, self._retry_at - time.monotonic()), 1) if self._retry_at else 0.0
 
     def _stderr_tail(self, prefix: str) -> str:
         """Attach the child's last stderr lines to a failure message."""
@@ -178,17 +193,30 @@ class MCPServer:
         except Exception as exc:
             detail = _unwrap(exc)
             self._last_error = self._stderr_tail(f"{type(detail).__name__}: {detail}")
+            self._record_failure()
             logger.error("MCP server '%s' lifecycle error: %s", self.name, self._last_error)
         finally:
             await self._release()
 
+    def _record_failure(self) -> None:
+        """Exponential backoff; a dead server keeps its last catalog."""
+        self._failures += 1
+        delay = min(BACKOFF_MAX, BACKOFF_START * (2 ** (self._failures - 1)))
+        self._retry_at = time.monotonic() + delay
+        self.state = "dead" if self._failures >= DEAD_AFTER else "degraded"
+
     def _mark_ready(self) -> None:
         self._connected = True
         self._last_error = None
+        self._failures = 0
+        self._retry_at = 0.0
+        self.state = "ready"
         self._ready.set()
 
     async def _release(self) -> None:
         """Drop every handle this lifecycle owned."""
+        if self._connected:
+            self.state = "idle"
         self._connected = False
         self._session = None
         self._client = None
@@ -211,7 +239,7 @@ class MCPServer:
     def connected(self) -> bool:
         return self._connected
 
-    async def start(self) -> bool:
+    async def start(self, force: bool = False) -> bool:
         """Connect once and wait for the handshake, bounded by connect_timeout."""
         if not self.config.enabled:
             return False
@@ -223,7 +251,11 @@ class MCPServer:
             return True
         if not MCP_SDK_AVAILABLE:
             self._last_error = "MCP SDK is not installed"
+            self._record_failure()
             return False
+        if not force and self._retry_at and time.monotonic() < self._retry_at:
+            return False
+        self.state = "starting"
         self._ready.clear()
         self._bg_task = asyncio.create_task(self._run_lifecycle())
         timeout = max(5.0, float(self.config.connect_timeout))
@@ -231,6 +263,7 @@ class MCPServer:
             await asyncio.wait_for(self._ready.wait(), timeout=timeout)
         except asyncio.TimeoutError:
             self._last_error = self._stderr_tail(f"startup timeout after {timeout:.0f}s")
+            self._record_failure()
             await self.stop(timeout=5.0)
             return False
         return self._connected
@@ -287,6 +320,8 @@ class MCPServer:
         self._connected = False
         self._session = None
         self._client = None
+        if not self._failures:
+            self.state = "idle"
 
 
 class MCPManager:
@@ -327,34 +362,42 @@ class MCPManager:
             if config.enabled:
                 self.servers[name] = MCPServer(name, config)
 
-    def _public_name(self, server: str, tool: str, duplicated: bool) -> str:
-        """`mcp_<tool>`, server-qualified only when another server also offers it."""
+    def _public_name(self, server: str, tool: str) -> str:
+        """`mcp__<server>__<tool>`, hashed when the joined name exceeds 64 chars."""
         clean = _UNSAFE.sub("_", tool)
-        name = f"mcp_{_UNSAFE.sub('_', server)}_{clean}" if duplicated else f"mcp_{clean}"
+        name = f"mcp__{_UNSAFE.sub('_', server)}__{clean}"
         if len(name) > _MAX_TOOL_NAME:
             digest = hashlib.sha1(f"{server}\0{tool}".encode()).hexdigest()[:8]
             name = f"{name[: _MAX_TOOL_NAME - 9]}_{digest}"
         return name
 
+    @staticmethod
+    def _serves(server: MCPServer) -> bool:
+        """Live, or degraded with a catalog worth keeping while it recovers."""
+        return server.connected or (server.state in ("degraded", "dead") and bool(server.tools))
+
     def _reindex(self) -> None:
         """Recompute public tool names across every live connection."""
         counts: Dict[str, int] = {}
         for server in self.servers.values():
-            if server.connected:
+            if self._serves(server):
                 for tool in server.tools:
                     counts[tool] = counts.get(tool, 0) + 1
         self.tools_map.clear()
         self._calls.clear()
         for server in self.servers.values():
-            if not server.connected:
+            if not self._serves(server):
                 server.public_names = {}
                 continue
             names = {}
             for tool in server.tools:
-                public = self._public_name(server.name, tool, counts[tool] > 1)
+                public = self._public_name(server.name, tool)
                 names[tool] = public
                 self.tools_map[public] = server.name
                 self._calls[public] = (server.name, tool)
+                if counts[tool] == 1:
+                    legacy = f"mcp_{_UNSAFE.sub('_', tool)}"
+                    self._calls.setdefault(legacy, (server.name, tool))
             server.public_names = names
 
     def reload(self, settings: Optional[GlobalSettings] = None) -> None:
@@ -376,13 +419,20 @@ class MCPManager:
         return dict(self.tools_map)
 
     def server_status(self) -> Dict[str, Dict[str, Any]]:
-        """Connection state of every configured server."""
+        """Health snapshot of every configured server, backoff included."""
         return {
-            name: {"connected": server.connected, "tools": len(server.tools), "error": server._last_error}
+            name: {
+                "state": server.state,
+                "connected": server.connected,
+                "tools": len(server.tools),
+                "attempts": server._failures,
+                "retry_in": server.retry_in,
+                "error": server._last_error,
+            }
             for name, server in self.servers.items()
         }
 
-    async def ensure_server(self, name: str) -> bool:
+    async def ensure_server(self, name: str, force: bool = False) -> bool:
         """Connect a server on demand; a dropped connection is reopened lazily."""
         config = (getattr(self.settings, "mcp_servers", {}) or {}).get(name)
         if config is None or not config.enabled:
@@ -390,19 +440,43 @@ class MCPManager:
         server = self.servers.get(name)
         if server and server.connected:
             return True
+        if not force and server and server.in_backoff:
+            return False
         async with self._connect_lock:
             server = self.servers.get(name)
             if server and server._bg_task and not server._bg_task.done():
                 await self._await_ready(server, config)
                 return server.connected
-            server = MCPServer(name, config)
-            self.servers[name] = server
+            if server is None:
+                server = MCPServer(name, config)
+                self.servers[name] = server
             try:
-                await server.start()
+                await server.start(force=force)
             except Exception as exc:
                 server._last_error = str(_unwrap(exc))
+                server._record_failure()
             self._reindex()
             return server.connected
+
+    async def doctor(self, force: bool = True) -> List[Dict[str, Any]]:
+        """Probe every configured server and report a per-server diagnosis."""
+        report = []
+        for name, config in (getattr(self.settings, "mcp_servers", {}) or {}).items():
+            server = self.servers.get(name)
+            if not config.enabled:
+                report.append({"server": name, "state": "off", "detail": "disabled in config"})
+                continue
+            if config.kind == "stdio" and config.command != "internal" and not shutil.which(config.command):
+                report.append({"server": name, "state": "dead",
+                               "detail": f"command '{config.command}' not found in PATH"})
+                continue
+            ok = await self.ensure_server(name, force=force)
+            live = self.servers.get(name)
+            state = "ready" if ok else (live.state if live else "dead")
+            detail = f"{len(live.tools)} tools" if ok else (live._last_error if live and live._last_error else "not connected")
+            report.append({"server": name, "state": state, "detail": detail})
+        self._reindex()
+        return report
 
     @staticmethod
     async def _await_ready(server: MCPServer, config: MCPServerConfig) -> None:
