@@ -128,7 +128,7 @@ class Provider(AIProvider):
                 error = event.get("error")
                 if error:
                     message = error.get("message", error) if isinstance(error, dict) else error
-                    raise ProviderError(f"{self.name} stream error: {message}", retryable=True)
+                    raise ProviderError(f"{self.name} stream error: {message}", retryable=True, stream_started=True)
                 self._track_usage(event)
                 for candidate in event.get("candidates") or []:
                     for part in (candidate.get("content") or {}).get("parts") or []:
@@ -148,7 +148,7 @@ class Provider(AIProvider):
                 try:
                     result = await self._stream(self._payload(history, system_prompt, True), on_token)
                 except ProviderError as exc:
-                    if exc.status_code is not None:
+                    if exc.status_code is not None or exc.stream_started:
                         raise
                     logger.debug("%s stream failed, falling back: %s", self.name, exc)
                 else:

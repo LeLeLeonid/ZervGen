@@ -3,8 +3,8 @@ import shutil
 import os
 import re
 from pathlib import Path
-from typing import Optional, Dict, List, TypedDict, Any
-from pydantic import BaseModel, Field, field_validator
+from typing import Optional, Dict, List, TypedDict, Any, get_args, get_origin
+from pydantic import BaseModel, Field, TypeAdapter, field_validator
 
 CONFIG_PATH = Path("config.json")
 ENV_PATH = Path.home() / ".zervgen" / ".env"
@@ -177,7 +177,6 @@ ZG_PROTOCOL = """
 EVOLUTION_DIR = Path("tmp/evolution")
 MAX_SHORT_TERM = 100
 TEMP_DIR = Path("tmp")
-RISK_ASK_TOOLS = {"shell", "write_file", "append_file", "edit_file", "delegate_to", "add_mcp_server", "mouse_click", "type_text"}
 WMO_CODES = {
     0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
     45: "Fog", 48: "Depositing rime fog",
@@ -208,10 +207,33 @@ _load_env()
 
 
 class MCPServerConfig(BaseModel):
-    command: str
-    args: List[str]
+    command: str = ""
+    args: List[str] = Field(default_factory=list)
     env: Dict[str, str] = Field(default_factory=dict)
+    url: str = ""
+    headers: Dict[str, str] = Field(default_factory=dict)
+    transport: str = "auto"
     enabled: bool = False
+    lazy: bool = False
+    timeout: float = 300.0
+    connect_timeout: float = 60.0
+    input_required_max_rounds: int = 10
+    tools_include: List[str] = Field(default_factory=list)
+    tools_exclude: List[str] = Field(default_factory=list)
+
+    @property
+    def kind(self) -> str:
+        """Transport this entry describes: stdio, sse or http."""
+        explicit = (self.transport or "auto").strip().lower()
+        if explicit in ("stdio", "sse"):
+            return explicit
+        if explicit in ("http", "streamable-http", "streamable_http"):
+            return "http"
+        if self.command:
+            return "stdio"
+        if self.url.rstrip("/").endswith("/sse"):
+            return "sse"
+        return "http"
 
     def is_executable_available(self) -> bool:
         cmd = self.command
@@ -314,11 +336,16 @@ class GlobalSettings(BaseModel):
     checkpoint_max_snapshots: int = 30
     trace_enabled: bool = True
     external_skills_enabled: bool = False
-    external_skill_roots: List[str] = Field(default_factory=lambda: ["tmp"])
+    external_skill_roots: List[str] = Field(
+        default_factory=lambda: ["~/.zervgen/skills", "~/.agents/skills"]
+    )
     prompt_show_internal_skills: bool = True
     prompt_show_external_skills: bool = False
     prompt_auto_trigger_skills: bool = True
     prompt_auto_trigger_external_skills: bool = False
+    prompt_max_skills: int = 150
+    prompt_skill_description_chars: int = 90
+    prompt_skills_chars: int = 7000
     prompt_show_mcp_tools: bool = True
     prompt_max_chars: int = 14000
     prompt_memory_limit: int = 4
@@ -358,8 +385,14 @@ class GlobalSettings(BaseModel):
             if prov in data and isinstance(data[prov], dict):
                 data[prov].pop("api_key", None)
         for server in (data.get("mcp_servers") or {}).values():
-            if isinstance(server, dict):
-                server.pop("env", None)
+            if not isinstance(server, dict):
+                continue
+            server.pop("env", None)
+            headers = server.get("headers")
+            if isinstance(headers, dict):
+                server["headers"] = {k: v for k, v in headers.items() if "${" in str(v)}
+                if not server["headers"]:
+                    server.pop("headers")
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = CONFIG_PATH.with_suffix(CONFIG_PATH.suffix + ".tmp")
         with open(tmp_path, "w") as f:
@@ -611,6 +644,117 @@ def load_config() -> GlobalSettings:
     if _config_instance is None:
         _config_instance = _load_config_impl()
     return _config_instance
+
+
+def _setting_fields(model: Any) -> Dict[str, Any]:
+    """Declared fields of a settings model or its class."""
+    owner = model if isinstance(model, type) else type(model)
+    return dict(getattr(owner, "model_fields", {}) or {})
+
+
+def _is_branch(annotation: Any) -> bool:
+    """Whether a field holds a nested settings model worth expanding."""
+    return isinstance(annotation, type) and issubclass(annotation, BaseModel)
+
+
+def _parse_setting(annotation: Any, raw: str) -> Any:
+    """Read one CLI token as the declared field type."""
+    text = raw.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        text = text[1:-1].strip()
+    if annotation is bool:
+        flag = text.lower()
+        if flag in ("on", "true", "yes", "1", "enable", "enabled"):
+            return True
+        if flag in ("off", "false", "no", "0", "disable", "disabled"):
+            return False
+        raise ValueError("expected on/off")
+    origin = get_origin(annotation)
+    inner = [a for a in get_args(annotation) if a is not type(None)]
+    target = origin or annotation
+    if target is list and inner:
+        if not text.startswith("["):
+            return TypeAdapter(List[inner[0]]).validate_python([p.strip() for p in text.split(",") if p.strip()])
+    if target is dict and inner:
+        if not text.startswith("{"):
+            raise ValueError("expected a JSON object")
+    try:
+        return TypeAdapter(annotation).validate_python(json.loads(text) if text.startswith(("{", "[")) else text)
+    except Exception as exc:
+        raise ValueError(f"invalid value for {getattr(annotation, '__name__', annotation)}: {text[:40]}") from exc
+
+
+def _display_setting(value: Any) -> str:
+    """Render a setting for the terminal, hiding credentials."""
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    if isinstance(value, BaseModel):
+        return value.model_dump_json()
+    if isinstance(value, (dict, list, str)):
+        text = json.dumps(value) if not isinstance(value, str) else value
+        return text if len(text) <= 80 else text[:77] + "..."
+    return str(value)
+
+
+def _safe_value(path: str, value: Any) -> Any:
+    """Mask credentials and server env before a value reaches the screen."""
+    if path.endswith("api_key"):
+        return "********" if value else "(unset)"
+    if path == "mcp_servers" and isinstance(value, dict):
+        return {name: ("enabled" if getattr(cfg, "enabled", False) else "off") for name, cfg in value.items()}
+    if path.endswith("headers") and isinstance(value, dict):
+        return "********" if value else {}
+    return value
+
+
+def config_entries(settings: Optional["GlobalSettings"] = None) -> List[tuple]:
+    """Every editable setting as (dotted path, current value)."""
+    settings = settings or load_config()
+    rows: List[tuple] = []
+    for name, info in _setting_fields(settings).items():
+        value = getattr(settings, name)
+        if _is_branch(info.annotation) and name != "mcp_servers":
+            for sub in _setting_fields(value):
+                path = f"{name}.{sub}"
+                rows.append((path, _safe_value(path, getattr(value, sub))))
+        else:
+            rows.append((name, _safe_value(name, value)))
+    return rows
+
+
+def set_config_value(settings: "GlobalSettings", path: str, raw: str) -> str:
+    """Apply one dotted setting read from the CLI; secrets go to .env."""
+    segments = [part for part in (path or "").strip().split(".") if part]
+    if not segments:
+        raise ValueError("missing setting name")
+    data = settings.model_dump()
+    holder: Any = data
+    for segment in segments[:-1]:
+        if not isinstance(holder, dict) or segment not in holder:
+            raise ValueError(f"unknown setting: {path}")
+        holder = holder[segment]
+        if not isinstance(holder, dict):
+            raise ValueError(f"'{segment}' has no nested settings")
+    leaf = segments[-1]
+    if not isinstance(holder, dict) or leaf not in holder:
+        raise ValueError(f"unknown setting: {path}")
+    field = _setting_fields(settings)
+    for segment in segments[:-1]:
+        field = _setting_fields(field[segment].annotation)
+    value = _parse_setting(field[leaf].annotation, raw)
+    if leaf == "api_key":
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("api_key cannot be empty")
+        provider = segments[0] if len(segments) > 1 else settings.provider
+        if not save_env_key(provider, value.strip()):
+            raise ValueError("could not write the API key to .env")
+        value = value.strip()
+    holder[leaf] = value
+    validated = GlobalSettings.model_validate(data)
+    for name in _setting_fields(settings):
+        setattr(settings, name, getattr(validated, name))
+    shown = "********" if leaf == "api_key" else _display_setting(value)
+    return f"{path} = {shown}"
 
 
 def env_key_for(provider_name: str) -> str:

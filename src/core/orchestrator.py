@@ -14,7 +14,7 @@ from src.core.provider import AIProvider, get_provider
 from src.skills_loader import load_role, role_exists, skill_index, SkillEngine
 from src.tools import TOOL_REGISTRY, get_tools_schema, shell_exec
 from src.utils import get_system_context, sanitize_for_prompt, generate_random_delimiter, count_tokens, add_global_tokens, add_provider_tokens, GitManager
-from src.core.runtime import CheckpointRef, Plan, Task, TaskStatus
+from src.core.runtime import CheckpointRef, Plan, RunStatus, Task, TaskStatus
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -24,6 +24,14 @@ _FAILURE_MARKERS = re.compile(r"^(Error|BLOCKED|Timeout|TypeError|Exit code: [1-
 
 def _looks_failed(text: str) -> bool:
     return bool(_FAILURE_MARKERS.match(text.strip()))
+
+
+def _child_succeeded(agent: Any, text: str) -> bool:
+    """Trust the child's own terminal status over a text heuristic."""
+    run = getattr(agent, "_run", None) if agent is not None else None
+    if run is not None:
+        return run.status == RunStatus.DONE
+    return not _looks_failed(text)
 
 
 class Orchestrator(StemAgent):
@@ -174,13 +182,21 @@ class Orchestrator(StemAgent):
             if not result.ok:
                 failures.append(f"Verification command failed: {command}\n{result.to_text()}")
         if self._run:
-            self._run.status = self._run.status.VERIFYING
+            self._run.metadata["verification_passed"] = not failures
             self._run.emit("verification", self.name, "artifacts", "passed" if not failures else "failed", output=failures or "artifact checks passed")
         return failures
 
+    async def run(self, task: str) -> str:
+        """Entry point: the supervised path, not the bare stem loop."""
+        return await self.run_task(task, self.mode)
+
     async def run_task(self, task: str, mode: str = "BUILD") -> str:
         if not self.settings.critic_enabled:
-            return await self._execute_waves(task, mode)
+            if self.mode == "BUILD" and self._git_mgr and self._active_session_id:
+                self._git_mgr.snapshot(self._active_session_id)
+            result = await self._execute_waves(task, mode)
+            self._checkpoint("task")
+            return result
 
         skill_contract = skill_index.get(self.skill_name)
         original_task = task
@@ -192,13 +208,13 @@ class Orchestrator(StemAgent):
         max_rounds = max(1, int(self.settings.max_refine_rounds))
         for round_no in range(1, max_rounds + 1):
             self._log(self.name, f"Round {round_no}/{max_rounds}", "state", self.mode)
-            if self._run:
-                self._run.status = self._run.status.RUNNING
             if self.mode == "BUILD" and self._git_mgr and self._active_session_id:
                 self._git_mgr.snapshot(self._active_session_id)
 
             result = await self._execute_waves(task, mode)
+            self._checkpoint(f"round {round_no}")
             verify_failures = await self._verify_artifacts()
+
             if verify_failures:
                 self._log(self.name, "VERIFICATION FAILED:\n" + "\n".join(verify_failures), "state", self.mode)
                 result = f"{result}\n\n[VERIFICATION FAILURES]\n" + "\n".join(verify_failures)
@@ -230,7 +246,8 @@ End with exactly one line: GRADE: [1-5]"""
                 if self._run:
                     self._run.metadata["last_grade"] = grade
                     self._run.metadata["verification_failures"] = verify_failures
-                    self._run.status = self._run.status.DONE if grade >= self.settings.critic_gate_threshold else self._run.status.VERIFYING
+                if self._active_session_id:
+                    memory_core._session_db.update_session_grade(self._active_session_id, grade)
 
                 await memory_core.add_memory(str(result), category="blueprint", critic_score=grade)
 
@@ -244,7 +261,7 @@ End with exactly one line: GRADE: [1-5]"""
                         except Exception as e:
                             self._log(self.name, f"Rollback failed: {e}", "state", self.mode)
                     if self._run:
-                        self._run.status = self._run.status.FAILED
+                        self._run.metadata["critic_failed"] = True
                     return f"[ROLLBACK] Grade {grade} — reverted 1 step. Escalate."
 
                 task = f"Original task: {original_task}\n\nPrevious attempt scored {grade}/5. Fix the missing/broken parts. Focus ONLY on gaps."
@@ -322,15 +339,15 @@ End with exactly one line: GRADE: [1-5]"""
                         task_id = str(spec.get("id") or spec.get("task_id") or spec["agent_name"])
                         results_by_id[task_id] = str(result)
                         task_obj = plan.tasks[task_id]
+                        child_id = next((aid for aid, sp in agent_id_map.items() if sp is spec), None)
+                        child = self.agents.get(child_id or "")
                         if isinstance(result, Exception):
                             task_obj.status = TaskStatus.FAILED
                             task_obj.result = f"{type(result).__name__}: {result}"
                         else:
-                            ok = bool(result) and not _looks_failed(str(result))
+                            ok = bool(result) and _child_succeeded(child, str(result))
                             task_obj.status = TaskStatus.DONE if ok else TaskStatus.FAILED
                             task_obj.result = str(result)
-                        child_id = next((aid for aid, sp in agent_id_map.items() if sp is spec), None)
-                        child = self.agents.get(child_id or "")
                         if child and getattr(child, "_run", None):
                             task_obj.artifacts = list(child._run.artifacts)
                         if task_obj.status != TaskStatus.DONE:
@@ -361,39 +378,41 @@ End with exactly one line: GRADE: [1-5]"""
         self._last_agent_id = agent_id
         return str(result)
 
+    @staticmethod
+    def _task_key(spec: Dict) -> str:
+        return str(spec.get("id") or spec.get("task_id") or spec["agent_name"])
+
     def _compute_waves(self, agents_spec: List[Dict]) -> List[List[Dict]]:
-        by_name = {spec["agent_name"]: spec for spec in agents_spec}
-        in_degree = {spec["agent_name"]: 0 for spec in agents_spec}
-        graph = {spec["agent_name"]: set() for spec in agents_spec}
+        """Group specs into waves by task id, so two specs may share an agent."""
+        by_key = {self._task_key(spec): spec for spec in agents_spec}
+        if len(by_key) != len(agents_spec):
+            raise ValueError("Delegation specs need unique ids")
+        in_degree = {key: 0 for key in by_key}
+        graph = {key: set() for key in by_key}
         for spec in agents_spec:
-            deps = spec.get("depends_on", [])
-            for dep in deps:
+            key = self._task_key(spec)
+            for dep in spec.get("depends_on", []) or []:
+                dep = str(dep)
                 if dep in graph:
-                    graph[dep].add(spec["agent_name"])
-                    in_degree[spec["agent_name"]] = in_degree.get(spec["agent_name"], 0) + 1
+                    graph[dep].add(key)
+                    in_degree[key] += 1
                 else:
                     logger.warning(
-                        f"Agent '{spec['agent_name']}' depends on unknown "
-                        f"agent '{dep}' — dependency ignored")
+                        f"Task '{key}' depends on unknown task '{dep}' — dependency ignored")
         waves = []
-        remaining = [s for s in agents_spec if in_degree.get(s["agent_name"], 0) == 0]
+        remaining = [spec for spec in agents_spec if in_degree[self._task_key(spec)] == 0]
         while remaining:
-            current_wave = remaining[:]
-            waves.append(current_wave)
+            waves.append(list(remaining))
             next_remaining = []
-            for spec in current_wave:
-                name = spec["agent_name"]
-                for succ in graph.get(name, set()):
-                    in_degree[succ] = in_degree.get(succ, 0) - 1
-                    if in_degree[succ] == 0:
-                        next_remaining.append(by_name[succ])
+            for spec in remaining:
+                for successor in graph.get(self._task_key(spec), set()):
+                    in_degree[successor] -= 1
+                    if in_degree[successor] == 0:
+                        next_remaining.append(by_key[successor])
             remaining = next_remaining
-        all_names = {s["agent_name"] for s in agents_spec}
-        placed = {s["agent_name"] for w in waves for s in w}
-        if all_names != placed:
-            msg = f"Circular dependency detected among: {all_names - placed}"
-            logger.error(msg)
-            raise ValueError(msg)
+        placed = {self._task_key(spec) for wave in waves for spec in wave}
+        if placed != set(by_key):
+            raise ValueError(f"Circular dependency detected among: {set(by_key) - placed}")
         return waves
 
     def _spawn_agent(self, role_name: str, context: str, max_steps: int = None) -> tuple:
@@ -426,7 +445,7 @@ End with exactly one line: GRADE: [1-5]"""
         agent._is_delegated = True
         agent._mcp = self._mcp
         agent._mcp_initialized = True
-        agent.tools = {k: v for k, v in self.tools.items() if k != "delegate_to"}
+        agent.tools.pop("delegate_to", None)
         self.agents[agent_id] = agent
         self._log(self.name, f"SPAWN: {role_name} ({agent_id})", "agent_spawn", self.mode)
         return agent_id, agent

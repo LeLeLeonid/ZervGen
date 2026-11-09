@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional
 from threading import Lock
 
 import yaml
-from src.config import MAX_SHORT_TERM, EVOLUTION_DIR
+from src.config import MAX_SHORT_TERM, EVOLUTION_DIR, load_config
 
 logger = logging.getLogger(__name__)
 chromadb = None
@@ -343,11 +343,16 @@ class VectorStore:
         except Exception as e: logger.debug(f"Vector add failed: {e}")
 
     def search(self, query: str, n: int = 10) -> List[Dict]:
+        """Return nearest stored facts with their ids."""
         if not self._collection: return []
         try:
             results = self._collection.query(query_texts=[query], n_results=n)
-            if results["documents"] and results["documents"][0]:
-                return [{"content": d, "rank": i + 1} for i, d in enumerate(results["documents"][0])]
+            docs = (results.get("documents") or [[]])[0]
+            ids = (results.get("ids") or [[]])[0]
+            return [
+                {"id": ids[i] if i < len(ids) else "", "content": doc, "rank": i + 1}
+                for i, doc in enumerate(docs)
+            ]
         except Exception as e: logger.debug(f"Vector search failed: {e}")
         return []
 
@@ -423,6 +428,7 @@ class MemoryCore:
         self._vector = VectorStore(self._vector_dir)
         self._bm25 = BM25Index()
         self._session_db = SessionDB()
+        self._min_grade = float(getattr(load_config(), "min_session_grade", 0.0) or 0.0)
         self._active_session_id: Optional[str] = None
         self._triggered_this_session: set = set()  # track auto-injected skills per session
         self._rebuild_bm25()
@@ -437,12 +443,34 @@ class MemoryCore:
         vector_results = self._vector.search(query, n=limit * 2)
         bm25_results = self._bm25.search(query, limit=limit * 2)
         merged_scores = self._rrf_rank(vector_results + bm25_results, k=60)
-        sorted_items = sorted(merged_scores.items(), key=lambda x: -x[1])[:limit]
+        facts = {str(f.get("id", "")): f for f in self._kg.get_facts()}
         results = []
-        for content, score in sorted_items:
-            fact = next((f for f in self._kg.get_facts() if f.get("content") == content), None)
-            results.append({"content": content, "score": score, "fact": fact})
+        for fact_id, score in sorted(merged_scores.items(), key=lambda x: -x[1])[:limit]:
+            fact = facts.get(fact_id)
+            content = str((fact or {}).get("content") or fact_id)
+            results.append({"id": fact_id, "content": content, "score": score, "fact": fact})
         return results
+
+    def record_outcome(self, query: str, success: bool, limit: int = 5) -> None:
+        """Score the facts recalled for a task once its outcome is known.
+
+        Run this after a task finishes: it bumps the hit counter for every fact
+        the task saw, then updates each fact's success rate so `prune_toxic`
+        has real signal to act on instead of defaults.
+        """
+        if not query.strip():
+            return
+        for hit in self.search_memory(query, limit=limit):
+            fact = hit.get("fact")
+            if fact is None:
+                continue
+            fact["hits"] = int(fact.get("hits", 0) or 0) + 1
+            seen = int(fact.get("outcomes", 0) or 0)
+            wins = int(fact.get("wins", 0) or 0) + (1 if success else 0)
+            fact["outcomes"] = seen + 1
+            fact["wins"] = wins
+            fact["success_rate"] = wins / (seen + 1)
+        self._kg.save()
 
     def inject_context(self, query: str, limit: int = 5, trusted_sources=None) -> str:
         if not query or not query.strip():
@@ -537,7 +565,7 @@ class MemoryCore:
 
     async def add_memory(self, content: str, category: str = "general", tier: str = "now", critic_score: float = 0.0, source: str = "user") -> str:
         if critic_score > 0 and critic_score < getattr(self, '_min_grade', 4.0):
-            return f"Memory rejected: graded {critic_score}/5 (threshold: 4.0)"
+            return f"Memory rejected: graded {critic_score}/5 (threshold: {getattr(self, '_min_grade', 4.0)})"
         if len(content) < 10 or len(content) > 2000:
             return "Memory rejected: invalid length"
         error_markers = ("error:", "traceback", "syntaxerror", "nameerror")
@@ -579,9 +607,12 @@ class MemoryCore:
         return f"Memory {memory_id} not found"
 
     def _rrf_rank(self, results: List[Dict], k: int = 60) -> Dict[str, float]:
+        """Fuse ranked lists by fact id, never by document text."""
         scores: Dict[str, float] = {}
         for r in results:
-            key = r.get("content") or r.get("id", "")
+            key = str(r.get("id") or "")
+            if not key:
+                continue
             scores[key] = scores.get(key, 0) + 1 / (k + r["rank"])
         return scores
 
@@ -930,9 +961,8 @@ class Dreamer:
         if not self.orchestrator or not self.orchestrator.history:
             return
         agent = self.orchestrator
-        if agent._repeat_count >= 2:
-            logger.debug("[LOOP] Task stuck: same result %sx: %s", agent._repeat_count, str(agent._last_result)[:100])
-            agent._repeat_count = 0
+        if getattr(agent, "_repeat_count", 0) >= 2:
+            logger.debug("[LOOP] Task stuck: same result %sx", agent._repeat_count)
         last = agent.history[-1].get("content", "")
         if any(s in last for s in ("[STOP]", "Max steps", "Error:")):
             logger.debug("[STUCK] Task stalled: %s", last)

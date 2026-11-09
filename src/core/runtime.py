@@ -178,9 +178,11 @@ class Budget:
     max_tool_calls: int = 200
     max_delegations: int = 12
     max_parallel_agents: int = 4
+    max_file_writes: int = 0
     steps: int = 0
     tool_calls: int = 0
     delegations: int = 0
+    file_writes: int = 0
 
     def step(self) -> bool:
         """Consume one step, or report exhaustion."""
@@ -201,6 +203,13 @@ class Budget:
         if self.delegations >= self.max_delegations:
             return False
         self.delegations += 1
+        return True
+
+    def write(self) -> bool:
+        """Consume one file write, or report exhaustion."""
+        if self.max_file_writes and self.file_writes >= self.max_file_writes:
+            return False
+        self.file_writes += 1
         return True
 
 
@@ -340,10 +349,9 @@ class RunCoordinator:
             self.doorbell.set()
 
     def drain(self) -> List[str]:
-        """Take all queued messages."""
+        """Take all queued messages and lower the doorbell."""
         pending, self._inbox = self._inbox, []
-        if not pending:
-            self.doorbell.clear()
+        self.doorbell.clear()
         return pending
 
     def finish(self, status: RunStatus, run: Any = None) -> Optional[RunStatus]:
@@ -364,8 +372,9 @@ class PermissionPolicy:
 
     ALWAYS_DENY = {"eval", "exec", "compile", "__import__"}
     RISKY = {"shell", "write_file", "append_file", "edit_file", "delete_file",
-             "add_mcp_server", "delegate_to", "mouse_click", "type_text"}
-    BUILD_ONLY = {"write_file", "append_file", "edit_file", "delete_file", "shell"}
+             "add_mcp_server", "mcp_execute", "delegate_to", "mouse_click", "type_text"}
+    BUILD_ONLY = {"write_file", "append_file", "edit_file", "delete_file", "shell",
+                  "add_mcp_server", "mcp_execute"}
 
     def __init__(self, permission_mode: str = "ASK", mode: str = "BUILD", roots: Optional[List[str]] = None):
         """Bind mode, permission level and allowed roots."""

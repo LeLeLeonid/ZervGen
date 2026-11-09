@@ -25,7 +25,9 @@ def test_ceiling_uses_min_floor_on_small_window():
 
 
 def test_ceiling_never_exceeds_window():
-    assert context_ceiling(0) == -CONTEXT_RESERVE_MIN
+    for window in (0, 1, 2048, 4096, 8192, 32_000, 128_000, 1_000_000):
+        ceiling = context_ceiling(window)
+        assert 0 <= ceiling <= window
 
 
 def test_truncate_respects_token_budget():

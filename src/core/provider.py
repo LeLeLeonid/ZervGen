@@ -10,10 +10,14 @@ LOCAL_HOSTS = {"", "localhost", "127.0.0.1", "0.0.0.0", "::1"}
 
 
 class ProviderError(Exception):
-    def __init__(self, message: str, status_code: Optional[int] = None, retryable: bool = True):
+    """A provider failure that callers may retry or surface as-is."""
+
+    def __init__(self, message: str, status_code: Optional[int] = None, retryable: bool = True,
+                 stream_started: bool = False):
         super().__init__(message)
         self.status_code = status_code
         self.retryable = retryable
+        self.stream_started = stream_started
 
 
 class CircuitBreakerError(ProviderError):
@@ -156,11 +160,12 @@ class AIProvider:
     def _fail(self) -> None:
         _circuit_breaker.record_failure(self.name)
 
-    def _estimate_cost(self, input_tokens: int, output_tokens: int) -> Optional[float]:
+    def _estimate_cost(self, input_tokens: int, output_tokens: int) -> float:
+        """Cost in USD from the catalog; local and unknown models are free."""
         from src.utils import ModelCatalog
         if is_local_url(getattr(self, "base_url", "")):
             return 0.0
-        return ModelCatalog.get_cost(self.name, self.model, input_tokens, output_tokens)
+        return float(ModelCatalog.get_cost(self.name, self.model, input_tokens, output_tokens) or 0.0)
 
     def _record_usage(self, usage: Optional[Dict[str, Any]]) -> None:
         self._last_usage = dict(usage or {})
@@ -221,8 +226,18 @@ def _section_name(name: str) -> str:
     return "gemini" if name == "google" else name
 
 
+def _tier_model(settings, name: str) -> str:
+    """Model chosen by the active tier for this provider, if any."""
+    tiers = getattr(settings, "model_tiers", None) or {}
+    tier = str(getattr(settings, "active_model_tier", "") or "").strip()
+    table = tiers.get(tier) if isinstance(tiers, dict) else None
+    if not isinstance(table, dict):
+        return ""
+    return str(table.get(name) or table.get("*") or "")
+
+
 def _resolve_model(name: str, settings, preset: Optional[Dict[str, str]]) -> str:
-    chosen = (getattr(settings, "provider_models", None) or {}).get(name)
+    chosen = _tier_model(settings, name) or (getattr(settings, "provider_models", None) or {}).get(name)
     if chosen:
         return chosen
     section = getattr(settings, _section_name(name), None) if settings is not None else None

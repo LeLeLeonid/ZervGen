@@ -52,6 +52,13 @@ class OpenAIProvider(AIProvider):
             content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
         return str(content or "").strip()
 
+    def _delta(self, chunk: Dict[str, Any]) -> str:
+        """Stream fragments verbatim: whitespace-only deltas are load-bearing."""
+        content = chunk.get("content")
+        if isinstance(content, list):
+            content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+        return str(content or "")
+
     async def _non_stream(self, payload: Dict[str, Any]) -> str:
         kwargs: Dict[str, Any] = {"headers": self.headers, "json": payload}
         timeout = self._timeout()
@@ -102,13 +109,13 @@ class OpenAIProvider(AIProvider):
                 error = event.get("error")
                 if error:
                     message = error.get("message", error) if isinstance(error, dict) else error
-                    raise ProviderError(f"{self.name} stream error: {message}", retryable=True)
+                    raise ProviderError(f"{self.name} stream error: {message}", retryable=True, stream_started=True)
                 if isinstance(event.get("usage"), dict):
                     self._record_usage(event["usage"])
                 choices = event.get("choices") or []
                 if not choices:
                     continue
-                text = self._content(choices[0].get("delta") or {})
+                text = self._delta(choices[0].get("delta") or {})
                 if text:
                     full += text
                     on_token(text)
@@ -129,7 +136,7 @@ class OpenAIProvider(AIProvider):
         try:
             return await self._stream(self._payload(history, system_prompt, True), _relay)
         except ProviderError as exc:
-            if exc.status_code is not None or emitted:
+            if exc.status_code is not None or exc.stream_started or emitted:
                 raise
             logger.debug("%s stream failed, retrying without streaming: %s", self.name, exc)
         return await self._non_stream(self._payload(history, system_prompt, False))

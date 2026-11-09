@@ -108,7 +108,7 @@ class Provider(AIProvider):
                     continue
                 event_type = event.get("type")
                 if event_type == "error":
-                    raise ProviderError(f"{self.name} stream error: {event.get('error')}", retryable=True)
+                    raise ProviderError(f"{self.name} stream error: {event.get('error')}", retryable=True, stream_started=True)
                 if event_type == "message_start":
                     self._track_usage((event.get("message") or {}).get("usage") or {})
                 elif event_type == "message_delta":
@@ -130,7 +130,7 @@ class Provider(AIProvider):
                 try:
                     result = await self._stream(self._payload(history, system_prompt, True), on_token)
                 except ProviderError as exc:
-                    if exc.status_code is not None:
+                    if exc.status_code is not None or exc.stream_started:
                         raise
                     logger.debug("%s stream failed, falling back: %s", self.name, exc)
                 else:
