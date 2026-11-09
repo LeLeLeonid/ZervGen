@@ -343,11 +343,54 @@ class ModelCatalog:
         return cls._data
 
     @classmethod
-    def list_models(cls, provider: str) -> list[str]:
+    def _pid(cls, provider: str) -> str:
+        return {"gemini": "google"}.get(provider, provider)
+
+    @classmethod
+    def providers(cls) -> Dict[str, Dict]:
         d = cls._fetch()
-        pid = {"gemini": "google"}.get(provider, provider)
-        m = d.get(pid, {}).get("models", {})
-        return list(m.keys()) if isinstance(m, dict) else []
+        return {pid: p for pid, p in d.items() if isinstance(p, dict) and isinstance(p.get("models"), dict)}
+
+    @classmethod
+    def provider(cls, provider: str) -> Optional[Dict]:
+        return cls.providers().get(cls._pid(provider))
+
+    @classmethod
+    def get_api(cls, provider: str) -> Optional[str]:
+        api = (cls.provider(provider) or {}).get("api")
+        return api.rstrip("/") if isinstance(api, str) and api else None
+
+    @classmethod
+    def get_env(cls, provider: str) -> List[str]:
+        return [e for e in ((cls.provider(provider) or {}).get("env") or []) if isinstance(e, str)]
+
+    @classmethod
+    def list_models(cls, provider: str, kind: str = "chat", tool_call: bool = False) -> List[str]:
+        models = (cls.provider(provider) or {}).get("models", {})
+        out = []
+        for mid, m in models.items():
+            if not isinstance(m, dict):
+                continue
+            if kind and (m.get("type") or "chat") != kind:
+                continue
+            if tool_call and not m.get("tool_call"):
+                continue
+            out.append(mid)
+        return sorted(out)
+
+    @classmethod
+    def default_model(cls, provider: str) -> str:
+        models = (cls.provider(provider) or {}).get("models", {})
+        best, score = "", None
+        for mid, m in models.items():
+            if not isinstance(m, dict) or (m.get("type") or "chat") != "chat":
+                continue
+            limit = m.get("limit") or {}
+            context = limit.get("context") if isinstance(limit.get("context"), (int, float)) else 0
+            s = (not m.get("tool_call"), -context)
+            if score is None or s < score:
+                best, score = mid, s
+        return best
 
     @classmethod
     def get_info(cls, provider: str, model_id: str) -> dict | None:
@@ -371,6 +414,24 @@ class ModelCatalog:
             if isinstance(c, (int, float)) and c > 0:
                 return int(c)
         return None
+
+    @classmethod
+    def get_rates(cls, provider: str, model_id: str) -> Optional[Dict[str, float]]:
+        cost = (cls.get_info(provider, model_id) or {}).get("cost") or {}
+        rates = {k: float(v) for k, v in cost.items() if isinstance(v, (int, float))}
+        return rates or None
+
+    @classmethod
+    def get_cost(cls, provider: str, model_id: str, input_tokens: int, output_tokens: int) -> Optional[float]:
+        rates = cls.get_rates(provider, model_id)
+        if rates is None:
+            return None
+        return (input_tokens * rates.get("input", 0.0) + output_tokens * rates.get("output", 0.0)) / 1_000_000
+
+    @classmethod
+    def supports(cls, provider: str, model_id: str, field: str) -> Optional[bool]:
+        value = (cls.get_info(provider, model_id) or {}).get(field)
+        return value if isinstance(value, bool) else None
 
 
 def safe_run(cmd: list, cwd=None, timeout=30, **kwargs):

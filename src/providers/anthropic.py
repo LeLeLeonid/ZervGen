@@ -1,86 +1,149 @@
 import json
-from typing import List, Dict, Callable, Optional
-from src.core.provider import AIProvider, ProviderMeta, get_http_client, _record_failure, _record_success
+import logging
+from typing import Any, Callable, Dict, List, Optional
+
 from src.config import AnthropicSettings
+from src.core.provider import (
+    AIProvider,
+    ProviderError,
+    ProviderMeta,
+    get_http_client,
+    normalize_messages,
+    raise_for_status,
+    split_system,
+)
 from src.utils import async_retry
 
+logger = logging.getLogger(__name__)
+
 META = ProviderMeta(name="anthropic", display_name="Anthropic")
+
+DEFAULT_BASE_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_VERSION = "2023-06-01"
+MAX_TOKENS = 8192
 
 
 class Provider(AIProvider):
     META = META
 
     def __init__(self, settings: AnthropicSettings):
-        self.settings = settings
-        if not self.settings.api_key:
+        if not settings.api_key:
             raise ValueError("Anthropic API Key is not set.")
-        self.base_url = "https://api.anthropic.com/v1/messages"
+        super().__init__(DEFAULT_BASE_URL, settings.api_key, settings.model)
+        self.name = "anthropic"
+        self.settings = settings
         self.headers = {
-            "x-api-key": self.settings.api_key,
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json"
+            "x-api-key": settings.api_key,
+            "anthropic-version": ANTHROPIC_VERSION,
+            "Content-Type": "application/json",
         }
 
     @classmethod
-    def get_model_name(cls, config) -> str:
-        return config.anthropic.model
+    def from_endpoint(cls, name: str, base_url: str, api_key: str, model: str) -> "Provider":
+        if not api_key:
+            raise ValueError(f"{name} API Key is not set.")
+        provider = cls.__new__(cls)
+        AIProvider.__init__(provider, base_url or DEFAULT_BASE_URL, api_key, model)
+        provider.name = name
+        provider.settings = None
+        provider.headers = {
+            "x-api-key": api_key,
+            "anthropic-version": ANTHROPIC_VERSION,
+            "Content-Type": "application/json",
+        }
+        return provider
+
+    def _payload(self, history: List[Dict], system_prompt: str, stream: bool) -> Dict[str, Any]:
+        system, messages = split_system(normalize_messages(history, system_prompt))
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": MAX_TOKENS,
+            "temperature": 0.7,
+            "stream": bool(stream),
+        }
+        if system:
+            payload["system"] = system
+        return payload
+
+    def _track_usage(self, usage: Dict[str, Any]) -> None:
+        if not usage:
+            return
+        merged = dict(self._last_usage)
+        merged.update({k: v for k, v in usage.items() if isinstance(v, (int, float))})
+        self._record_usage(merged)
+
+    def _content(self, blocks: List[Dict[str, Any]]) -> str:
+        return "".join(str(block.get("text", "")) for block in blocks if isinstance(block, dict)).strip()
+
+    async def _non_stream(self, payload: Dict[str, Any]) -> str:
+        response = await get_http_client().post(self.base_url, headers=self.headers, json=payload)
+        raise_for_status(response, self.name)
+        data = response.json()
+        if data.get("type") == "error":
+            raise ProviderError(f"{self.name} error: {data.get('error')}", retryable=True)
+        content = self._content(data.get("content") or [])
+        if not content:
+            raise ProviderError(f"{self.name} returned empty content", retryable=False)
+        self._track_usage(data.get("usage") or {})
+        return content
+
+    async def _stream(self, payload: Dict[str, Any], on_token: Callable[[str], None]) -> str:
+        full = ""
+        async with get_http_client().stream("POST", self.base_url, headers=self.headers, json=payload) as response:
+            if response.status_code != 200:
+                body = (await response.aread()).decode(errors="replace")[:300]
+                retryable = response.status_code in (408, 409, 425, 429) or response.status_code >= 500
+                raise ProviderError(
+                    f"{self.name} HTTP {response.status_code}: {body}",
+                    status_code=response.status_code,
+                    retryable=retryable,
+                )
+            async for line in response.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    event = json.loads(line[5:].strip())
+                except json.JSONDecodeError:
+                    continue
+                event_type = event.get("type")
+                if event_type == "error":
+                    raise ProviderError(f"{self.name} stream error: {event.get('error')}", retryable=True)
+                if event_type == "message_start":
+                    self._track_usage((event.get("message") or {}).get("usage") or {})
+                elif event_type == "message_delta":
+                    self._track_usage(event.get("usage") or {})
+                elif event_type == "content_block_delta":
+                    text = (event.get("delta") or {}).get("text") or ""
+                    if text:
+                        full += text
+                        on_token(text)
+        if not full.strip():
+            raise ProviderError(f"{self.name} streamed empty content", retryable=True)
+        return full
 
     @async_retry(retries=5, delays=[2, 5, 10, 25, 60])
     async def generate_text(self, history: List[Dict], system_prompt: str, on_token: Optional[Callable[[str], None]] = None) -> str:
-        messages = [{"role": m.get("role"), "content": m.get("content", "")} for m in history]
-        payload = {
-            "model": self.settings.model,
-            "messages": messages,
-            "system": system_prompt,
-            "max_tokens": 4096,
-            "temperature": 0.7,
-            "stream": on_token is not None
-        }
-
-        client = get_http_client()
+        self._preflight()
         try:
             if on_token:
-                async with client.stream("POST", self.base_url, headers=self.headers, json=payload) as response:
-                    if response.status_code != 200:
-                        raise Exception(f"Anthropic HTTP {response.status_code}")
-                    full_content = ""
-                    async for line in response.aiter_lines():
-                        if not line.startswith("data: "):
-                            continue
-                        data_str = line[6:]
-                        try:
-                            data = json.loads(data_str)
-                            if data.get("type") == "content_block_delta":
-                                delta = data.get("delta", {}).get("text", "")
-                                if delta:
-                                    full_content += delta
-                                    on_token(delta)
-                        except json.JSONDecodeError:
-                            pass
-                    _record_success("anthropic")
-                    return full_content
-            else:
-                resp = await client.post(self.base_url, headers=self.headers, json=payload)
+                try:
+                    result = await self._stream(self._payload(history, system_prompt, True), on_token)
+                except ProviderError as exc:
+                    if exc.status_code is not None:
+                        raise
+                    logger.debug("%s stream failed, falling back: %s", self.name, exc)
+                else:
+                    self._succeed()
+                    return result
+            result = await self._non_stream(self._payload(history, system_prompt, False))
+        except Exception:
+            self._fail()
+            raise
+        self._succeed()
+        return result
 
-                if resp.status_code != 200:
-                    raise Exception(f"Anthropic HTTP {resp.status_code}")
-
-                data = resp.json()
-                if "error" in data:
-                    raise Exception(f"Anthropic API Error: {data['error']}")
-
-                content = data.get('content', [{}])[0].get('text', '')
-                if not content:
-                    raise Exception("Anthropic returned empty content")
-
-                _record_success("anthropic")
-                return content
-
-        except Exception as e:
-            _record_failure("anthropic")
-            raise e
-
-    async def generate_image(self, prompt: str) -> str:
+    async def generate_image(self, prompt: str, width: Optional[int] = None, height: Optional[int] = None) -> str:
         raise NotImplementedError("Anthropic does not support image generation")
 
     async def generate_audio(self, text: str) -> bytes:

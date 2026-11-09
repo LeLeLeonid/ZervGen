@@ -1,116 +1,154 @@
 import json
 import logging
+from typing import Any, Callable, Dict, List, Optional
+
 import httpx
-from typing import List, Dict, Callable, Optional
-from src.core.provider import get_http_client, _record_failure, _record_success
+
+from src.core.provider import (
+    AIProvider,
+    ProviderError,
+    get_http_client,
+    normalize_messages,
+    raise_for_status,
+)
 
 logger = logging.getLogger(__name__)
 
 
-class OpenAIProvider:
-    def __init__(self, name: str, base_url: str, headers: dict, model: str):
+class OpenAIProvider(AIProvider):
+    def __init__(self, name: str, base_url: str, headers: Dict[str, str], model: str):
+        endpoint = (base_url or "").rstrip("/")
+        if not endpoint.endswith("/chat/completions"):
+            endpoint = f"{endpoint}/chat/completions"
+        super().__init__(base_url=endpoint, model=model, headers=headers)
         self.name = name
-        self.base_url = base_url
-        self.headers = headers
-        self.model = model
         self._cached_prefix_hash = None
 
-    def get_model_name(self, config=None):
-        return self.model
-
     def _is_reasoning_model(self) -> bool:
-        return any(k in self.model.lower() for k in ["o1", "o3", "r1", "reasoning", "deepseek-r", "deepseek-reasoner"])
+        from src.utils import ModelCatalog
 
-    def _estimate_cost(self, input_tokens: int, output_tokens: int) -> float:
-        return (input_tokens * 3 + output_tokens * 15) / 1_000_000
+        flag = ModelCatalog.supports(self.name, self.model, "reasoning")
+        if flag is not None:
+            return flag
+        lowered = (self.model or "").lower()
+        return any(k in lowered for k in ("o1", "o3", "o4", "r1", "reasoning", "deepseek-r"))
 
-    async def _non_stream(self, payload: dict, timeout=None) -> str:
-        client = get_http_client()
-        kwargs = {"headers": self.headers, "json": payload}
+    def _timeout(self) -> Optional[httpx.Timeout]:
+        return httpx.Timeout(180.0, connect=10.0) if self._is_reasoning_model() else None
+
+    def _payload(self, history: List[Dict], system_prompt: str, stream: bool) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "messages": normalize_messages(history, system_prompt),
+            "stream": bool(stream),
+        }
+        if not self._is_reasoning_model():
+            payload["temperature"] = 0.7
+        return payload
+
+    def _content(self, message: Dict[str, Any]) -> str:
+        content = message.get("content")
+        if isinstance(content, list):
+            content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+        return str(content or "").strip()
+
+    async def _non_stream(self, payload: Dict[str, Any]) -> str:
+        kwargs: Dict[str, Any] = {"headers": self.headers, "json": payload}
+        timeout = self._timeout()
         if timeout is not None:
             kwargs["timeout"] = timeout
-        resp = await client.post(self.base_url, **kwargs)
-        if resp.status_code == 429:
-            raise Exception(f"{self.name} rate limited (429)")
-        if resp.status_code != 200:
-            body = resp.text[:500]
-            raise Exception(f"{self.name} HTTP {resp.status_code}: {body}")
-        data = resp.json()
-        if "error" in data:
-            err = data["error"]
-            msg = err.get("message", err) if isinstance(err, dict) else err
-            raise Exception(f"{self.name} error: {msg}")
-        choices = data.get("choices")
+        response = await get_http_client().post(self.base_url, **kwargs)
+        raise_for_status(response, self.name)
+        data = response.json()
+        error = data.get("error")
+        if error:
+            message = error.get("message", error) if isinstance(error, dict) else error
+            raise ProviderError(f"{self.name} error: {message}", retryable=False)
+        choices = data.get("choices") or []
         if not choices:
-            raise Exception(f"{self.name} no choices in response: {json.dumps(data)[:300]}")
-        content = choices[0].get("message", {}).get("content", "")
+            raise ProviderError(f"{self.name} returned no choices", retryable=True)
+        content = self._content(choices[0].get("message") or {})
         if not content:
             finish = choices[0].get("finish_reason", "unknown")
-            raise Exception(f"{self.name} empty content (finish_reason={finish})")
-        usage = data.get("usage", {})
-        if usage:
-            self._last_usage = usage
-            input_tokens = usage.get("prompt_tokens", 0)
-            output_tokens = usage.get("completion_tokens", 0)
-            self._last_cost = self._estimate_cost(input_tokens, output_tokens)
+            raise ProviderError(f"{self.name} returned empty content (finish_reason={finish})", retryable=False)
+        self._record_usage(data.get("usage"))
         return content
 
-    async def _stream(self, payload: dict, on_token: Callable, timeout=None) -> str:
-        client = get_http_client()
-        kwargs = {"headers": self.headers, "json": payload}
+    async def _stream(self, payload: Dict[str, Any], on_token: Callable[[str], None]) -> str:
+        kwargs: Dict[str, Any] = {"headers": self.headers, "json": payload}
+        timeout = self._timeout()
         if timeout is not None:
             kwargs["timeout"] = timeout
         full = ""
-        async with client.stream("POST", self.base_url, **kwargs) as resp:
-            if resp.status_code != 200:
-                body = await resp.aread()
-                raise Exception(f"{self.name} HTTP {resp.status_code}: {body.decode()[:500]}")
-            async for line in resp.aiter_lines():
-                if not line.startswith("data: "):
+        async with get_http_client().stream("POST", self.base_url, **kwargs) as response:
+            if response.status_code != 200:
+                body = (await response.aread()).decode(errors="replace")[:300]
+                retryable = response.status_code in (408, 409, 425, 429) or response.status_code >= 500
+                raise ProviderError(
+                    f"{self.name} HTTP {response.status_code}: {body}",
+                    status_code=response.status_code,
+                    retryable=retryable,
+                )
+            async for line in response.aiter_lines():
+                if not line.startswith("data:"):
                     continue
-                data_str = line[6:]
-                if data_str == "[DONE]":
+                raw = line[5:].strip()
+                if raw == "[DONE]":
                     break
                 try:
-                    data = json.loads(data_str)
+                    event = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
-                if "error" in data:
-                    err = data["error"]
-                    msg = err.get("message", err) if isinstance(err, dict) else err
-                    raise Exception(f"{self.name} stream error: {msg}")
-                delta = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                if delta:
-                    full += delta
-                    on_token(delta)
+                error = event.get("error")
+                if error:
+                    message = error.get("message", error) if isinstance(error, dict) else error
+                    raise ProviderError(f"{self.name} stream error: {message}", retryable=True)
+                if isinstance(event.get("usage"), dict):
+                    self._record_usage(event["usage"])
+                choices = event.get("choices") or []
+                if not choices:
+                    continue
+                text = self._content(choices[0].get("delta") or {})
+                if text:
+                    full += text
+                    on_token(text)
+        if not full.strip():
+            raise ProviderError(f"{self.name} streamed empty content", retryable=True)
         return full
 
-    async def generate_text(self, history: List[Dict], system_prompt: str, on_token: Callable = None) -> str:
-        messages = [{"role": "system", "content": system_prompt}] + history
-        payload = {"model": self.model, "messages": messages, "temperature": 0.7}
+    async def _dispatch(self, history: List[Dict], system_prompt: str, on_token: Optional[Callable[[str], None]]) -> str:
+        if not on_token:
+            return await self._non_stream(self._payload(history, system_prompt, False))
+        emitted = False
 
-        reasoning_timeout = None
-        if self._is_reasoning_model():
-            payload["temperature"] = 0.0
-            reasoning_timeout = httpx.Timeout(90.0, connect=10.0)
-
-        if on_token:
-            try:
-                result = await self._stream(payload, on_token, timeout=reasoning_timeout)
-                if result.strip():
-                    _record_success(self.name)
-                    return result
-            except Exception as e:
-                logger.debug(f"{self.name} stream failed, fallback to non-stream: {e}")
+        def _relay(text: str) -> None:
+            nonlocal emitted
+            emitted = True
+            on_token(text)
 
         try:
-            result = await self._non_stream(payload, timeout=reasoning_timeout)
-            _record_success(self.name)
-            return result
-        except Exception as e:
-            _record_failure(self.name)
-            raise e
+            return await self._stream(self._payload(history, system_prompt, True), _relay)
+        except ProviderError as exc:
+            if exc.status_code is not None or emitted:
+                raise
+            logger.debug("%s stream failed, retrying without streaming: %s", self.name, exc)
+        return await self._non_stream(self._payload(history, system_prompt, False))
 
-    async def generate_image(self, prompt): raise NotImplementedError
-    async def generate_audio(self, text): raise NotImplementedError
-    async def analyze_image(self, prompt, image): raise NotImplementedError
+    async def generate_text(self, history: List[Dict], system_prompt: str, on_token: Callable = None) -> str:
+        self._preflight()
+        try:
+            result = await self._dispatch(history, system_prompt, on_token)
+        except Exception:
+            self._fail()
+            raise
+        self._succeed()
+        return result
+
+    async def generate_image(self, prompt: str, width: Optional[int] = None, height: Optional[int] = None) -> str:
+        raise NotImplementedError(f"{self.name} does not support image generation")
+
+    async def generate_audio(self, text: str) -> bytes:
+        raise NotImplementedError(f"{self.name} does not support audio generation")
+
+    async def analyze_image(self, prompt: str, image: str) -> str:
+        raise NotImplementedError(f"{self.name} does not support image analysis")

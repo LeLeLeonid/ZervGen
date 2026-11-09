@@ -34,7 +34,7 @@ warnings.filterwarnings("ignore", category=ResourceWarning)
 from src.config import load_config, MODES
 from src.core.memory import memory_core
 from src.core.orchestrator import Orchestrator
-from src.core.provider import get_provider, get_model_name, list_providers
+from src.core.provider import get_provider, get_model_name, list_live_models, list_providers
 from src.skills_loader import get_all_roles
 from src.utils import get_global_tokens, reset_global_tokens, count_tokens, add_global_tokens, ModelCatalog
 
@@ -944,22 +944,21 @@ class ZervGenCLI:
                 break
 
     def _has_api_key(self) -> bool:
-        p = self.config.provider
-        if p in ("pollinations", "local", "ollama", "lmstudio", "koboldcpp"):
+        from src.config import _get_all_presets, resolve_provider
+        p = resolve_provider(self.config.provider)
+        if p in ("pollinations", "ollama", "lmstudio", "koboldcpp"):
             return True
-        ps = getattr(self.config, p, None)
-        if ps and getattr(ps, "api_key", None):
+        preset = _get_all_presets(self.config).get(p) or {}
+        env = preset.get("api_key_env") or f"{p.upper().replace('-', '_')}_API_KEY"
+        if os.environ.get(env):
             return True
-        if os.environ.get(f"{p.upper()}_API_KEY"):
-            return True
-        return False
+        section = getattr(self.config, "gemini" if p == "google" else p, None)
+        return bool(section and getattr(section, "api_key", None))
 
     def _select_model(self) -> None:
-        p = self.config.provider
-        ps = getattr(self.config, p, None)
-        if p == "gemini":
-            self._select_gemini_model()
-            return
+        from src.config import resolve_provider
+        p = resolve_provider(self.config.provider)
+        ps = getattr(self.config, "gemini" if p == "google" else p, None)
         current = get_model_name(p, self.config)
         CC.print(f"[dim]Current model: {current}[/dim]")
         models = []
@@ -967,7 +966,7 @@ class ZervGenCLI:
             models = self._list_local_models()
         else:
             try:
-                models = ModelCatalog.list_models(p) or []
+                models = list_live_models(p, self.config) or ModelCatalog.list_models(p)
             except Exception:
                 models = []
         if models:
@@ -998,15 +997,14 @@ class ZervGenCLI:
             new_model = Prompt.ask("Model", default=current) if choice == len(models) + 1 else models[choice - 1]
         if not new_model or new_model == current:
             return
-        if ps and hasattr(ps, "model"):
+        if ps is not None and hasattr(ps, "model"):
             ps.model = new_model
-            try:
-                self.config.save()
-            except Exception:
-                pass
         else:
-            os.environ[f"{p.upper()}_MODEL"] = new_model
-            CC.print(f"[dim]applied now; to keep after restart add {p.upper()}_MODEL={new_model} to .env[/dim]")
+            self.config.provider_models[p] = new_model
+        try:
+            self.config.save()
+        except Exception:
+            pass
         if self.orchestrator:
             try:
                 self.orchestrator.provider = get_provider(p, self.config)
@@ -1042,42 +1040,6 @@ class ZervGenCLI:
             self.config.save()
             CC.print(f"[green]Provider set: {selected.name.upper()}[/green]")
 
-    def _select_gemini_model(self) -> None:
-        try:
-            from src.providers.gemini import fetch_available_models
-        except ImportError:
-            CC.print("[red]Gemini provider module not found.[/red]")
-            CC.print("[yellow]Enter model name manually.[/yellow]")
-            current = getattr(self.config.gemini, "model", "gemini-3.5-flash")
-            new = Prompt.ask("Model", default=current)
-            self.config.gemini.model = new
-            self.config.save()
-            return
-        if not self.config.gemini.api_key:
-            CC.print("[red]API Key required to fetch models.[/red]")
-            self._input_api_key()
-            if not self.config.gemini.api_key:
-                return
-        try:
-            with console.status(_acm("Fetching models…")):
-                models = fetch_available_models(self.config.gemini.api_key)
-            if not models:
-                CC.print("[yellow]No models returned.[/yellow]")
-                return
-            console.clear()
-            CC.print(f"{_acm('Available Models')}\n")
-            for i, m in enumerate(models, 1):
-                CC.print(f"  [{i}] {m}")
-            choice = IntPrompt.ask(
-                "Select",
-                choices=[str(i) for i in range(1, len(models) + 1)],
-            )
-            self.config.gemini.model = models[choice - 1]
-            self.config.save()
-            CC.print(f"[green]✓ Model: {models[choice - 1]}[/green]")
-        except Exception as e:
-            CC.print(f"[red]Error: {self._escape(str(e))}[/red]")
-
     def _list_local_models(self) -> list[str]:
         urls = {
             "ollama": "http://localhost:11434/api/tags",
@@ -1108,7 +1070,10 @@ class ZervGenCLI:
         if ps and getattr(ps, "api_key", None):
             current = ps.api_key
         if not current:
-            current = os.environ.get(f"{p.upper()}_API_KEY", "")
+            from src.config import _get_all_presets
+            preset = _get_all_presets(self.config).get(p) or {}
+            env = preset.get("api_key_env") or f"{p.upper().replace('-', '_')}_API_KEY"
+            current = os.environ.get(env, "")
         masked = (current[:6] + "…" + current[-4:]) if len(current) > 12 else ("(none)" if not current else current)
         CC.print(f"[dim]Current {p} key: {masked}[/dim]")
         key = Prompt.ask(f"{p.title()} API Key", password=True, default="")

@@ -227,6 +227,7 @@ class GlobalSettings(BaseModel):
     openai: OpenAISettings = Field(default_factory=OpenAISettings)
     anthropic: AnthropicSettings = Field(default_factory=AnthropicSettings)
     compatible_presets: Dict[str, Dict[str, str]] = Field(default_factory=dict)
+    provider_models: Dict[str, str] = Field(default_factory=dict)
     mode: str = "BUILD"
     permission_mode: str = "ASK"
     memory_enabled: bool = True
@@ -307,11 +308,103 @@ MODES: Dict[str, Dict[str, str]] = {
               "prompt": "MODE: [DEBUG]. Reproduce the failure, identify the root cause from evidence, make the smallest reliable fix, and verify it."},
 }
 
+PROVIDER_ALIASES: Dict[str, str] = {"gemini": "google"}
+
+PROVIDER_ENDPOINTS: Dict[str, str] = {
+    "openai": "https://api.openai.com/v1",
+    "groq": "https://api.groq.com/openai/v1",
+    "mistral": "https://api.mistral.ai/v1",
+    "xai": "https://api.x.ai/v1",
+    "cerebras": "https://api.cerebras.ai/v1",
+    "togetherai": "https://api.together.xyz/v1",
+    "deepinfra": "https://api.deepinfra.com/v1/openai",
+    "perplexity": "https://api.perplexity.ai",
+    "cohere": "https://api.cohere.ai/compatibility/v1",
+    "ollama": "http://localhost:11434/v1",
+    "lmstudio": "http://127.0.0.1:1234/v1",
+    "koboldcpp": "http://localhost:5001/v1",
+}
+
+NATIVE_DIALECTS: Dict[str, str] = {
+    "anthropic": "anthropic",
+    "google": "google",
+    "gemini": "google",
+}
+
+OPENAI_COMPATIBLE_NPM = {
+    "@ai-sdk/openai-compatible",
+    "@ai-sdk/openai",
+    "@ai-sdk/groq",
+    "@ai-sdk/cerebras",
+    "@ai-sdk/xai",
+    "@ai-sdk/mistral",
+    "@ai-sdk/togetherai",
+    "@ai-sdk/deepinfra",
+    "@ai-sdk/azure",
+    "@openrouter/ai-sdk-provider",
+}
+
+CATALOG_KINDS = ("chat",)
+
+
+def resolve_provider(name: str) -> str:
+    key = (name or "").strip().lower()
+    return PROVIDER_ALIASES.get(key, key)
+
+
+def provider_dialect(name: str) -> str:
+    key = resolve_provider(name)
+    if key in NATIVE_DIALECTS:
+        return NATIVE_DIALECTS[key]
+    from src.utils import ModelCatalog
+    npm = (ModelCatalog.provider(key) or {}).get("npm")
+    if npm == "@ai-sdk/anthropic":
+        return "anthropic"
+    if npm == "@ai-sdk/google":
+        return "google"
+    return "openai"
+
+
+def _chat_endpoint(api: str) -> str:
+    api = api.rstrip("/")
+    return api if api.endswith("/chat/completions") else f"{api}/chat/completions"
+
+
+def _messages_endpoint(api: str) -> str:
+    api = api.rstrip("/")
+    return api if api.endswith("/messages") else f"{api}/messages"
+
+
+def _catalog_presets() -> Dict[str, MCPreset]:
+    from src.utils import ModelCatalog
+    out: Dict[str, MCPreset] = {}
+    for pid, entry in ModelCatalog.providers().items():
+        if pid in NATIVE_DIALECTS:
+            continue
+        npm = entry.get("npm") or ""
+        api = entry.get("api") or PROVIDER_ENDPOINTS.get(pid)
+        if not api:
+            continue
+        if npm == "@ai-sdk/anthropic":
+            url = _messages_endpoint(api)
+        elif npm in OPENAI_COMPATIBLE_NPM or pid in PROVIDER_ENDPOINTS:
+            url = _chat_endpoint(api)
+        else:
+            continue
+        env = next((e for e in (entry.get("env") or []) if isinstance(e, str)), "")
+        out[pid] = {
+            "base_url": url,
+            "api_key_env": env,
+            "default_model": ModelCatalog.default_model(pid),
+        }
+    return out
+
+
 COMPATIBLE_PRESETS: Dict[str, MCPreset] = {
     "omnirouter": {
         "base_url": "https://omnirouter.li/v1/chat/completions",
         "api_key_env": "OMNIROUTER_API_KEY",
-        "default_model": "deepseek-v4-flash",
+        "default_model": "deepseek-v4-1-flash",
     },
     "deepseek": {
         "base_url": "https://api.deepseek.com/chat/completions",
@@ -322,6 +415,41 @@ COMPATIBLE_PRESETS: Dict[str, MCPreset] = {
         "base_url": "https://api.groq.com/openai/v1/chat/completions",
         "api_key_env": "GROQ_API_KEY",
         "default_model": "llama-3.1-70b-versatile",
+    },
+    "mistral": {
+        "base_url": "https://api.mistral.ai/v1/chat/completions",
+        "api_key_env": "MISTRAL_API_KEY",
+        "default_model": "",
+    },
+    "xai": {
+        "base_url": "https://api.x.ai/v1/chat/completions",
+        "api_key_env": "XAI_API_KEY",
+        "default_model": "",
+    },
+    "cerebras": {
+        "base_url": "https://api.cerebras.ai/v1/chat/completions",
+        "api_key_env": "CEREBRAS_API_KEY",
+        "default_model": "",
+    },
+    "togetherai": {
+        "base_url": "https://api.together.xyz/v1/chat/completions",
+        "api_key_env": "TOGETHER_API_KEY",
+        "default_model": "",
+    },
+    "deepinfra": {
+        "base_url": "https://api.deepinfra.com/v1/openai/chat/completions",
+        "api_key_env": "DEEPINFRA_API_KEY",
+        "default_model": "",
+    },
+    "perplexity": {
+        "base_url": "https://api.perplexity.ai/chat/completions",
+        "api_key_env": "PERPLEXITY_API_KEY",
+        "default_model": "",
+    },
+    "cohere": {
+        "base_url": "https://api.cohere.ai/compatibility/v1/chat/completions",
+        "api_key_env": "COHERE_API_KEY",
+        "default_model": "",
     },
     "siliconflow": {
         "base_url": "https://api.siliconflow.cn/v1/chat/completions",
@@ -345,27 +473,26 @@ COMPATIBLE_PRESETS: Dict[str, MCPreset] = {
     },
 }
 
-def _build_preset_headers(preset: dict) -> dict:
+def _build_preset_headers(preset: dict, api_key: str = "") -> dict:
     headers = {"Content-Type": "application/json"}
-    api_key_env = preset.get("api_key_env", "")
-    if api_key_env:
-        api_key = os.environ.get(api_key_env, "")
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
+    key = api_key or os.environ.get(preset.get("api_key_env") or "", "")
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    for name, value in (preset.get("headers") or {}).items():
+        headers[str(name)] = str(value)
     return headers
 
 
 def _get_all_presets(settings=None) -> dict:
-    all_presets = {name: dict(preset) for name, preset in COMPATIBLE_PRESETS.items()}
+    all_presets = _catalog_presets()
+    for name, preset in COMPATIBLE_PRESETS.items():
+        all_presets.setdefault(name, {}).update(preset)
     if settings:
         user_presets = getattr(settings, 'compatible_presets', None)
         if isinstance(user_presets, dict):
             for name, preset in user_presets.items():
                 if isinstance(preset, dict):
-                    if name in all_presets:
-                        all_presets[name].update(preset)
-                    else:
-                        all_presets[name] = dict(preset)
+                    all_presets.setdefault(name, {}).update(preset)
     return all_presets
 
 
