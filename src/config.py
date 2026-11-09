@@ -3,64 +3,133 @@ import shutil
 import os
 import re
 from pathlib import Path
-from typing import Optional, Dict, List, TypedDict, Any
-from pydantic import BaseModel, Field, field_validator
+from typing import Optional, Dict, List, TypedDict, Any, get_args, get_origin
+from pydantic import BaseModel, Field, TypeAdapter, field_validator
 
 CONFIG_PATH = Path("config.json")
 ENV_PATH = Path.home() / ".zervgen" / ".env"
 ALLOWED_ROOTS_PATH = Path.home() / ".zervgen" / "allowed_roots.json"
 
 _REDACT_PATTERNS = [
-    (r'sk-[a-zA-Z0-9]{20,}', '[REDACTED_OPENAI]'),
-    (r'sk-ant-[a-zA-Z0-9-]{20,}', '[REDACTED_ANTHROPIC]'),
-    (r'sk-or-[a-zA-Z0-9-]{20,}', '[REDACTED_OPENROUTER]'),
-    (r'sk_live_[a-zA-Z0-9]{16,}', '[REDACTED_STRIPE]'),
-    (r'rk_live_[a-zA-Z0-9]{16,}', '[REDACTED_STRIPE_REST]'),
-    (r'\bgh[pousr]_[a-zA-Z0-9]{36}\b', '[REDACTED_GITHUB]'),
-    (r'github_pat_[a-zA-Z0-9_]{40,}', '[REDACTED_GITHUB_PAT]'),
-    (r'AKIA[0-9A-Z]{16}', '[REDACTED_AWS]'),
-    (r'ASIA[0-9A-Z]{16}', '[REDACTED_AWS_SESSION]'),
-    (r'AIza[a-zA-Z0-9\-_]{35}', '[REDACTED_GOOGLE]'),
-    (r'ya29\.[a-zA-Z0-9\-_]+', '[REDACTED_GOOGLE_OAUTH]'),
-    (r'xox[baprs]-[a-zA-Z0-9-]+', '[REDACTED_SLACK]'),
-    (r'SG\.[a-zA-Z0-9_\-]{16,}\.[a-zA-Z0-9_\-]{16,}', '[REDACTED_SENDGRID]'),
-    (r'npm_[a-zA-Z0-9]{36}', '[REDACTED_NPM]'),
-    (r'cf-[a-zA-Z0-9]{32,}', '[REDACTED_CLOUDFLARE]'),
-    (r'glpat-[a-zA-Z0-9_\-]{20,}', '[REDACTED_GITLAB]'),
-    (r'\b\d{8,10}:[A-Za-z0-9_-]{30,}\b', '[REDACTED_TELEGRAM_BOT_TOKEN]'),
-    (r'eyJ[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,}', '[REDACTED_JWT]'),
-    (r'-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----', '[REDACTED_PRIVATE_KEY]'),
-    (r'"(api_key|apikey|api_token|secret|client_secret|password|passwd|pwd|token)"\s*:\s*"[^"]{8,}"', '"\\1": "[REDACTED]"'),
-    (r'(?:api_key|apikey|secret|token|password|passwd|pwd|client_secret)\s*[=:]\s*["\'?]?[A-Za-z0-9_\-]{12,}["\'?]?', '[REDACTED_CREDENTIAL]'),
-    (r'Bearer\s+[A-Za-z0-9_\-\.=]{12,}', 'Bearer [REDACTED]'),
-    (r'Authorization:\s*Bearer\s+[a-zA-Z0-9\-_]{20,}', 'Authorization: Bearer [REDACTED]'),
-    (r'x-api-key:\s*[a-zA-Z0-9\-_]{20,}', 'x-api-key: [REDACTED]'),
-    (r'(?:mongodb|postgresql|mysql|redis|amqp|https?)://[^\s:@/]+:[^\s:@/]+@', '[REDACTED_CONN_STRING]'),
+    (re.compile(r'sk-ant-[a-zA-Z0-9-]{20,}', re.IGNORECASE), '[REDACTED_ANTHROPIC]'),
+    (re.compile(r'sk-or-[a-zA-Z0-9-]{20,}', re.IGNORECASE), '[REDACTED_OPENROUTER]'),
+    (re.compile(r'sk-(?:proj-|svcacct-)?[a-zA-Z0-9_-]{20,}', re.IGNORECASE), '[REDACTED_OPENAI]'),
+    (re.compile(r'sk_live_[a-zA-Z0-9]{16,}', re.IGNORECASE), '[REDACTED_STRIPE]'),
+    (re.compile(r'rk_live_[a-zA-Z0-9]{16,}', re.IGNORECASE), '[REDACTED_STRIPE_REST]'),
+    (re.compile(r'\bgh[pousr]_[a-zA-Z0-9]{36}\b', re.IGNORECASE), '[REDACTED_GITHUB]'),
+    (re.compile(r'github_pat_[a-zA-Z0-9_]{40,}', re.IGNORECASE), '[REDACTED_GITHUB_PAT]'),
+    (re.compile(r'AKIA[0-9A-Z]{16}', re.IGNORECASE), '[REDACTED_AWS]'),
+    (re.compile(r'ASIA[0-9A-Z]{16}', re.IGNORECASE), '[REDACTED_AWS_SESSION]'),
+    (re.compile(r'AIza[a-zA-Z0-9\-_]{35}', re.IGNORECASE), '[REDACTED_GOOGLE]'),
+    (re.compile(r'ya29\.[a-zA-Z0-9\-_]+', re.IGNORECASE), '[REDACTED_GOOGLE_OAUTH]'),
+    (re.compile(r'xox[baprs]-[a-zA-Z0-9-]+', re.IGNORECASE), '[REDACTED_SLACK]'),
+    (re.compile(r'SG\.[a-zA-Z0-9_\-]{16,}\.[a-zA-Z0-9_\-]{16,}', re.IGNORECASE), '[REDACTED_SENDGRID]'),
+    (re.compile(r'npm_[a-zA-Z0-9]{36}', re.IGNORECASE), '[REDACTED_NPM]'),
+    (re.compile(r'cf-[a-zA-Z0-9]{32,}', re.IGNORECASE), '[REDACTED_CLOUDFLARE]'),
+    (re.compile(r'glpat-[a-zA-Z0-9_\-]{20,}', re.IGNORECASE), '[REDACTED_GITLAB]'),
+    (re.compile(r'\b\d{8,10}:[A-Za-z0-9_-]{30,}\b', re.IGNORECASE), '[REDACTED_TELEGRAM_BOT_TOKEN]'),
+    (re.compile(r'eyJ[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,}', re.IGNORECASE), '[REDACTED_JWT]'),
+    (re.compile(r'-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----', re.IGNORECASE), '[REDACTED_PRIVATE_KEY]'),
+    (re.compile(r'"([A-Za-z0-9_]*(?:api_key|apikey|api_token|secret|password|passwd|pwd|token))"\s*:\s*"[^"]{8,}"', re.IGNORECASE), '"\\1": "[REDACTED]"'),
+    (re.compile(r'\b([A-Z0-9_]*(?:API_KEY|APIKEY|ACCESS_KEY|TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE_KEY))\s*[=:]\s*["\']?[^\s"\']{8,}["\']?', re.IGNORECASE), '\\1=[REDACTED]'),
+    (re.compile(r'(?:api_key|apikey|secret|token|password|passwd|pwd|client_secret)\s*[=:]\s*["\'?]?[A-Za-z0-9_\-]{12,}["\'?]?', re.IGNORECASE), '[REDACTED_CREDENTIAL]'),
+    (re.compile(r'Bearer\s+[A-Za-z0-9_\-\.=]{12,}', re.IGNORECASE), 'Bearer [REDACTED]'),
+    (re.compile(r'Authorization:\s*Bearer\s+[a-zA-Z0-9\-_]{20,}', re.IGNORECASE), 'Authorization: Bearer [REDACTED]'),
+    (re.compile(r'x-api-key:\s*[a-zA-Z0-9\-_]{20,}', re.IGNORECASE), 'x-api-key: [REDACTED]'),
+    (re.compile(r'(?:mongodb|postgresql|mysql|redis|amqp|https?)://[^\s:@/]+:[^\s:@/]+@', re.IGNORECASE), '[REDACTED_CONN_STRING]'),
 ]
 
 _ANTI_PATTERNS = [
-    (r"rm\s+(-rf?|--recursive)\s+[/~]", "Recursive delete from root/home"),
-    (r"rd\s+/s/q\s+[A-Z]:[\\\/]", "Windows recursive delete from root"),
-    (r"(sudo|doas)\s+", "Privilege escalation"),
-    (r"(chmod|chown)\s+777", "World-writable perms"),
-    (r">\s*/dev/sd[a-z]", "Raw disk write"),
-    (r"del\s+/[fqs]\s+[A-Z]:[\\\/]", "Windows force delete from root"),
-    (r"mkfs\.\w+", "Format filesystem"),
-    (r"dd\s+if=.*of=/dev/", "Raw disk write"),
-    (r":\(\)\s*\{.*\|.*:.*\};:", "Fork bomb"),
-    (r"(shutdown|reboot|halt|poweroff)\s", "System shutdown"),
-    (r"Stop-Computer|Restart-Computer|shutdown\s+/[srf]", "Windows shutdown"),
-    (r"curl\b.*\|\s*(bash|sh|powershell|pwsh)", "Remote code exec via curl"),
-    (r"wget\b.*\|\s*(bash|sh|powershell|pwsh)", "Remote code exec via wget"),
-    (r"iex\s*\(|Invoke-Expression", "PowerShell remote exec"),
-    (r">\s*/etc/(passwd|shadow|hosts)", "Write to system config"),
-    (r"chmod\s+[0-7]*\s+/(etc|usr|bin|sbin)", "System dir perm change"),
-    (r"Set-ExecutionPolicy\s+Bypass", "PowerShell execution bypass"),
-    (r"Remove-Item\s+-[a-z]*Recurse\s+[A-Z]:\\", "PowerShell recursive root delete"),
-    (r"format\s+[A-Z]:\s*/[yq]", "Windows disk format"),
-    (r"reg\s+delete\s+HKLM", "Registry delete"),
-    (r"Remove-ItemProperty\s+.*HKLM", "Registry delete PowerShell"),
+    (re.compile(r"rd\s+/s/q\s+[A-Z]:[\\\/]", re.IGNORECASE), "Windows recursive delete from root"),
+    (re.compile(r"(?<![\w.-])(?:sudo|doas)\s+", re.IGNORECASE), "Privilege escalation"),
+    (re.compile(r"(?:chmod|chown)\s+(?:-[a-zA-Z]+\s+)*777\b", re.IGNORECASE), "World-writable perms"),
+    (re.compile(r">\s*/dev/(?:sd|hd|nvme)", re.IGNORECASE), "Raw disk write"),
+    (re.compile(r"del\s+/[fqs]\s+[A-Z]:[\\\/]", re.IGNORECASE), "Windows force delete from root"),
+    (re.compile(r"\bmkfs\.\w+", re.IGNORECASE), "Format filesystem"),
+    (re.compile(r"\bdd\s+[^|;]*if=[^|;]*of=/dev/", re.IGNORECASE), "Raw disk write"),
+    (re.compile(r":\(\)\s*\{.*\|.*:.*\};:", re.IGNORECASE), "Fork bomb"),
+    (re.compile(r"(?<![\w.-])(?:shutdown|reboot|halt|poweroff)(?:\s|$)", re.IGNORECASE), "System shutdown"),
+    (re.compile(r"Stop-Computer|Restart-Computer|shutdown\s+/[srf]", re.IGNORECASE), "Windows shutdown"),
+    (re.compile(r"\b(?:curl|wget)\b[^|;]*\|\s*(?:bash|sh|zsh|powershell|pwsh)\b", re.IGNORECASE), "Remote code exec via pipe"),
+    (re.compile(r"iex\s*\(|Invoke-Expression", re.IGNORECASE), "PowerShell remote exec"),
+    (re.compile(r">\s*/etc/(?:passwd|shadow|hosts)", re.IGNORECASE), "Write to system config"),
+    (re.compile(r"chmod\s+[0-7]*\s+/(?:etc|usr|bin|sbin)(?:\s|$)", re.IGNORECASE), "System dir perm change"),
+    (re.compile(r"Set-ExecutionPolicy\s+Bypass", re.IGNORECASE), "PowerShell execution bypass"),
+    (re.compile(r"Remove-Item\s+-[a-z]*Recurse\s+[A-Z]:\\", re.IGNORECASE), "PowerShell recursive root delete"),
+    (re.compile(r"format\s+[A-Z]:\s*/[yq]", re.IGNORECASE), "Windows disk format"),
+    (re.compile(r"reg\s+delete\s+HKLM", re.IGNORECASE), "Registry delete"),
+    (re.compile(r"Remove-ItemProperty\s+.*HKLM", re.IGNORECASE), "Registry delete PowerShell"),
 ]
+
+_DESTRUCTIVE_ROOTS = {"/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64", "/opt",
+                      "/proc", "/root", "/sbin", "/sys", "/usr", "/var"}
+_SHELL_SPLIT = re.compile(r"(?:\|\||&&|[;|\n])")
+_SYSTEM_TREES = {"etc", "usr", "bin", "sbin", "lib", "lib64", "boot", "dev", "proc",
+                 "sys", "root", "opt", "var"}
+
+
+def _rm_target_reason(part: str) -> Optional[str]:
+    import shlex
+    try:
+        tokens = shlex.split(part, comments=False, posix=True)
+    except ValueError:
+        tokens = part.split()
+    while tokens and tokens[0] in ("command", "env"):
+        tokens.pop(0)
+        while tokens and ("=" in tokens[0] or tokens[0].startswith("-")):
+            tokens.pop(0)
+    if not tokens or os.path.basename(tokens[0]) not in ("rm", "unlink", "shred"):
+        return None
+    recursive = False
+    force = False
+    paths = []
+    for token in tokens[1:]:
+        if token == "--":
+            continue
+        if token.startswith("--"):
+            name = token[2:].split("=", 1)[0]
+            recursive = recursive or name in ("recursive", "dir")
+            force = force or name == "force"
+            continue
+        if token.startswith("-") and len(token) > 1:
+            flags = token[1:]
+            recursive = recursive or any(c in flags for c in "rR")
+            force = force or "f" in flags
+            continue
+        paths.append(token)
+    if not paths:
+        return None
+    home = str(Path.home())
+    for raw in paths:
+        expanded = raw.replace("${HOME}", home).replace("$HOME", home)
+        if not os.path.isabs(expanded) and expanded.startswith("~"):
+            expanded = os.path.expanduser(expanded)
+        target = os.path.abspath(os.path.expanduser(expanded))
+        if target == "/" or target in _DESTRUCTIVE_ROOTS:
+            return f"Destructive delete of protected path {target}"
+        if target == home and (recursive or force):
+            return f"Destructive delete of home directory {target}"
+        if recursive and target.startswith(home + os.sep) and len(Path(target).parts) <= len(Path(home).parts) + 1:
+            return f"Destructive recursive delete of {target}"
+        if recursive and target.startswith(home + os.sep) and Path(target).name in (".ssh", ".config", ".local", ".zervgen"):
+            return f"Destructive delete of {target}"
+        parts = Path(target).parts
+        if recursive and len(parts) > 1 and parts[1] in _SYSTEM_TREES:
+            return f"Destructive recursive delete of system path {target}"
+    return None
+
+
+def shell_block_reason(command: str) -> Optional[str]:
+    if not command or not command.strip():
+        return "Empty command"
+    for segment in _SHELL_SPLIT.split(command):
+        reason = _rm_target_reason(segment)
+        if reason:
+            return reason
+    for pattern, reason in _ANTI_PATTERNS:
+        if pattern.search(command):
+            return reason
+    return None
 
 INJECTION_PATTERNS = [
     r"ignore\s+(?:all\s+)?previous\s+instructions",
@@ -108,7 +177,6 @@ ZG_PROTOCOL = """
 EVOLUTION_DIR = Path("tmp/evolution")
 MAX_SHORT_TERM = 100
 TEMP_DIR = Path("tmp")
-RISK_ASK_TOOLS = {"shell", "write_file", "append_file", "edit_file", "delegate_to", "add_mcp_server", "mouse_click", "type_text"}
 WMO_CODES = {
     0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
     45: "Fog", 48: "Depositing rime fog",
@@ -139,10 +207,33 @@ _load_env()
 
 
 class MCPServerConfig(BaseModel):
-    command: str
-    args: List[str]
+    command: str = ""
+    args: List[str] = Field(default_factory=list)
     env: Dict[str, str] = Field(default_factory=dict)
+    url: str = ""
+    headers: Dict[str, str] = Field(default_factory=dict)
+    transport: str = "auto"
     enabled: bool = False
+    lazy: bool = False
+    timeout: float = 300.0
+    connect_timeout: float = 60.0
+    input_required_max_rounds: int = 10
+    tools_include: List[str] = Field(default_factory=list)
+    tools_exclude: List[str] = Field(default_factory=list)
+
+    @property
+    def kind(self) -> str:
+        """Transport this entry describes: stdio, sse or http."""
+        explicit = (self.transport or "auto").strip().lower()
+        if explicit in ("stdio", "sse"):
+            return explicit
+        if explicit in ("http", "streamable-http", "streamable_http"):
+            return "http"
+        if self.command:
+            return "stdio"
+        if self.url.rstrip("/").endswith("/sse"):
+            return "sse"
+        return "http"
 
     def is_executable_available(self) -> bool:
         cmd = self.command
@@ -227,6 +318,7 @@ class GlobalSettings(BaseModel):
     openai: OpenAISettings = Field(default_factory=OpenAISettings)
     anthropic: AnthropicSettings = Field(default_factory=AnthropicSettings)
     compatible_presets: Dict[str, Dict[str, str]] = Field(default_factory=dict)
+    provider_models: Dict[str, str] = Field(default_factory=dict)
     mode: str = "BUILD"
     permission_mode: str = "ASK"
     memory_enabled: bool = True
@@ -243,12 +335,17 @@ class GlobalSettings(BaseModel):
     resume_enabled: bool = True
     checkpoint_max_snapshots: int = 30
     trace_enabled: bool = True
-    external_skills_enabled: bool = True
-    external_skill_roots: List[str] = Field(default_factory=lambda: ["tmp"])
+    external_skills_enabled: bool = False
+    external_skill_roots: List[str] = Field(
+        default_factory=lambda: ["~/.zervgen/skills", "~/.agents/skills"]
+    )
     prompt_show_internal_skills: bool = True
     prompt_show_external_skills: bool = False
     prompt_auto_trigger_skills: bool = True
-    prompt_auto_trigger_external_skills: bool = True
+    prompt_auto_trigger_external_skills: bool = False
+    prompt_max_skills: int = 150
+    prompt_skill_description_chars: int = 90
+    prompt_skills_chars: int = 7000
     prompt_show_mcp_tools: bool = True
     prompt_max_chars: int = 14000
     prompt_memory_limit: int = 4
@@ -287,8 +384,22 @@ class GlobalSettings(BaseModel):
         for prov in ("pollinations", "gemini", "openrouter", "openai", "anthropic"):
             if prov in data and isinstance(data[prov], dict):
                 data[prov].pop("api_key", None)
-        with open(CONFIG_PATH, "w") as f:
+        for server in (data.get("mcp_servers") or {}).values():
+            if not isinstance(server, dict):
+                continue
+            server.pop("env", None)
+            headers = server.get("headers")
+            if isinstance(headers, dict):
+                server["headers"] = {k: v for k, v in headers.items() if "${" in str(v)}
+                if not server["headers"]:
+                    server.pop("headers")
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = CONFIG_PATH.with_suffix(CONFIG_PATH.suffix + ".tmp")
+        with open(tmp_path, "w") as f:
             json.dump(data, f, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, CONFIG_PATH)
 
 
 class MCPreset(TypedDict):
@@ -307,11 +418,103 @@ MODES: Dict[str, Dict[str, str]] = {
               "prompt": "MODE: [DEBUG]. Reproduce the failure, identify the root cause from evidence, make the smallest reliable fix, and verify it."},
 }
 
+PROVIDER_ALIASES: Dict[str, str] = {"gemini": "google"}
+
+PROVIDER_ENDPOINTS: Dict[str, str] = {
+    "openai": "https://api.openai.com/v1",
+    "groq": "https://api.groq.com/openai/v1",
+    "mistral": "https://api.mistral.ai/v1",
+    "xai": "https://api.x.ai/v1",
+    "cerebras": "https://api.cerebras.ai/v1",
+    "togetherai": "https://api.together.xyz/v1",
+    "deepinfra": "https://api.deepinfra.com/v1/openai",
+    "perplexity": "https://api.perplexity.ai",
+    "cohere": "https://api.cohere.ai/compatibility/v1",
+    "ollama": "http://localhost:11434/v1",
+    "lmstudio": "http://127.0.0.1:1234/v1",
+    "koboldcpp": "http://localhost:5001/v1",
+}
+
+NATIVE_DIALECTS: Dict[str, str] = {
+    "anthropic": "anthropic",
+    "google": "google",
+    "gemini": "google",
+}
+
+OPENAI_COMPATIBLE_NPM = {
+    "@ai-sdk/openai-compatible",
+    "@ai-sdk/openai",
+    "@ai-sdk/groq",
+    "@ai-sdk/cerebras",
+    "@ai-sdk/xai",
+    "@ai-sdk/mistral",
+    "@ai-sdk/togetherai",
+    "@ai-sdk/deepinfra",
+    "@ai-sdk/azure",
+    "@openrouter/ai-sdk-provider",
+}
+
+CATALOG_KINDS = ("chat",)
+
+
+def resolve_provider(name: str) -> str:
+    key = (name or "").strip().lower()
+    return PROVIDER_ALIASES.get(key, key)
+
+
+def provider_dialect(name: str) -> str:
+    key = resolve_provider(name)
+    if key in NATIVE_DIALECTS:
+        return NATIVE_DIALECTS[key]
+    from src.utils import ModelCatalog
+    npm = (ModelCatalog.provider(key) or {}).get("npm")
+    if npm == "@ai-sdk/anthropic":
+        return "anthropic"
+    if npm == "@ai-sdk/google":
+        return "google"
+    return "openai"
+
+
+def _chat_endpoint(api: str) -> str:
+    api = api.rstrip("/")
+    return api if api.endswith("/chat/completions") else f"{api}/chat/completions"
+
+
+def _messages_endpoint(api: str) -> str:
+    api = api.rstrip("/")
+    return api if api.endswith("/messages") else f"{api}/messages"
+
+
+def _catalog_presets() -> Dict[str, MCPreset]:
+    from src.utils import ModelCatalog
+    out: Dict[str, MCPreset] = {}
+    for pid, entry in ModelCatalog.providers().items():
+        if pid in NATIVE_DIALECTS:
+            continue
+        npm = entry.get("npm") or ""
+        api = entry.get("api") or PROVIDER_ENDPOINTS.get(pid)
+        if not api:
+            continue
+        if npm == "@ai-sdk/anthropic":
+            url = _messages_endpoint(api)
+        elif npm in OPENAI_COMPATIBLE_NPM or pid in PROVIDER_ENDPOINTS:
+            url = _chat_endpoint(api)
+        else:
+            continue
+        env = next((e for e in (entry.get("env") or []) if isinstance(e, str)), "")
+        out[pid] = {
+            "base_url": url,
+            "api_key_env": env,
+            "default_model": ModelCatalog.default_model(pid),
+        }
+    return out
+
+
 COMPATIBLE_PRESETS: Dict[str, MCPreset] = {
     "omnirouter": {
         "base_url": "https://omnirouter.li/v1/chat/completions",
         "api_key_env": "OMNIROUTER_API_KEY",
-        "default_model": "deepseek-v4-flash",
+        "default_model": "deepseek-v4-1-flash",
     },
     "deepseek": {
         "base_url": "https://api.deepseek.com/chat/completions",
@@ -322,6 +525,41 @@ COMPATIBLE_PRESETS: Dict[str, MCPreset] = {
         "base_url": "https://api.groq.com/openai/v1/chat/completions",
         "api_key_env": "GROQ_API_KEY",
         "default_model": "llama-3.1-70b-versatile",
+    },
+    "mistral": {
+        "base_url": "https://api.mistral.ai/v1/chat/completions",
+        "api_key_env": "MISTRAL_API_KEY",
+        "default_model": "",
+    },
+    "xai": {
+        "base_url": "https://api.x.ai/v1/chat/completions",
+        "api_key_env": "XAI_API_KEY",
+        "default_model": "",
+    },
+    "cerebras": {
+        "base_url": "https://api.cerebras.ai/v1/chat/completions",
+        "api_key_env": "CEREBRAS_API_KEY",
+        "default_model": "",
+    },
+    "togetherai": {
+        "base_url": "https://api.together.xyz/v1/chat/completions",
+        "api_key_env": "TOGETHER_API_KEY",
+        "default_model": "",
+    },
+    "deepinfra": {
+        "base_url": "https://api.deepinfra.com/v1/openai/chat/completions",
+        "api_key_env": "DEEPINFRA_API_KEY",
+        "default_model": "",
+    },
+    "perplexity": {
+        "base_url": "https://api.perplexity.ai/chat/completions",
+        "api_key_env": "PERPLEXITY_API_KEY",
+        "default_model": "",
+    },
+    "cohere": {
+        "base_url": "https://api.cohere.ai/compatibility/v1/chat/completions",
+        "api_key_env": "COHERE_API_KEY",
+        "default_model": "",
     },
     "siliconflow": {
         "base_url": "https://api.siliconflow.cn/v1/chat/completions",
@@ -345,27 +583,26 @@ COMPATIBLE_PRESETS: Dict[str, MCPreset] = {
     },
 }
 
-def _build_preset_headers(preset: dict) -> dict:
+def _build_preset_headers(preset: dict, api_key: str = "") -> dict:
     headers = {"Content-Type": "application/json"}
-    api_key_env = preset.get("api_key_env", "")
-    if api_key_env:
-        api_key = os.environ.get(api_key_env, "")
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
+    key = api_key or os.environ.get(preset.get("api_key_env") or "", "")
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    for name, value in (preset.get("headers") or {}).items():
+        headers[str(name)] = str(value)
     return headers
 
 
 def _get_all_presets(settings=None) -> dict:
-    all_presets = {name: dict(preset) for name, preset in COMPATIBLE_PRESETS.items()}
+    all_presets = _catalog_presets()
+    for name, preset in COMPATIBLE_PRESETS.items():
+        all_presets.setdefault(name, {}).update(preset)
     if settings:
         user_presets = getattr(settings, 'compatible_presets', None)
         if isinstance(user_presets, dict):
             for name, preset in user_presets.items():
                 if isinstance(preset, dict):
-                    if name in all_presets:
-                        all_presets[name].update(preset)
-                    else:
-                        all_presets[name] = dict(preset)
+                    all_presets.setdefault(name, {}).update(preset)
     return all_presets
 
 
@@ -376,26 +613,27 @@ def _load_config_impl() -> GlobalSettings:
         return defaults
 
     try:
-        with open(CONFIG_PATH, "r") as f:
-            data = json.load(f)
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("config root must be an object")
+    except Exception as e:
+        print(f"\n[bold red]CONFIG UNREADABLE:[/bold red]\n{e}\n[dim]Running with defaults; {CONFIG_PATH} left untouched.[/dim]\n")
+        return GlobalSettings()
 
+    try:
         default_servers = {k: MCPServerConfig(**v.model_dump()) for k, v in DEFAULT_MCP_SERVERS.items()}
-        if "mcp_servers" in data:
-            merged_servers = {**default_servers}
-            for name, cfg in data.get("mcp_servers", {}).items():
-                if name.lower() == "zervgen":
-                    continue
-                merged_servers[name] = MCPServerConfig(**cfg)
-            data["mcp_servers"] = merged_servers
-
+        merged_servers = dict(default_servers)
+        for name, cfg in (data.get("mcp_servers") or {}).items():
+            if name.lower() == "zervgen" or not isinstance(cfg, dict):
+                continue
+            merged = dict(default_servers.get(name, MCPServerConfig(command="", args=[])).model_dump())
+            merged.update(cfg)
+            merged_servers[name] = MCPServerConfig(**merged)
+        data["mcp_servers"] = merged_servers
         return GlobalSettings.model_validate(data)
     except Exception as e:
-        print(f"\n[bold red]CONFIG VALIDATION FAILED:[/bold red]\n{e}\n")
-        if CONFIG_PATH.exists():
-            shutil.copy(CONFIG_PATH, CONFIG_PATH.with_suffix(".bak"))
-        defaults = GlobalSettings()
-        defaults.save()
-        return defaults
+        print(f"\n[bold red]CONFIG VALIDATION FAILED:[/bold red]\n{e}\n[dim]File left untouched: {CONFIG_PATH}[/dim]\n")
+        return GlobalSettings()
 
 
 _config_instance: Optional[GlobalSettings] = None
@@ -408,28 +646,157 @@ def load_config() -> GlobalSettings:
     return _config_instance
 
 
-def save_env_key(provider_name: str, api_key: str) -> None:
-    provider_settings = getattr(_config_instance, provider_name, None) if _config_instance else None
-    env_key = getattr(provider_settings, '_env_key', '') if provider_settings else ''
-    if not env_key:
-        return
+def _setting_fields(model: Any) -> Dict[str, Any]:
+    """Declared fields of a settings model or its class."""
+    owner = model if isinstance(model, type) else type(model)
+    return dict(getattr(owner, "model_fields", {}) or {})
+
+
+def _is_branch(annotation: Any) -> bool:
+    """Whether a field holds a nested settings model worth expanding."""
+    return isinstance(annotation, type) and issubclass(annotation, BaseModel)
+
+
+def _parse_setting(annotation: Any, raw: str) -> Any:
+    """Read one CLI token as the declared field type."""
+    text = raw.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        text = text[1:-1].strip()
+    if annotation is bool:
+        flag = text.lower()
+        if flag in ("on", "true", "yes", "1", "enable", "enabled"):
+            return True
+        if flag in ("off", "false", "no", "0", "disable", "disabled"):
+            return False
+        raise ValueError("expected on/off")
+    origin = get_origin(annotation)
+    inner = [a for a in get_args(annotation) if a is not type(None)]
+    target = origin or annotation
+    if target is list and inner:
+        if not text.startswith("["):
+            return TypeAdapter(List[inner[0]]).validate_python([p.strip() for p in text.split(",") if p.strip()])
+    if target is dict and inner:
+        if not text.startswith("{"):
+            raise ValueError("expected a JSON object")
+    try:
+        return TypeAdapter(annotation).validate_python(json.loads(text) if text.startswith(("{", "[")) else text)
+    except Exception as exc:
+        raise ValueError(f"invalid value for {getattr(annotation, '__name__', annotation)}: {text[:40]}") from exc
+
+
+def _display_setting(value: Any) -> str:
+    """Render a setting for the terminal, hiding credentials."""
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    if isinstance(value, BaseModel):
+        return value.model_dump_json()
+    if isinstance(value, (dict, list, str)):
+        text = json.dumps(value) if not isinstance(value, str) else value
+        return text if len(text) <= 80 else text[:77] + "..."
+    return str(value)
+
+
+def _safe_value(path: str, value: Any) -> Any:
+    """Mask credentials and server env before a value reaches the screen."""
+    if path.endswith("api_key"):
+        return "********" if value else "(unset)"
+    if path == "mcp_servers" and isinstance(value, dict):
+        return {name: ("enabled" if getattr(cfg, "enabled", False) else "off") for name, cfg in value.items()}
+    if path.endswith("headers") and isinstance(value, dict):
+        return "********" if value else {}
+    return value
+
+
+def config_entries(settings: Optional["GlobalSettings"] = None) -> List[tuple]:
+    """Every editable setting as (dotted path, current value)."""
+    settings = settings or load_config()
+    rows: List[tuple] = []
+    for name, info in _setting_fields(settings).items():
+        value = getattr(settings, name)
+        if _is_branch(info.annotation) and name != "mcp_servers":
+            for sub in _setting_fields(value):
+                path = f"{name}.{sub}"
+                rows.append((path, _safe_value(path, getattr(value, sub))))
+        else:
+            rows.append((name, _safe_value(name, value)))
+    return rows
+
+
+def set_config_value(settings: "GlobalSettings", path: str, raw: str) -> str:
+    """Apply one dotted setting read from the CLI; secrets go to .env."""
+    segments = [part for part in (path or "").strip().split(".") if part]
+    if not segments:
+        raise ValueError("missing setting name")
+    data = settings.model_dump()
+    holder: Any = data
+    for segment in segments[:-1]:
+        if not isinstance(holder, dict) or segment not in holder:
+            raise ValueError(f"unknown setting: {path}")
+        holder = holder[segment]
+        if not isinstance(holder, dict):
+            raise ValueError(f"'{segment}' has no nested settings")
+    leaf = segments[-1]
+    if not isinstance(holder, dict) or leaf not in holder:
+        raise ValueError(f"unknown setting: {path}")
+    field = _setting_fields(settings)
+    for segment in segments[:-1]:
+        field = _setting_fields(field[segment].annotation)
+    value = _parse_setting(field[leaf].annotation, raw)
+    if leaf == "api_key":
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("api_key cannot be empty")
+        provider = segments[0] if len(segments) > 1 else settings.provider
+        if not save_env_key(provider, value.strip()):
+            raise ValueError("could not write the API key to .env")
+        value = value.strip()
+    holder[leaf] = value
+    validated = GlobalSettings.model_validate(data)
+    for name in _setting_fields(settings):
+        setattr(settings, name, getattr(validated, name))
+    shown = "********" if leaf == "api_key" else _display_setting(value)
+    return f"{path} = {shown}"
+
+
+def env_key_for(provider_name: str) -> str:
+    section = getattr(_config_instance, provider_name, None) if _config_instance else None
+    env_key = getattr(section, "_env_key", "") if section else ""
+    if env_key:
+        return env_key
+    preset = _get_all_presets(_config_instance).get(resolve_provider(provider_name)) or {}
+    env_key = preset.get("api_key_env") or ""
+    if env_key:
+        return env_key
+    return f"{resolve_provider(provider_name).upper().replace('-', '_')}_API_KEY"
+
+
+def save_env_var(env_key: str, value: str) -> bool:
+    env_key = (env_key or "").strip()
+    if not env_key or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_key) or not value:
+        return False
     ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
-    lines = []
-    if ENV_PATH.exists():
-        lines = ENV_PATH.read_text().splitlines()
-    found = False
+    lines = ENV_PATH.read_text().splitlines() if ENV_PATH.exists() else []
     new_lines = []
+    found = False
     for line in lines:
-        stripped = line.strip()
-        if stripped.startswith(f"{env_key}="):
-            new_lines.append(f'{env_key}="{api_key}"')
+        if line.strip().startswith(f"{env_key}="):
+            new_lines.append(f'{env_key}="{value}"')
             found = True
         else:
             new_lines.append(line)
     if not found:
-        new_lines.append(f'{env_key}="{api_key}"')
-    ENV_PATH.write_text("\n".join(new_lines) + "\n")
-    os.environ[env_key] = api_key
+        new_lines.append(f'{env_key}="{value}"')
+    tmp_path = ENV_PATH.with_suffix(ENV_PATH.suffix + ".tmp")
+    tmp_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, ENV_PATH)
+    os.environ[env_key] = value
+    return True
+
+
+def save_env_key(provider_name: str, api_key: str) -> bool:
+    if not api_key:
+        return False
+    return save_env_var(env_key_for(provider_name), api_key)
 
 
 def get_allowed_roots() -> List[str]:

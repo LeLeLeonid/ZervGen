@@ -172,6 +172,15 @@ def redact_fast(text: str) -> str:
     return text
 
 
+def redact_traceback(tb_text: str) -> str:
+    """Redact credentials from a Python traceback string."""
+    if not tb_text:
+        return tb_text
+    for pat, repl in _REDACT_PATTERNS:
+        tb_text = re.sub(pat, repl, tb_text)
+    return tb_text
+
+
 def discover_context_files(cwd: str = ".") -> str:
     base = Path(cwd).resolve()
     search = [base]
@@ -241,7 +250,11 @@ def truncate_to_tokens(text: str, max_tokens: int, marker: str = "\n[truncated]"
 
 
 def context_ceiling(window: int) -> int:
-    return window - max(int(window * CONTEXT_RESERVE_SHARE), CONTEXT_RESERVE_MIN)
+    """Usable prompt budget: the window minus a reserve that never swallows it."""
+    if not window or window <= 0:
+        return 0
+    reserve = max(int(window * CONTEXT_RESERVE_SHARE), min(CONTEXT_RESERVE_MIN, int(window * 0.5)))
+    return min(window, max(256, window - reserve))
 
 
 def estimate_messages_tokens(messages: List[Dict]) -> int:
@@ -334,11 +347,54 @@ class ModelCatalog:
         return cls._data
 
     @classmethod
-    def list_models(cls, provider: str) -> list[str]:
+    def _pid(cls, provider: str) -> str:
+        return {"gemini": "google"}.get(provider, provider)
+
+    @classmethod
+    def providers(cls) -> Dict[str, Dict]:
         d = cls._fetch()
-        pid = {"gemini": "google"}.get(provider, provider)
-        m = d.get(pid, {}).get("models", {})
-        return list(m.keys()) if isinstance(m, dict) else []
+        return {pid: p for pid, p in d.items() if isinstance(p, dict) and isinstance(p.get("models"), dict)}
+
+    @classmethod
+    def provider(cls, provider: str) -> Optional[Dict]:
+        return cls.providers().get(cls._pid(provider))
+
+    @classmethod
+    def get_api(cls, provider: str) -> Optional[str]:
+        api = (cls.provider(provider) or {}).get("api")
+        return api.rstrip("/") if isinstance(api, str) and api else None
+
+    @classmethod
+    def get_env(cls, provider: str) -> List[str]:
+        return [e for e in ((cls.provider(provider) or {}).get("env") or []) if isinstance(e, str)]
+
+    @classmethod
+    def list_models(cls, provider: str, kind: str = "chat", tool_call: bool = False) -> List[str]:
+        models = (cls.provider(provider) or {}).get("models", {})
+        out = []
+        for mid, m in models.items():
+            if not isinstance(m, dict):
+                continue
+            if kind and (m.get("type") or "chat") != kind:
+                continue
+            if tool_call and not m.get("tool_call"):
+                continue
+            out.append(mid)
+        return sorted(out)
+
+    @classmethod
+    def default_model(cls, provider: str) -> str:
+        models = (cls.provider(provider) or {}).get("models", {})
+        best, score = "", None
+        for mid, m in models.items():
+            if not isinstance(m, dict) or (m.get("type") or "chat") != "chat":
+                continue
+            limit = m.get("limit") or {}
+            context = limit.get("context") if isinstance(limit.get("context"), (int, float)) else 0
+            s = (not m.get("tool_call"), -context)
+            if score is None or s < score:
+                best, score = mid, s
+        return best
 
     @classmethod
     def get_info(cls, provider: str, model_id: str) -> dict | None:
@@ -362,6 +418,24 @@ class ModelCatalog:
             if isinstance(c, (int, float)) and c > 0:
                 return int(c)
         return None
+
+    @classmethod
+    def get_rates(cls, provider: str, model_id: str) -> Optional[Dict[str, float]]:
+        cost = (cls.get_info(provider, model_id) or {}).get("cost") or {}
+        rates = {k: float(v) for k, v in cost.items() if isinstance(v, (int, float))}
+        return rates or None
+
+    @classmethod
+    def get_cost(cls, provider: str, model_id: str, input_tokens: int, output_tokens: int) -> Optional[float]:
+        rates = cls.get_rates(provider, model_id)
+        if rates is None:
+            return None
+        return (input_tokens * rates.get("input", 0.0) + output_tokens * rates.get("output", 0.0)) / 1_000_000
+
+    @classmethod
+    def supports(cls, provider: str, model_id: str, field: str) -> Optional[bool]:
+        value = (cls.get_info(provider, model_id) or {}).get(field)
+        return value if isinstance(value, bool) else None
 
 
 def safe_run(cmd: list, cwd=None, timeout=30, **kwargs):
@@ -506,29 +580,47 @@ class GitManager:
             return None
         return state
     
+    def _revisions(self, env) -> List[str]:
+        result = safe_run(["git", "rev-list", "HEAD"], cwd=self.repo_dir, env=env, text=True)
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    def _move_ref(self, revision: str, env) -> bool:
+        """Point HEAD at a revision. Never touches the work tree or the index."""
+        result = safe_run(["git", "update-ref", "HEAD", revision], cwd=self.repo_dir, env=env, text=True)
+        return result.returncode == 0
+
+    def _expire(self, env) -> None:
+        safe_run(["git", "reflog", "expire", "--expire=now", "--all"], cwd=self.repo_dir, env=env)
+        safe_run(["git", "gc", "--prune=now"], cwd=self.repo_dir, env=env)
+
+    def _prune_states(self) -> None:
+        state_dir = self.repo_dir / "run_state"
+        if not state_dir.exists():
+            return
+        files = sorted(state_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for path in files[max(1, self.max_snapshots):]:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
     def _prune(self):
+        """Drop old snapshots by moving HEAD. The user's work tree is never reset."""
         env = self._git_env()
-        r = safe_run(["git", "log", "--oneline"], cwd=self.repo_dir, env=env)
-        lines = [l for l in r.stdout.split('\n') if l.strip()]
-        if len(lines) > self.max_snapshots:
-            keep = lines[self.max_snapshots - 1].split()[0]
-            safe_run(["git", "reset", "--hard", keep], cwd=self.repo_dir, env=env)
-            safe_run(["git", "reflog", "expire", "--expire=now", "--all"], cwd=self.repo_dir, env=env)
-            safe_run(["git", "gc", "--prune=now", "--aggressive"], cwd=self.repo_dir, env=env)
-            lines = lines[:self.max_snapshots]
-        if self.max_total_mb > 0:
-            while self._repo_mb() > self.max_total_mb and len(lines) > 1:
-                safe_run(["git", "reset", "--hard", "HEAD~1"], cwd=self.repo_dir, env=env)
-                safe_run(["git", "gc", "--prune=now"], cwd=self.repo_dir, env=env)
-                lines = lines[1:]
-                state_dir = self.repo_dir / "run_state"
-                if state_dir.exists():
-                    files = sorted(state_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-                    for path in files[self.max_snapshots:]:
-                        try:
-                            path.unlink()
-                        except OSError:
-                            pass
+        revisions = self._revisions(env)
+        if not revisions:
+            return
+        changed = False
+        if self.max_snapshots > 0 and len(revisions) > self.max_snapshots:
+            revisions = revisions[: self.max_snapshots]
+            changed = self._move_ref(revisions[-1], env)
+        while self.max_total_mb > 0 and len(revisions) > 1 and self._repo_mb() > self.max_total_mb:
+            revisions = revisions[: max(1, len(revisions) // 2)]
+            changed = self._move_ref(revisions[-1], env) or changed
+            self._expire(env)
+        if changed:
+            self._expire(env)
+            self._prune_states()
 
     def rollback(self, steps: int = 1) -> str:
         env = self._git_env()

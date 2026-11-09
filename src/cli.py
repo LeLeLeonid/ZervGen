@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import sys
 import warnings
@@ -31,13 +32,14 @@ from prompt_toolkit.patch_stdout import patch_stdout
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=ResourceWarning)
 
-from src.config import load_config, MODES
+from src.config import load_config, MODES, ENV_PATH, config_entries, set_config_value
 from src.core.memory import memory_core
 from src.core.orchestrator import Orchestrator
-from src.core.provider import get_provider, get_model_name, list_providers
+from src.core.provider import get_provider, get_model_name, list_live_models, list_providers
 from src.skills_loader import get_all_roles
 from src.utils import get_global_tokens, reset_global_tokens, count_tokens, add_global_tokens, ModelCatalog
 
+logger = logging.getLogger(__name__)
 console = Console()
 C = "purple"
 
@@ -68,6 +70,7 @@ class ZervGenCLI:
         self._pending_input: asyncio.Queue = None
         self._agent_task: Optional[asyncio.Task] = None
         self._perm_future: Optional[asyncio.Future] = None
+        self._mcp_warm_task: Optional[asyncio.Task] = None
         self._modal_cmd: Optional[str] = None
         self._status_text = ""
         self._cmd_table: Dict[str, Any] = {
@@ -91,9 +94,14 @@ class ZervGenCLI:
             "mode": lambda a: self._handle_mode(a),
             "critic": lambda a: self._toggle_cfg_cmd("critic_enabled", "Critic", a),
             "trim": lambda a: self._toggle_cfg_cmd("history_trim_enabled", "History Trim", a),
+            "get": lambda a: self._handle_get(a),
+            "set": lambda a: self._handle_set(a),
+            "settings": lambda a: self._handle_get(a),
+            "key": lambda a: self._input_api_key(),
             "contract": lambda a: self._handle_contract(a),
             "search": lambda a: self._handle_search(a),
             "rollback": lambda a: self._handle_rollback(a),
+            "resume": lambda a: self._handle_resume(a),
             "reload": lambda a: self._cmd_reload(),
             "trace": lambda a: self._cmd_trace(a),
         }
@@ -130,7 +138,7 @@ class ZervGenCLI:
                 self.orchestrator.status_cb = self._on_status
                 if name != chosen:
                     self.config.provider = name
-                    CC.print(f"[yellow]'{chosen}' unavailable ({last_err}) — running on '{name}' this session. Config untouched.[/yellow]")
+                    CC.print(f"[yellow]'{self._escape(chosen)}' unavailable ({self._escape(str(last_err))}) — running on '{self._escape(name)}' this session. Config untouched.[/yellow]")
                 break
             except Exception as e:
                 last_err = e
@@ -144,6 +152,37 @@ class ZervGenCLI:
                 self._dreamer = Dreamer(self.orchestrator.provider, memory_core, self.config.dream_interval, orchestrator=self.orchestrator)
                 await self._dreamer.start()
         await self._setup_permission_handler()
+        await self._warm_mcp()
+
+    def _reload_mcp(self) -> None:
+        """Rebuild the MCP server table after a config change and reconnect."""
+        manager = getattr(self.orchestrator, "_mcp", None)
+        if manager is None:
+            return
+        manager.reload(self.config)
+        if getattr(self.orchestrator, "_mcp_initialized", False):
+            asyncio.create_task(self._warm_mcp())
+
+    async def _warm_mcp(self) -> None:
+        """Connect configured MCP servers in the background so the prompt lists them."""
+        if not getattr(self.config, "mcp_enabled", True):
+            return
+        await self.orchestrator._init_mcp()
+        manager = self.orchestrator._mcp
+        if manager is None or not getattr(manager, "servers", None):
+            return
+        if self._mcp_warm_task and not self._mcp_warm_task.done():
+            return
+
+        async def _connect() -> None:
+            try:
+                await manager.connect_all()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("MCP warm connection failed: %s", exc)
+
+        self._mcp_warm_task = asyncio.create_task(_connect())
     
     def _on_status(self, text: str) -> None:
         self._status_text = text or ""
@@ -300,14 +339,14 @@ class ZervGenCLI:
             return True
         parts = cmd.split()
         raw_cmd = parts[0].lower().lstrip("/")
-        args = parts[1] if len(parts) > 1 else None
+        args = " ".join(parts[1:]) if len(parts) > 1 else None
         handler = self._cmd_table.get(raw_cmd)
         if handler:
             res = handler(args)
             if asyncio.iscoroutine(res):
                 await res
             return True
-        CC.print(f"[red]Unknown command: {cmd}[/red]\n[dim]Type /help for commands.[/dim]")
+        CC.print(f"[red]Unknown command: {self._escape(cmd)}[/red]\n[dim]Type /help for commands.[/dim]")
         return True
 
     def _clear_session(self, hard: bool = False, all_sessions: bool = False) -> bool:
@@ -317,7 +356,7 @@ class ZervGenCLI:
             CC.print("[yellow]All sessions deleted from disk.[/yellow]")
         elif hard and sid:
             memory_core._session_db.delete_session(sid)
-            CC.print(f"[yellow]Session {sid[:8]} deleted from disk.[/yellow]")
+            CC.print(f"[yellow]Session {self._escape(sid[:8])} deleted from disk.[/yellow]")
         self.orchestrator.history = []
         self.orchestrator.skill_name = "system"
         self.orchestrator._last_agent_id = None
@@ -340,7 +379,7 @@ class ZervGenCLI:
                 await self.orchestrator._mcp.cleanup()
             self.orchestrator._mcp = None
             self.orchestrator._mcp_initialized = False
-            await self.orchestrator._init_mcp()
+            await self._warm_mcp()
         return True
 
     def _cmd_reload(self) -> bool:
@@ -399,6 +438,83 @@ class ZervGenCLI:
         CC.print(f"[bold]Provider:[/bold] {self.config.provider.upper()}  [dim]Model: {model}[/dim]")
         return True
 
+    def _handle_get(self, args: Optional[str]) -> bool:
+        rows = config_entries(self.config)
+        if not args:
+            self._show_config_table(rows)
+            return True
+        matches = [(path, value) for path, value in rows if path == args or path.endswith(f".{args}")]
+        if not matches:
+            CC.print(f"[red]Unknown setting: {self._escape(args)}[/red]\n[dim]Use /get to list all.[/dim]")
+            return True
+        for path, value in matches:
+            CC.print(f"[bold cyan]{path}[/bold cyan] = [green]{self._escape(value)}[/green]")
+        return True
+
+    def _show_config_table(self, rows: List[tuple]) -> None:
+        table = Table(title="SETTINGS", border_style=C)
+        table.add_column("Parameter", style="cyan", no_wrap=True)
+        table.add_column("Value", style="green")
+        for path, value in rows:
+            table.add_row(self._escape(path), self._escape(value))
+        CC.print(table)
+        CC.print("[dim]/set <key> <value> to change any of them.[/dim]")
+
+    def _handle_set(self, args: Optional[str]) -> bool:
+        if not args:
+            self._show_config_table(config_entries(self.config))
+            return True
+        parts = args.split(None, 1)
+        key = parts[0]
+        if len(parts) == 1:
+            return self._handle_get(key)
+        raw = parts[1].strip()
+        old_provider = self.config.provider
+        old_mode = self.config.mode
+        try:
+            message = set_config_value(self.config, key, raw)
+        except Exception as exc:
+            CC.print(f"[bold red][!] {self._escape(str(exc))}[/bold red]")
+            return True
+        applied = self._apply_live_config(key, old_provider, old_mode)
+        if applied is False:
+            return True
+        self.config.save()
+        CC.print(f"[bold green]✓ {self._escape(message)}[/bold green]")
+        return True
+
+    def _apply_live_config(self, key: str, old_provider: str, old_mode: str) -> bool:
+        """Push a changed setting into the running system."""
+        if not self.orchestrator:
+            return True
+        if key == "provider" and self.config.provider != old_provider:
+            if not self.orchestrator.switch_provider(self.config.provider):
+                self.config.provider = old_provider
+                CC.print(f"[red]Switch failed — stayed on {self._escape(old_provider.upper())}[/red]")
+                return False
+        if key in {"provider", "model", "temperature"} or key.endswith(".model") or key.endswith(".temperature"):
+            try:
+                self.orchestrator.provider = get_provider(self.config.provider, self.config)
+            except Exception as exc:
+                CC.print(f"[yellow]Provider refresh failed: {self._escape(str(exc))}[/yellow]")
+        if key == "mode" and self.orchestrator.mode != self.config.mode:
+            if not self.orchestrator.set_mode(self.config.mode):
+                self.config.mode = old_mode
+                CC.print(f"[red]Mode change failed — stayed on {self._escape(old_mode)}[/red]")
+                return False
+        if key == "allowed_directories":
+            from src.tools import reload_allowed_roots
+            reload_allowed_roots()
+        if key == "mcp_servers" or key == "mcp_enabled":
+            from src.core.mcp_manager import MCPManager
+            self.orchestrator._mcp_initialized = False
+            MCPManager._instance = None
+            self.orchestrator._mcp = None
+        if key in {"permission_mode", "mode", "allowed_directories"}:
+            self.orchestrator._runtime = self.orchestrator._build_runtime()
+        self.orchestrator.invalidate_cache()
+        return True
+
     def _handle_role(self, args: Optional[str]) -> bool:
         if not args:
             CC.print(f"[bold]Current Role:[/bold] {self.orchestrator.get_mode_status()['role']}")
@@ -406,7 +522,7 @@ class ZervGenCLI:
         if self.orchestrator.set_role(args):
             CC.print(f"[bold green][+] ROLE UPDATED: {args.upper()}[/bold green]")
         else:
-            CC.print(f"[bold red][!] ERROR:[/bold red] Role '{args}' not found")
+            CC.print(f"[bold red][!] ERROR:[/bold red] Role '{self._escape(args)}' not found")
         return True
 
     async def _handle_contract(self, args: Optional[str]) -> bool:
@@ -417,7 +533,7 @@ class ZervGenCLI:
             return True
         skill = skill_index.get(args)
         if not skill:
-            CC.print(f"[red]Skill '{args}' not found[/red]")
+            CC.print(f"[red]Skill '{self._escape(args)}' not found[/red]")
             return True
         table = Table(title=f"Contract: {skill.name}", border_style=C)
         table.add_column("Field", style="cyan")
@@ -443,24 +559,26 @@ class ZervGenCLI:
             if not results:
                 CC.print("[dim]No matches[/dim]")
                 return True
-            table = Table(title=f"Search: {args}", border_style=C)
+            table = Table(title=Text(f"Search: {args}"), border_style=C)
             table.add_column("#", style="cyan")
             table.add_column("Snippet")
             table.add_column("Role", style="green")
             table.add_column("Time", style="dim")
             for i, r in enumerate(results, 1):
-                c = r.get("content", "")
+                c = str(r.get("content", ""))
                 table.add_row(
                     str(i),
-                    (c[:100] + "...") if len(c) > 100 else c,
-                    r.get("role", "?"),
-                    datetime.fromtimestamp(r.get("timestamp", 0)).strftime("%m-%d %H:%M")
-                    if isinstance(r.get("timestamp"), (int, float))
-                    else "",
+                    Text((c[:100] + "...") if len(c) > 100 else c),
+                    Text(str(r.get("role", "?"))),
+                    Text(
+                        datetime.fromtimestamp(r.get("timestamp", 0)).strftime("%m-%d %H:%M")
+                        if isinstance(r.get("timestamp"), (int, float))
+                        else ""
+                    ),
                 )
             CC.print(table)
         except Exception as e:
-            CC.print(f"[red]Error: {e}[/red]")
+            CC.print(f"[red]Error: {self._escape(e)}[/red]")
         return True
 
     async def _handle_rollback(self, args: Optional[str]) -> bool:
@@ -479,7 +597,20 @@ class ZervGenCLI:
             else:
                 CC.print("[red]Rollback failed[/red]")
         except Exception as e:
-            CC.print(f"[red]Error: {e}[/red]")
+            CC.print(f"[red]Error: {self._escape(e)}[/red]")
+        return True
+
+    async def _handle_resume(self, args: Optional[str]) -> bool:
+        """Restore the newest checkpoint (or the named one) and continue its goal."""
+        if not self.orchestrator:
+            return True
+        checkpoint_id = (args or "").strip()
+        try:
+            result = await self.orchestrator.resume_checkpoint(checkpoint_id)
+        except Exception as e:
+            CC.print(f"[red]Resume failed: {self._escape(e)}[/red]")
+            return True
+        CC.print(f"[cyan]{self._escape(result)}[/cyan]")
         return True
 
     async def _handle_mode(self, args: Optional[str]) -> bool:
@@ -523,7 +654,7 @@ class ZervGenCLI:
         CC.print(f"{_acm('SELECT AGENT')}\n")
         for i, (name, cfg) in enumerate(role_list, 1):
             marker = " [cyan](current)[/cyan]" if name == self.orchestrator.skill_name else ""
-            CC.print(f"  [{i}] {name}{marker}")
+            CC.print(f"  [{i}] {self._escape(name)}{marker}")
 
         choice = Prompt.ask(_acm("Choice"))
         try:
@@ -532,7 +663,7 @@ class ZervGenCLI:
                 name, cfg = role_list[idx]
                 self.orchestrator.set_role(name)
                 self.orchestrator._log(name.capitalize(), f"AGENT: {name}", "state")
-                CC.print(f"[green]Agent switched to: {name}[/green]")
+                CC.print(f"[green]Agent switched to: {self._escape(name)}[/green]")
         except (ValueError, IndexError):
             pass
         return True
@@ -549,12 +680,16 @@ class ZervGenCLI:
 /contract - Show skill contract details
 /search  - Search session memory
 /rollback - Rollback last agent step (BUILD mode)
+/resume  - Restore the latest checkpoint and continue its goal
 /memory  - Show memory statistics
 /load    - Load your sessions
 /usage   - Toggle the Token Counter
 /compact - Compact short-term memory into long-term storage
 /reload  - Reload your skills
 /mcp     - Model Context Protocol
+/get     - List every setting, or show one: /get max_steps
+/set     - Change any setting: /set max_steps 80
+/key     - Set the API key for the current provider
 /q       - Quit application
 
 [bold][{C}]PROVIDER:[/{C}][/bold]
@@ -579,7 +714,7 @@ class ZervGenCLI:
     def _show_history(self) -> bool:
         if self.orchestrator and self.orchestrator.history:
             summary = self.orchestrator.get_history_summary()
-            CC.print(Panel(summary, title="Recent History"))
+            CC.print(Panel(Text(summary), title="Recent History"))
         else:
             CC.print("[dim]No history yet.[/dim]")
         return True
@@ -608,7 +743,7 @@ class ZervGenCLI:
         try:
             sessions = memory_core._session_db.list_sessions(20)
         except Exception as e:
-            CC.print(f"[red]Error listing sessions: {e}[/red]")
+            CC.print(f"[red]Error listing sessions: {self._escape(e)}[/red]")
             return True
 
         if not sessions:
@@ -627,7 +762,7 @@ class ZervGenCLI:
                     started = str(start_ts)
             else:
                 started = ''
-            CC.print(f"[{i}] {title} ({msgcnt} msgs) [{started}]")
+            CC.print(f"[{i}] {self._escape(title)} ({msgcnt} msgs) [{self._escape(started)}]")
 
         try:
             choice = IntPrompt.ask("Load Session #", choices=[str(i) for i in range(1, min(10, len(sessions)) + 1)])
@@ -681,10 +816,10 @@ class ZervGenCLI:
             in_tok, _ = count_tokens(history, "")
             add_global_tokens(in_tok)
 
-            CC.print(f"[green]Loaded session: {selected.get('title') or session_id}[/green]")
+            CC.print(f"[green]Loaded session: {self._escape(selected.get('title') or session_id)}[/green]")
 
         except Exception as e:
-            CC.print(f"[red]Failed to load session: {e}[/red]")
+            CC.print(f"[red]Failed to load session: {self._escape(e)}[/red]")
 
         return True
 
@@ -742,7 +877,7 @@ class ZervGenCLI:
             await memory_core.add_memory(summary[:500], category="compacted", tier="recent")
             CC.print(f"[bold green]Compacted {len(to_summarize)} messages into 1 summary.[/bold green]")
         except Exception as e:
-            CC.print(f"[red]Compaction failed: {e}[/red]")
+            CC.print(f"[red]Compaction failed: {self._escape(e)}[/red]")
         return True
 
     async def settings_menu(self) -> None:
@@ -766,6 +901,7 @@ class ZervGenCLI:
             table.add_row("10", "Path Whitelist", "Manage...")
             table.add_row("11", "Accent Color", C)
             table.add_row("12", "Permission Mode", self.config.permission_mode)
+            table.add_row("13", "Advanced (all settings)", f"{len(config_entries(self.config))} parameters")
 
             CC.print(table)
             CC.print("\n[dim]ID to edit, 'b' to return[/dim]")
@@ -788,6 +924,7 @@ class ZervGenCLI:
                     '10': self._whitelist_menu,
                     '11': self._select_accent_color,
                     '12': self._permission_menu,
+                    '13': self._advanced_settings_menu,
                 }
 
                 if choice in handlers:
@@ -843,6 +980,41 @@ class ZervGenCLI:
         except (ValueError, IndexError):
             pass
 
+    def _advanced_settings_menu(self) -> None:
+        rows = config_entries(self.config)
+        while True:
+            console.clear()
+            CC.print(f"[bold]{_acm('ALL SETTINGS')}[/bold]")
+            CC.print("[dim]Enter a number to change it, or 'b' to go back.[/dim]\n")
+            table = Table(border_style=C)
+            table.add_column("#", style="cyan", no_wrap=True)
+            table.add_column("Parameter", style=C)
+            table.add_column("Value", style="green")
+            for i, (path, value) in enumerate(rows, 1):
+                table.add_row(str(i), self._escape(path), self._escape(value))
+            CC.print(table)
+            choice = Prompt.ask(_acm("Setting"))
+            if choice.lower() in ("b", "back", "q"):
+                return
+            try:
+                path, current = rows[int(choice) - 1]
+            except (ValueError, IndexError):
+                continue
+            raw = Prompt.ask(f"{path} [dim]({self._escape(current)})[/dim]", default="")
+            if not raw.strip():
+                continue
+            old_provider, old_mode = self.config.provider, self.config.mode
+            try:
+                message = set_config_value(self.config, path, raw)
+            except Exception as exc:
+                CC.print(f"[red]{self._escape(str(exc))}[/red]")
+                Prompt.ask("[dim]Enter to continue[/dim]", default="")
+                continue
+            if self._apply_live_config(path, old_provider, old_mode) is not False:
+                self.config.save()
+                CC.print(f"[green]✓ {self._escape(message)}[/green]")
+            rows = config_entries(self.config)
+
     def _run_menu(self, title: str, items: List[tuple]) -> None:
         while True:
             console.clear()
@@ -890,7 +1062,7 @@ class ZervGenCLI:
         try:
             sessions = memory_core._session_db.list_sessions(20)
         except Exception as e:
-            CC.print(f"[red]Error listing sessions: {e}[/red]")
+            CC.print(f"[red]Error listing sessions: {self._escape(e)}[/red]")
             return True
 
         if not sessions:
@@ -914,7 +1086,7 @@ class ZervGenCLI:
                     started = str(ts)
             else:
                 started = ''
-            table.add_row(str(i), title, str(msgcnt), started)
+            table.add_row(str(i), Text(title), str(msgcnt), started)
 
         CC.print(table)
         return True
@@ -944,22 +1116,21 @@ class ZervGenCLI:
                 break
 
     def _has_api_key(self) -> bool:
-        p = self.config.provider
-        if p in ("pollinations", "local", "ollama", "lmstudio", "koboldcpp"):
+        from src.config import _get_all_presets, resolve_provider
+        p = resolve_provider(self.config.provider)
+        if p in ("pollinations", "ollama", "lmstudio", "koboldcpp"):
             return True
-        ps = getattr(self.config, p, None)
-        if ps and getattr(ps, "api_key", None):
+        preset = _get_all_presets(self.config).get(p) or {}
+        env = preset.get("api_key_env") or f"{p.upper().replace('-', '_')}_API_KEY"
+        if os.environ.get(env):
             return True
-        if os.environ.get(f"{p.upper()}_API_KEY"):
-            return True
-        return False
+        section = getattr(self.config, "gemini" if p == "google" else p, None)
+        return bool(section and getattr(section, "api_key", None))
 
     def _select_model(self) -> None:
-        p = self.config.provider
-        ps = getattr(self.config, p, None)
-        if p == "gemini":
-            self._select_gemini_model()
-            return
+        from src.config import resolve_provider
+        p = resolve_provider(self.config.provider)
+        ps = getattr(self.config, "gemini" if p == "google" else p, None)
         current = get_model_name(p, self.config)
         CC.print(f"[dim]Current model: {current}[/dim]")
         models = []
@@ -967,7 +1138,7 @@ class ZervGenCLI:
             models = self._list_local_models()
         else:
             try:
-                models = ModelCatalog.list_models(p) or []
+                models = list_live_models(p, self.config) or ModelCatalog.list_models(p)
             except Exception:
                 models = []
         if models:
@@ -989,7 +1160,7 @@ class ZervGenCLI:
                 out_cost = cost.get('output', '?')
                 tag = f"[dim]{ctx // 1000 if ctx else '?'}k ctx · ${in_cost}/M in · ${out_cost}/M out[/dim]"
                 mk = " ->" if m == current else "   "
-                CC.print(f"{mk}[{i}] {m}  {tag}")
+                CC.print(f"{mk}[{i}] {self._escape(str(m))}  {tag}")
             CC.print(f"   [{len(models) + 1}] custom...")
             try:
                 choice = IntPrompt.ask("Select", choices=[str(i) for i in range(1, len(models) + 2)])
@@ -998,15 +1169,14 @@ class ZervGenCLI:
             new_model = Prompt.ask("Model", default=current) if choice == len(models) + 1 else models[choice - 1]
         if not new_model or new_model == current:
             return
-        if ps and hasattr(ps, "model"):
+        if ps is not None and hasattr(ps, "model"):
             ps.model = new_model
-            try:
-                self.config.save()
-            except Exception:
-                pass
         else:
-            os.environ[f"{p.upper()}_MODEL"] = new_model
-            CC.print(f"[dim]applied now; to keep after restart add {p.upper()}_MODEL={new_model} to .env[/dim]")
+            self.config.provider_models[p] = new_model
+        try:
+            self.config.save()
+        except Exception:
+            pass
         if self.orchestrator:
             try:
                 self.orchestrator.provider = get_provider(p, self.config)
@@ -1042,42 +1212,6 @@ class ZervGenCLI:
             self.config.save()
             CC.print(f"[green]Provider set: {selected.name.upper()}[/green]")
 
-    def _select_gemini_model(self) -> None:
-        try:
-            from src.providers.gemini import fetch_available_models
-        except ImportError:
-            CC.print("[red]Gemini provider module not found.[/red]")
-            CC.print("[yellow]Enter model name manually.[/yellow]")
-            current = getattr(self.config.gemini, "model", "gemini-3.5-flash")
-            new = Prompt.ask("Model", default=current)
-            self.config.gemini.model = new
-            self.config.save()
-            return
-        if not self.config.gemini.api_key:
-            CC.print("[red]API Key required to fetch models.[/red]")
-            self._input_api_key()
-            if not self.config.gemini.api_key:
-                return
-        try:
-            with console.status(_acm("Fetching models…")):
-                models = fetch_available_models(self.config.gemini.api_key)
-            if not models:
-                CC.print("[yellow]No models returned.[/yellow]")
-                return
-            console.clear()
-            CC.print(f"{_acm('Available Models')}\n")
-            for i, m in enumerate(models, 1):
-                CC.print(f"  [{i}] {m}")
-            choice = IntPrompt.ask(
-                "Select",
-                choices=[str(i) for i in range(1, len(models) + 1)],
-            )
-            self.config.gemini.model = models[choice - 1]
-            self.config.save()
-            CC.print(f"[green]✓ Model: {models[choice - 1]}[/green]")
-        except Exception as e:
-            CC.print(f"[red]Error: {self._escape(str(e))}[/red]")
-
     def _list_local_models(self) -> list[str]:
         urls = {
             "ollama": "http://localhost:11434/api/tags",
@@ -1102,41 +1236,41 @@ class ZervGenCLI:
             return []
 
     def _input_api_key(self) -> None:
-        p = self.config.provider
-        ps = getattr(self.config, p, None)
-        current = ""
-        if ps and getattr(ps, "api_key", None):
-            current = ps.api_key
+        from src.config import env_key_for, resolve_provider, save_env_key
+        p = resolve_provider(self.config.provider)
+        section = getattr(self.config, "gemini" if p == "google" else p, None)
+        current = getattr(section, "api_key", None) if section else None
+        env_name = env_key_for(p)
         if not current:
-            current = os.environ.get(f"{p.upper()}_API_KEY", "")
+            current = os.environ.get(env_name, "")
         masked = (current[:6] + "…" + current[-4:]) if len(current) > 12 else ("(none)" if not current else current)
         CC.print(f"[dim]Current {p} key: {masked}[/dim]")
         key = Prompt.ask(f"{p.title()} API Key", password=True, default="")
         if not key:
             CC.print("[dim]kept existing[/dim]" if current else "[yellow]no key entered[/yellow]")
             return
-        os.environ[f"{p.upper()}_API_KEY"] = key
+        stored = False
         try:
-            from src.config import save_env_key
-            save_env_key(p, key)
-        except Exception:
-            pass
-        if ps and hasattr(ps, "api_key"):
-            ps.api_key = key
-            try:
-                self.config.save()
-            except Exception:
-                pass
+            stored = save_env_key(p, key)
+        except Exception as exc:
+            CC.print(f"[red]Could not write .env: {self._escape(str(exc))}[/red]")
+        os.environ[env_name] = key
+        if section is not None and hasattr(section, "api_key"):
+            section.api_key = key
+            key = ""
         if self.orchestrator:
             try:
                 self.orchestrator.provider = get_provider(p, self.config)
                 self.orchestrator.invalidate_cache()
-            except Exception as e:
-                CC.print(f"[yellow]key saved, refresh failed: {self._escape(str(e))}[/yellow]")
-        CC.print("[dim]saved to .env — table updates on redraw[/dim]")
+            except Exception as exc:
+                CC.print(f"[yellow]key set, provider refresh failed: {self._escape(str(exc))}[/yellow]")
+        CC.print(f"[dim]{env_name} saved to {ENV_PATH}[/dim]" if stored else "[yellow]key held in this session only[/yellow]")
 
     def _check_server_installed(self, cfg) -> bool:
+        """Local servers need their executable; remote servers only need a URL."""
         import shutil
+        if getattr(cfg, "kind", "stdio") != "stdio":
+            return bool(cfg.url)
         if cfg.command == "internal":
             from src.tools import TOOL_REGISTRY
             return bool(TOOL_REGISTRY)
@@ -1153,6 +1287,9 @@ class ZervGenCLI:
     def _install_server(self, name: str, cfg) -> bool:
         import subprocess
         import shutil
+        if cfg.kind != "stdio":
+            CC.print(f"[green]'{self._escape(name)}' is remote ({cfg.kind}) — nothing to install.[/green]")
+            return True
         if cfg.args and cfg.args[0] == "-m" and len(cfg.args) > 1:
             module = cfg.args[1]
             CC.print(f"\n[yellow]Installing Python module: {module}...[/yellow]")
@@ -1162,7 +1299,7 @@ class ZervGenCLI:
                     capture_output=True, text=True, timeout=120
                 )
                 if result.returncode == 0:
-                    CC.print(f"[green]{name} installed![/green]")
+                    CC.print(f"[green]{self._escape(name)} installed![/green]")
                     return True
                 else:
                     CC.print(f"[red]Install failed:[/red] {result.stderr[:200]}")
@@ -1172,10 +1309,10 @@ class ZervGenCLI:
                 return False
         elif cfg.command == "npx":
             if not (shutil.which("npx") or shutil.which("npx.cmd")):
-                CC.print(f"[red]Cannot enable '{name}': npx is not installed or not in PATH.[/red]")
+                CC.print(f"[red]Cannot enable '{self._escape(name)}': npx is not installed or not in PATH.[/red]")
                 CC.print(f"[yellow]Install Node.js to use npx-based MCP servers.[/yellow]")
                 return False
-            CC.print(f"[green]'{name}' ready — package will be fetched via npx on first connection.[/green]")
+            CC.print(f"[green]'{self._escape(name)}' ready — package will be fetched via npx on first connection.[/green]")
             return True
         else:
             CC.print(f"[red]Unknown install method for '{cfg.command}'.[/red]")
@@ -1192,14 +1329,18 @@ class ZervGenCLI:
             table.add_column("Runtime", style=C)
             table.add_column("Command", style="dim")
             servers = list(self.config.mcp_servers.keys())
-            from src.core.mcp_manager import MCPManager
-            live = MCPManager(self.config)
+            live = getattr(self.orchestrator, "_mcp", None)
             for i, name in enumerate(servers, 1):
                 cfg = self.config.mcp_servers[name]
                 status = "[green]ON[/green]" if cfg.enabled else "[dim]OFF[/dim]"
                 installed = self._check_server_installed(cfg)
                 inst_display = "[green]Yes[/green]" if installed else "[red]No[/red]"
-                cmd = "[cyan](internal)[/cyan]" if cfg.command == "internal" else cfg.command
+                if cfg.kind != "stdio":
+                    cmd = Text(f"{cfg.kind}: {cfg.url}", style="cyan")
+                elif cfg.command == "internal":
+                    cmd = Text("(internal)", style="cyan")
+                else:
+                    cmd = Text(cfg.command)
                 lsrv = live.servers.get(name) if live else None
                 if lsrv and lsrv.connected:
                     runtime = "[green]LIVE[/green]"
@@ -1210,14 +1351,8 @@ class ZervGenCLI:
                 else:
                     runtime = "[red]DEAD[/red]"
                 
-                if not cfg.enabled:
-                    display_name = f"[dim]{name}[/dim]"
-                elif installed:
-                    display_name = f"[green]{name}[/green]"
-                else:
-                    display_name = f"[red]{name}[/red]"
-                    
-                table.add_row(str(i), display_name, status, inst_display, runtime, cmd)
+                tone = "dim" if not cfg.enabled else ("green" if installed else "red")
+                table.add_row(str(i), Text(name, style=tone), status, inst_display, runtime, cmd)
 
             CC.print(table)
             CC.print("\n[dim]ID to toggle/install, 'b' to back[/dim]")
@@ -1232,16 +1367,18 @@ class ZervGenCLI:
                     name = servers[idx]
                     cfg = self.config.mcp_servers[name]
                     installed = self._check_server_installed(cfg)
-                    if not installed and cfg.command != "internal":
+                    if not installed:
                         if self._install_server(name, cfg):
                             cfg.enabled = True
                             self.config.save()
-                            CC.print(f"[green]{name} enabled![/green]")
+                            self._reload_mcp()
+                            CC.print(f"[green]{self._escape(name)} enabled![/green]")
                         Prompt.ask("[dim]Press Enter[/dim]")
                     else:
                         cfg.enabled = not cfg.enabled
                         self.config.save()
-                        CC.print(f"[yellow]Toggled {name}: {'ON' if cfg.enabled else 'OFF'}[/yellow]")
+                        self._reload_mcp()
+                        CC.print(f"[yellow]Toggled {self._escape(name)}: {'ON' if cfg.enabled else 'OFF'}[/yellow]")
             except ValueError:
                 pass
 
@@ -1299,6 +1436,7 @@ class ZervGenCLI:
             self.orchestrator.new_session(title=user_input[:80])
         self._agent_task = asyncio.create_task(self._do_run(user_input))
         self._agent_running = True
+        deferred: list[str] = []
         if self._app:
             self._app.invalidate()
         try:
@@ -1311,12 +1449,15 @@ class ZervGenCLI:
                     if self._perm_future and not self._perm_future.done() and msg.strip().lower() in ("y", "n", "yes", "no"):
                         self._perm_future.set_result(msg.strip().lower() in ("y", "yes"))
                         continue
-                    if msg.strip().lower() in ("/stop", "stop"):
+                    text = msg.strip()
+                    if text.lower() in ("/stop", "stop"):
                         if self._agent_task and not self._agent_task.done():
                             self.orchestrator.request_interrupt()
                             self._agent_task.cancel()
+                    elif text.startswith("/"):
+                        deferred.append(text)
                     else:
-                        self.orchestrator.inject_user_message(msg)
+                        self.orchestrator.inject_user_message(text)
                 await asyncio.sleep(0.1)
         except asyncio.CancelledError:
             self._agent_task.cancel()
@@ -1332,9 +1473,10 @@ class ZervGenCLI:
             await self._agent_task
         except (asyncio.CancelledError, Exception):
             pass
-        for m in list(self.orchestrator._injected):
-            self.orchestrator._injected.remove(m)
-            self._pending_input.put_nowait(m["content"])
+        for m in self.orchestrator.coordinator.drain():
+            self._pending_input.put_nowait(m)
+        for cmd in deferred:
+            await self.handle_system_command(cmd)
 
     async def _do_run(self, user_input: str) -> None:
         async with self._active_lock:
@@ -1356,7 +1498,7 @@ class ZervGenCLI:
                 pass
         try:
             response = await self.orchestrator.run(user_input)
-            if response and response.strip():
+            if response and response.strip() and not self._already_shown(response):
                 shown = response if len(response) < 12000 else response[:12000] + f"\n\n… [{len(response) - 12000} chars truncated]"
                 CC.print(Panel(Markdown(shown), border_style=C))
         except asyncio.CancelledError:
@@ -1367,6 +1509,14 @@ class ZervGenCLI:
             async with self._active_lock:
                 self._user_active = False
                 self.orchestrator._user_active = False
+
+    def _already_shown(self, response: str) -> bool:
+        """Whether the streamed prose already carried this final answer."""
+        if not getattr(self.orchestrator, "_last_streamed", False):
+            return False
+        streamed = getattr(self.orchestrator, "_last_streamed_text", "") or ""
+        head = response.strip()[:200]
+        return bool(head) and head in streamed
 
     def _escape(self, text: str) -> str:
         return str(text).replace("[", "\\[")
@@ -1396,6 +1546,9 @@ class ZervGenCLI:
                 raise SystemExit(0)
 
     async def _cleanup(self) -> None:
+        if self._mcp_warm_task and not self._mcp_warm_task.done():
+            self._mcp_warm_task.cancel()
+            await asyncio.gather(self._mcp_warm_task, return_exceptions=True)
         if self.orchestrator:
             try:
                 await self.orchestrator.cleanup()

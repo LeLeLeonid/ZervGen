@@ -23,22 +23,21 @@ async def graceful_shutdown(sig):
 
 
 def handle_exit(sig, frame):
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.create_task(graceful_shutdown(sig))
-        else:
-            os._exit(0)
-    except RuntimeError:
-        os._exit(0)
+    """Interrupt whatever is blocking, so an open prompt cannot swallow Ctrl-C."""
+    raise KeyboardInterrupt
 
 
 async def main():
     loop = asyncio.get_running_loop()
-    def _ignore_shutdown_exceptions(l, context):
-        if sys.meta_path is None:
+    def _ignore_shutdown_exceptions(loop, context):
+        """Swallow the teardown noise that fires while transports are being closed."""
+        exc = context.get("exception")
+        message = context.get("message", "")
+        if isinstance(exc, (RuntimeError, OSError)) and "Event loop is closed" in (str(exc) or message):
             return
-        l.default_exception_handler(context)
+        if "Event loop is closed" in message:
+            return
+        loop.default_exception_handler(context)
     loop.set_exception_handler(_ignore_shutdown_exceptions)
     from src.cli import ZervGenCLI
     from src.utils import setup_logging
@@ -62,12 +61,9 @@ def run_app():
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        if is_windows:
-            try:
-                asyncio.run(graceful_shutdown(signal.SIGINT))
-            except Exception:
-                os._exit(0)
-        else:
+        try:
+            asyncio.run(graceful_shutdown(signal.SIGINT))
+        except Exception:
             os._exit(0)
     except Exception as e:
         console.print(f"\n[bold red]Error:[/bold red] {str(e).replace('[', '\\[')}")

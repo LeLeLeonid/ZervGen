@@ -1,6 +1,7 @@
 import re
 import threading
 import logging
+import time
 import yaml
 import json
 from pathlib import Path
@@ -12,60 +13,150 @@ logger = logging.getLogger(__name__)
 SKILLS_DIR = Path(__file__).parent / "skills"
 AGENTS_DIR = SKILLS_DIR / "AGENTS"
 CATALOG_PATH = Path("tmp/memory/skills_catalog.json")
+CATALOG_TTL_SECONDS = 120
+
+SKILL_FILE = "SKILL.md"
+SUPPORT_DIRS = ("references", "templates", "assets", "scripts")
+MAX_NAME = 64
+MAX_DESCRIPTION = 1024
+MAX_DEPTH = 6
+SKIP_DIRS = {"node_modules", "__pycache__", "site-packages", ".git"}
+_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
 
 def _external_roots() -> List[Path]:
     try:
         from src.config import load_config
         roots = getattr(load_config(), "external_skill_roots", ["tmp"])
-        return [Path(r).resolve() for r in roots if str(r).strip()]
+        return [Path(r).expanduser().resolve() for r in roots if str(r).strip()]
     except Exception:
         return [Path("tmp").resolve()]
 
+
 def _parse_frontmatter(text: str) -> Optional[dict]:
+    """Frontmatter of a skill file, or None when it is not a skill."""
     if not text.startswith("---"):
         return None
     try:
         end = text.index("---", 3)
-    except ValueError:
-        return None
-    try:
         fm = yaml.safe_load(text[3:end]) or {}
     except Exception:
         return None
-    if not (fm.get("name") and fm.get("description")):
+    if not isinstance(fm, dict) or not fm.get("name") or not fm.get("description"):
         return None
     tags = fm.get("tags", [])
     if isinstance(tags, str):
         fm["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
-    elif not isinstance(tags, list):
-        fm["tags"] = []
+    elif isinstance(tags, list):
+        fm["tags"] = [str(t) for t in tags]
     else:
-        fm["tags"] = tags
+        fm["tags"] = []
+
+    name = str(fm["name"]).strip()
+    description = " ".join(str(fm["description"]).split())
+    if len(name) > MAX_NAME or not _NAME_RE.match(name):
+        logger.warning("Skill name rejected: %r", name)
+        return None
+    if len(description) > MAX_DESCRIPTION:
+        description = description[:MAX_DESCRIPTION]
+    fm["name"], fm["description"] = name, description
     return fm
 
-def rebuild_catalog() -> dict:
-    old = {}
+
+def _iter_skill_files(root: Path):
+    """Yield skill files: a directory with SKILL.md is a leaf, never recursed."""
+    stack = [(root, 0)]
+    while stack:
+        directory, depth = stack.pop()
+        if depth > MAX_DEPTH:
+            continue
+        skill = directory / SKILL_FILE
+        if skill.is_file():
+            yield skill
+            continue
+        try:
+            entries = sorted(directory.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.name.startswith(".") or entry.name in SKIP_DIRS:
+                continue
+            if entry.is_dir() and not entry.is_symlink():
+                stack.append((entry, depth + 1))
+            elif depth == 0 and entry.suffix.lower() == ".md" and entry.name != "README.md":
+                yield entry
+
+
+def list_resources(path: Path) -> List[str]:
+    """Bundled files a skill ships under its support directories."""
+    base = Path(path).parent
+    found = []
+    for folder in SUPPORT_DIRS:
+        area = base / folder
+        if not area.is_dir():
+            continue
+        for item in sorted(area.rglob("*")):
+            if item.is_file() and not item.is_symlink():
+                found.append(str(item.relative_to(base)))
+    return found[:60]
+
+
+def _root_stamp(roots: List[Path]) -> str:
+    """Cheap fingerprint so an unchanged tree is never rescanned."""
+    parts = []
+    for root in roots:
+        try:
+            parts.append(f"{root}:{root.stat().st_mtime_ns}")
+        except OSError:
+            parts.append(f"{root}:missing")
+    return "|".join(parts)
+
+
+def rebuild_catalog(force: bool = False) -> dict:
+    """Rescan every external root; first definition of a name wins."""
+    roots = _external_roots()
+    stamp = _root_stamp(roots)
+    old: Dict[str, Any] = {}
     if CATALOG_PATH.exists():
         try:
             old = json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
         except Exception:
-            pass
-    catalog = {}
-    for root in _external_roots():
-        if not root.exists():
+            old = {}
+    fresh = time.time() - float(old.get("_built") or 0) < CATALOG_TTL_SECONDS
+    if not force and fresh and old.get("_stamp") == stamp and isinstance(old.get("skills"), dict):
+        return old["skills"]
+
+    catalog: Dict[str, Dict[str, Any]] = {}
+    collisions = 0
+    for root in roots:
+        if not root.is_dir():
             continue
-        for md in root.rglob("*.md"):
+        for md in _iter_skill_files(root):
             try:
                 fm = _parse_frontmatter(md.read_text(encoding="utf-8", errors="replace"))
             except Exception:
                 continue
-            if fm:
-                tags = fm["tags"]
-                if "favorite" in old.get(fm["name"], {}).get("tags", []) and "favorite" not in tags:
-                    tags.append("favorite")
-                catalog[fm["name"]] = {"path": str(md), "description": fm["description"], "tags": tags}
+            if not fm:
+                continue
+            name = fm["name"]
+            if name in catalog:
+                collisions += 1
+                continue
+            tags = list(fm["tags"])
+            if "favorite" in old.get(name, {}).get("tags", []) and "favorite" not in tags:
+                tags.append("favorite")
+            catalog[name] = {
+                "path": str(md),
+                "description": fm["description"],
+                "tags": tags,
+                "files": list_resources(md),
+            }
+    if collisions:
+        logger.info("Skill catalog: %d duplicate name(s) ignored", collisions)
     CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CATALOG_PATH.write_text(json.dumps(catalog, indent=2))
+    CATALOG_PATH.write_text(
+        json.dumps({"_stamp": stamp, "_built": time.time(), "skills": catalog}, indent=2)
+    )
     return catalog
 
 
@@ -127,7 +218,7 @@ GRADE: [1-5]"""
 
 @dataclass
 class SkillDef:
-    """Skill definitions."""
+    """One skill: metadata eagerly, body and bundled files on demand."""
     name: str
     description: str = ""
     tags: List[str] = field(default_factory=list)
@@ -139,6 +230,13 @@ class SkillDef:
     verification: str = "checklist"  # "checklist" or "heavy"
     body: str = ""
     path: str = ""
+    files: List[str] = field(default_factory=list)
+    external: bool = False
+
+    @property
+    def base_dir(self) -> str:
+        """Directory the skill's relative paths resolve against."""
+        return str(Path(self.path).parent) if self.path else ""
 
     def match_trigger(self, user_input: str) -> bool:
         if not self.tags:
@@ -152,7 +250,7 @@ class SkillDef:
     
     @property
     def is_favorite(self) -> bool:
-        return "favorite" in self.tags or not self.path
+        return "favorite" in self.tags or not self.external
 
 class SkillRegistry:
     """Loads YAML contracts, validates, topological dependency sort (GoS)."""
@@ -173,6 +271,7 @@ class SkillRegistry:
         self._load_external()   
 
     def _load_external(self) -> None:
+        """External skills stay metadata-only until their body is requested."""
         for name, meta in rebuild_catalog().items():
             if name not in self.skills:
                 self.skills[name] = SkillDef(
@@ -181,6 +280,8 @@ class SkillRegistry:
                     tags=meta["tags"],
                     body="",
                     path=meta["path"],
+                    files=list(meta.get("files") or []),
+                    external=True,
                 )
 
     def _load_all(self):
@@ -221,6 +322,9 @@ class SkillRegistry:
                 dependencies=meta.get("dependencies", []),
                 verification=meta.get("verification", "checklist"),
                 body=body,
+                path=str(path),
+                files=list_resources(path),
+                external=False,
             )
         except Exception as e:
             logger.warning(f"Skill load failed: {path} -> {e}")
@@ -247,33 +351,75 @@ class SkillRegistry:
         return order
 
     def get(self, name: str) -> Optional[SkillDef]:
+        """A skill, unless it is external and external skills are switched off."""
         skill = self.skills.get(name)
-        if skill and skill.path and not self._external_enabled():
+        if skill and skill.external and not self._external_enabled():
             return None
         return skill
 
     def is_external(self, name: str) -> bool:
         skill = self.skills.get(name)
-        return bool(skill and skill.path)
+        return bool(skill and skill.external)
 
     def visible(self) -> List[SkillDef]:
+        """Skills the current configuration allows the model to see."""
         if self._external_enabled():
             return list(self.skills.values())
-        return [skill for skill in self.skills.values() if not skill.path]
+        return [skill for skill in self.skills.values() if not skill.external]
 
     def get_body(self, name: str) -> str:
-        s = self.skills.get(name)
-        if not s:
+        """The skill's instructions, read from disk the first time it is used."""
+        skill = self.skills.get(name)
+        if not skill:
             return f"Error: skill '{name}' not found."
-        if s.path and not self._external_enabled():
+        if skill.external and not self._external_enabled():
             return f"Error: external skills are disabled: '{name}'."
-        if not s.body and s.path:
+        if not skill.body and skill.path:
             try:
-                text = Path(s.path).read_text(encoding="utf-8", errors="replace")
-                s.body = text.split("---", 2)[2].strip() if text.startswith("---") else text
+                text = Path(skill.path).read_text(encoding="utf-8", errors="replace")
+                skill.body = text.split("---", 2)[2].strip() if text.startswith("---") else text
             except Exception as e:
-                return f"Error: cannot read {s.path}: {e}"
-        return s.body or "(empty)"
+                return f"Error: cannot read {skill.path}: {e}"
+        return skill.body or "(empty)"
+
+    def pin(self, name: str) -> str:
+        """Mark an external skill as a favorite in the on-disk catalog."""
+        skill = self.skills.get(name)
+        if not skill or not skill.external:
+            return f"Error: '{name}' is not an external skill."
+        if "favorite" in skill.tags:
+            return f"'{name}' is already a favorite."
+        catalog = rebuild_catalog()
+        entry = catalog.setdefault(name, {"path": skill.path, "description": skill.description, "tags": []})
+        entry.setdefault("tags", []).append("favorite")
+        CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CATALOG_PATH.write_text(
+            json.dumps(
+                {"_stamp": _root_stamp(_external_roots()), "_built": time.time(), "skills": catalog},
+                indent=2,
+            )
+        )
+        skill.tags.append("favorite")
+        return f"'{name}' pinned as favorite."
+
+    def get_resource(self, name: str, relative: str) -> str:
+        """Read one bundled file, confined to the skill's own directory."""
+        skill = self.skills.get(name)
+        if not skill or not skill.path:
+            return f"Error: skill '{name}' has no bundled files."
+        if skill.external and not self._external_enabled():
+            return f"Error: external skills are disabled: '{name}'."
+        base = Path(skill.path).parent.resolve()
+        target = (base / relative).resolve()
+        if not target.is_relative_to(base):
+            return f"Error: '{relative}' escapes the skill directory."
+        if not target.is_file():
+            available = ", ".join(skill.files) or "none"
+            return f"Error: no bundled file '{relative}'. Available: {available}."
+        try:
+            return target.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            return f"Error: cannot read {relative}: {e}"
 
     def match_task(self, task: str) -> Optional[str]:
         task_lower = task.lower()
@@ -302,7 +448,9 @@ class SkillRegistry:
         return None
 
     def reload(self):
+        """Drop every skill and rescan, including the external catalog."""
         self.skills.clear()
+        rebuild_catalog(force=True)
         self._load_all()
         self._load_external()
 

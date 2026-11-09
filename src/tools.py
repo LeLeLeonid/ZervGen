@@ -13,8 +13,9 @@ import base64
 import hashlib
 import secrets
 import warnings
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import List
+from typing import Any, Callable, Dict, List
 from pathlib import Path
 from urllib.parse import quote, urlparse
 from types import MappingProxyType
@@ -22,7 +23,7 @@ import aiofiles
 import httpx
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from rich.console import Console
-from src.config import load_config, _ANTI_PATTERNS, TEMP_DIR, WMO_CODES
+from src.config import load_config, shell_block_reason, TEMP_DIR, WMO_CODES
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
@@ -31,16 +32,39 @@ console = Console()
 
 _ALLOWED_ROOTS: List[Path] = [Path.cwd().resolve()]
 
+current_agent: ContextVar[Any] = ContextVar("zervgen_agent", default=None)
+
+
+def _resolve_agent() -> Any:
+    """Bound agent from the dispatch context, else the PTC call stack."""
+    agent = current_agent.get()
+    if agent is not None:
+        return agent
+    frame = inspect.currentframe()
+    while frame:
+        candidate = frame.f_globals.get("_orchestrator")
+        if candidate is not None:
+            for owner in (candidate, getattr(candidate, "root", None), getattr(candidate, "owner", None)):
+                if owner is not None and hasattr(owner, "_handle_delegation"):
+                    return owner
+                if hasattr(owner, "_response_called"):
+                    return owner
+        frame = frame.f_back
+    return None
+
 def _load_allowed_roots():
     wl = Path.home() / ".zervgen" / "allowed_roots.json"
+    sources = []
     if wl.exists():
         try:
-            for p in json.loads(wl.read_text()):
-                pp = Path(p).resolve()
-                if pp.exists() and pp not in _ALLOWED_ROOTS:
-                    _ALLOWED_ROOTS.append(pp)
+            sources.extend(json.loads(wl.read_text()))
         except Exception:
             pass
+    sources.extend(getattr(load_config(), "allowed_directories", []) or [])
+    for p in sources:
+        pp = Path(p).expanduser().resolve()
+        if pp.exists() and pp not in _ALLOWED_ROOTS:
+            _ALLOWED_ROOTS.append(pp)
 
 def reload_allowed_roots():
     global _ALLOWED_ROOTS
@@ -50,11 +74,19 @@ def reload_allowed_roots():
 _load_allowed_roots()
 
 def _is_safe_path(path: str) -> bool:
+    """True when the resolved path stays inside an allowed root."""
     try:
         resolved = Path(path).resolve()
         return any(resolved.is_relative_to(root) for root in _ALLOWED_ROOTS)
     except (OSError, ValueError):
         return False
+
+def _is_link(path: Path) -> bool:
+    """True for symlinks and paths that cannot be stat'ed."""
+    try:
+        return path.is_symlink()
+    except OSError:
+        return True
 
 def _clip(s: str, n: int) -> str:
     if not s:
@@ -83,33 +115,14 @@ def _atomic_write(path: Path, content: str) -> None:
 
 # ── DELEGATION ──────────────────────────────────────────────────────────────
 
-async def delegate_to(agent_name: str = "", agent_id: str = "", task: str = "", context: str = "", mode: str = "ASK", memory: bool = True, agents: str = "") -> str:
-    import inspect
-    from src.skills_loader import role_exists
-    frame = inspect.currentframe().f_back
-    orchestrator = None
-    while frame:
-        cand = frame.f_globals.get("_orchestrator")
-        if cand:
-            if hasattr(cand, '_handle_delegation'):
-                orchestrator = cand
-                break
-            root = getattr(cand, 'root', None)
-            if root and hasattr(root, '_handle_delegation'):
-                orchestrator = root
-                break
-            owner = getattr(cand, 'owner', None)
-            if owner and hasattr(owner, '_handle_delegation'):
-                orchestrator = owner
-                break
-        frame = frame.f_back
-
-    if orchestrator and hasattr(orchestrator, '_handle_delegation'):
+async def delegate_to(agent_name: str = "", agent_id: str = "", task: str = "", context: str = "", agents: str = "") -> str:
+    """Hand a task to a role agent through the live orchestrator."""
+    orchestrator = _resolve_agent()
+    if orchestrator is not None and hasattr(orchestrator, "_handle_delegation"):
         return await orchestrator._handle_delegation({
-            "agent_name": agent_name, "agent_id": agent_id, "task": task, "context": context,
-            "mode": mode, "memory": memory, "agents": agents
+            "agent_name": agent_name, "agent_id": agent_id, "task": task,
+            "context": context, "agents": agents,
         })
-
     return "Error: delegation requires an active orchestrator with _handle_delegation."
 
 # ─── WEB ─────────────────────────────────────────────────────────────────────
@@ -267,9 +280,9 @@ class ShellResult:
 async def shell_exec(command: str, timeout: int = 60) -> ShellResult:
     if not command or not isinstance(command, str) or not command.strip():
         return ShellResult(ok=False, error="Empty command.")
-    for pat, reason in _ANTI_PATTERNS:
-        if re.search(pat, command, re.IGNORECASE):
-            return ShellResult(ok=False, blocked=True, reason=f"{reason}. Command: {command[:100]}")
+    reason = shell_block_reason(command)
+    if reason:
+        return ShellResult(ok=False, blocked=True, reason=f"{reason}. Command: {command[:100]}")
     try:
         from src.core.memory import memory_core
         for block in memory_core.get_runtime_blocks():
@@ -316,6 +329,7 @@ async def shell(command: str, timeout: int = 60) -> str:
 # ─── FILESYSTEM ──────────────────────────────────────────────────────────────
 
 async def list_files(path: str = ".", recursive: bool = False, exclude_cache: bool = True, ignore_dir: bool = True) -> str:
+    """List a directory, optionally recursive, confined to allowed roots."""
     target = Path(path)
     if not target.exists():
         return f"Error: Path does not exist: {path}"
@@ -323,19 +337,23 @@ async def list_files(path: str = ".", recursive: bool = False, exclude_cache: bo
         return f"Error: Not a directory: {path}"
     if not _is_safe_path(str(target)):
         return f"Error: Access denied to {path}"
-    if ignore_dir:
-        ignore_dirs = {'.git', '__pycache__', 'venv', 'env', 'node_modules', '.idea', '.vscode', '.kilo', 'tmp'}
+    ignore_dirs = {'.git', '__pycache__', 'venv', 'env', 'node_modules', '.idea', '.vscode', '.kilo', 'tmp'} if ignore_dir else set()
     if recursive:
         results = []
-        for root, dirs, files in os.walk(target):
-            dirs[:] = [d for d in dirs if d not in ignore_dirs]
+        for root, dirs, files in os.walk(target, followlinks=False):
+            dirs[:] = [d for d in dirs if d not in ignore_dirs and not _is_link(Path(root) / d)]
             for file in files:
                 full_path = Path(root) / file
+                if _is_link(full_path) or not _is_safe_path(str(full_path)):
+                    continue
                 results.append(str(full_path.relative_to(target)).replace("\\", "/"))
         return "\n".join(results) if results else "Directory is empty."
-    else:
-        items = [f"{'DIR' if item.is_dir() else '   '} {item.name}" for item in sorted(target.iterdir())]
-        return "\n".join(items) if items else f"(empty directory: {path})"
+    items = [
+        f"{'DIR' if item.is_dir() else '   '} {item.name}"
+        for item in sorted(target.iterdir())
+        if item.name not in ignore_dirs and not _is_link(item)
+    ]
+    return "\n".join(items) if items else f"(empty directory: {path})"
 
 
 async def read_file(path: str, offset: int = 0, max_chars: int = 8000) -> str:
@@ -401,10 +419,14 @@ async def edit_file(path: str, find: str, replace: str = "", replace_all: bool =
 
 
 async def glob_files(pattern: str = "**/*", path: str = ".") -> str:
+    """Glob under a directory, skipping symlinks and paths outside the roots."""
     base = Path(path)
     if not base.exists() or not _is_safe_path(str(base)):
         return f"Error: Invalid path or access denied: {path}"
-    matches = list(base.glob(pattern))
+    matches = [
+        item for item in base.glob(pattern)
+        if not _is_link(item) and _is_safe_path(str(item))
+    ]
     if not matches:
         return f"No files match: {pattern}"
     output = [f"Files matching '{pattern}' in {path}:\n"]
@@ -416,6 +438,7 @@ async def glob_files(pattern: str = "**/*", path: str = ".") -> str:
 
 
 async def grep_files(pattern: str, path: str = ".", file_type: str = "", use_regex: bool = False) -> str:
+    """Search file contents, skipping symlinks and paths outside the roots."""
     if not pattern or not isinstance(pattern, str):
         return "Error: No search pattern provided."
     base = Path(path)
@@ -425,6 +448,8 @@ async def grep_files(pattern: str, path: str = ".", file_type: str = "", use_reg
         search_pattern = re.compile(pattern) if use_regex else re.compile(re.escape(pattern))
         matches = []
         for file_path in base.rglob(f"*{file_type}" if file_type else "*"):
+            if _is_link(file_path) or not _is_safe_path(str(file_path)):
+                continue
             if file_path.is_file() and file_path.stat().st_size <= 1_000_000:
                 try:
                     content = file_path.read_text(encoding='utf-8', errors='ignore')
@@ -492,7 +517,19 @@ async def generate_image(prompt: str, width: int = None, height: int = None, mod
         provider = None
     if provider is not None and hasattr(provider, "generate_image"):
         try:
-            return await provider.generate_image(prompt, width=width, height=height)
+            accepted = inspect.signature(provider.generate_image).parameters
+            kwargs: Dict[str, Any] = {}
+            if width is not None and "width" in accepted:
+                kwargs["width"] = width
+            if height is not None and "height" in accepted:
+                kwargs["height"] = height
+            produced = await provider.generate_image(prompt, **kwargs)
+            if str(produced).startswith(("http://", "https://")):
+                token = getattr(config.pollinations, "token", "") or os.environ.get("POLLINATIONS_TOKEN", "")
+                return await download_and_open_image(str(produced), token=token)
+            return str(produced)
+        except NotImplementedError:
+            pass
         except Exception as e:
             return f"Error: provider image gen failed ({e}); falling back to pollinations."
     safe_prompt = quote(prompt)
@@ -622,18 +659,28 @@ async def list_skills() -> str:
     return "\n\n".join(out) if out else "No skills or roles available."
 
 
-async def load_skill(name: str) -> str:
+async def load_skill(name: str, file: str = "") -> str:
+    """Load a skill's instructions, or one bundled file it ships beside them."""
     from src.skills_loader import skill_index
     skill = skill_index.get(name)
     if not skill:
         if skill_index.is_external(name):
             return f"Error: external skills are disabled: '{name}'."
         return f"Error: skill '{name}' not found."
+    if file:
+        body = skill_index.get_resource(name, file)
+        return body if body.startswith("Error:") else f"--- {name}/{file} ---\n{body}"
     body = skill_index.get_body(name)
     if body.startswith("Error:"):
         return body
-    src = f"\n{skill.path}" if skill.path else ""
-    return f"--- {name} ---{src}\n{body}"
+    head = f"--- {name} ---"
+    if skill.base_dir:
+        head += f"\nSkill directory: {skill.base_dir}"
+        head += "\nResolve relative paths against that directory."
+    if skill.files:
+        shown = ", ".join(skill.files[:20])
+        head += f"\nBundled files (load_skill(name, file=...)): {shown}"
+    return f"{head}\n{body}"
 
 
 async def set_external_skills(enabled: bool) -> str:
@@ -646,28 +693,10 @@ async def set_external_skills(enabled: bool) -> str:
     return f"External skills {'enabled' if enabled else 'disabled'}."
 
 async def add_favorite(skill_name: str) -> str:
-    """Add the tag to an external skill in json."""
-    import json
-    from src.skills_loader import CATALOG_PATH, skill_index
+    """Add the favorite tag to an external skill."""
+    from src.skills_loader import skill_index
 
-    skill = skill_index.get(skill_name)
-    if not skill or not skill.path:
-        return f"Error: '{skill_name}' is not an external skill."
-    catalog = {}
-    if CATALOG_PATH.exists():
-        try:
-            catalog = json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    entry = catalog.setdefault(skill_name, {"path": skill.path, "description": skill.description, "tags": []})
-    tags = entry.setdefault("tags", [])
-    if "favorite" in tags:
-        return f"'{skill_name}' is already a favorite."
-    tags.append("favorite")
-    CATALOG_PATH.write_text(json.dumps(catalog, indent=2))
-    if "favorite" not in skill.tags:
-        skill.tags.append("favorite")
-    return f"'{skill_name}' pinned as favorite."
+    return skill_index.pin(skill_name)
 
 
 # ─── MEMORY ──────────────────────────────────────────────────────────────────
@@ -738,17 +767,11 @@ async def manage_todo(action: str, task: str = "", todo_id: str = "") -> str:
 # ─── RESPONSE ────────────────────────────────────────────────────────────────
 
 async def response(text: str = None) -> str:
-    import inspect
+    """Finish the run with the final user-facing answer."""
     if text is not None and not isinstance(text, str):
         text = json.dumps(text, ensure_ascii=False, indent=2)
-    frame = inspect.currentframe()
-    while frame:
-        agent = frame.f_globals.get("_orchestrator")
-        if hasattr(agent, '_response_called'):
-            break
-        agent = None
-        frame = frame.f_back
-    if agent and hasattr(agent, '_response_called'):
+    agent = _resolve_agent()
+    if agent is not None and hasattr(agent, "_response_called"):
         agent._response_called = True
         agent._response_value = text if text is not None else ""
         return agent._response_value
@@ -805,30 +828,58 @@ async def base64_decode(encoded: str) -> str:
 
 # ─── MCP ──────────────────────────────────────────────────────────────────────
 
-async def add_mcp_server(name: str, command: str, args: str = "[]", env: str = "{}", default: bool = False) -> str:
-    if not name or not command:
-        return "Error: name and command are required."
+async def add_mcp_server(
+    name: str = "",
+    command: str = "",
+    args: str = "[]",
+    env: str = "{}",
+    url: str = "",
+    headers: str = "{}",
+    transport: str = "auto",
+    default: bool = False,
+) -> str:
+    """Add a local (command) or remote (url) MCP server, enabled at once.
+
+    Env values and header values are written to `.zervgen/.env`; the config file
+    keeps only `${VAR}` references so no secret lands in tracked JSON.
+    """
+    if not name:
+        return "Error: name is required."
+    if not command and not url:
+        return "Error: provide a command (local server) or a url (remote server)."
+    if command and url:
+        return "Error: give either command or url, not both."
     try:
         args_list = json.loads(args) if isinstance(args, str) else args
         env_dict = json.loads(env) if isinstance(env, str) else env
+        header_dict = json.loads(headers) if isinstance(headers, str) else headers
     except json.JSONDecodeError:
-        return "Error: Invalid JSON for args or env."
+        return "Error: Invalid JSON for args, env or headers."
+    if not isinstance(args_list, list) or not isinstance(env_dict, dict) or not isinstance(header_dict, dict):
+        return "Error: args must be a list; env and headers must be objects."
+
+    from src.config import MCPServerConfig, save_env_var
+    from src.core.mcp_manager import MCPManager
+
+    stored_env = {key: f"${{{key}}}" for key in env_dict}
+    stored_headers = {key: f"${{{key}}}" for key in header_dict}
+    written = [key for key, value in {**env_dict, **header_dict}.items() if save_env_var(key, value)]
     config = load_config()
-    from src.config import MCPServerConfig
-    config.mcp_servers[name] = MCPServerConfig(command=command, args=args_list, env=env_dict, enabled=True)
+    config.mcp_servers[name] = MCPServerConfig(
+        command=command,
+        args=args_list,
+        env=stored_env,
+        url=url,
+        headers=stored_headers,
+        transport=transport or "auto",
+        enabled=True,
+    )
     config.save()
-    if default:
-        cfg_path = Path("src/config.py")
-        text = cfg_path.read_text(encoding="utf-8")
-        new_entry = f'    "{name}": MCPServerConfig(command="{command}", args={json.dumps(args_list)}, env={json.dumps(env_dict)}, enabled=True),\n'
-        import re
-        pattern = r'(DEFAULT_MCP_SERVERS\s*=\s*\{)(.*?)(\n\})'
-        match = re.search(pattern, text, re.DOTALL)
-        if match and name not in match.group(2):
-            text = text[:match.end(2)] + "\n" + new_entry + text[match.start(3):]
-            cfg_path.write_text(text, encoding="utf-8")
-            return f"MCP server '{name}' added to config.json AND hardcoded into src/config.py."
-    return f"MCP server '{name}' added to config.json."
+    MCPManager(config)
+    kind = config.mcp_servers[name].kind
+    target = url if url else f"{command} {' '.join(args_list)}".strip()
+    note = f"; secrets in .env: {', '.join(written)}" if written else ""
+    return f"MCP server '{name}' added ({kind}: {target}){note}."
 
 
 async def list_mcp_servers() -> dict:
@@ -839,7 +890,9 @@ async def list_mcp_servers() -> dict:
     out = {}
     for name, cfg in mgr.settings.mcp_servers.items():
         srv = mgr.servers.get(name)
-        if cfg.command == "internal":
+        if cfg.kind != "stdio":
+            installed = bool(cfg.url)
+        elif cfg.command == "internal":
             installed = True
         elif cfg.args and cfg.args[0] == "-m" and len(cfg.args) > 1:
             try:
@@ -859,7 +912,7 @@ async def list_mcp_servers() -> dict:
             "installed": installed,
             "tools": len(srv.tools) if srv else 0,
             "error": srv._last_error if srv and srv._last_error else None,
-            "cmd": cfg.command,
+            "cmd": cfg.url if cfg.kind != "stdio" else cfg.command,
         }
     return out or {"error": "No MCP servers configured."}
 
@@ -928,19 +981,86 @@ def _generate_registry():
     return registry
 
 
+def _mcp_schema(spec: Any) -> Dict[str, Any]:
+    """Normalize an MCP tool descriptor to its JSON input schema."""
+    schema = getattr(spec, "inputSchema", None) or getattr(spec, "input_schema", None) or {}
+    return schema if isinstance(schema, dict) else {}
+
+
+def _schema_signature(name: str, schema: Dict[str, Any]) -> inspect.Signature:
+    """Give an MCP wrapper a real signature so the model sees its parameters."""
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return inspect.Signature()
+    kinds = {"integer": int, "number": float, "boolean": bool, "array": list,
+             "object": dict, "string": str}
+    required = set(schema.get("required") or [])
+    defaults = {bool: False, int: 0, float: 0.0, str: "", list: [], dict: {}}
+    params = []
+    for arg, meta in properties.items():
+        kind = kinds.get(str((meta or {}).get("type")), str)
+        if arg in required:
+            params.append(inspect.Parameter(arg, inspect.Parameter.KEYWORD_ONLY, annotation=kind))
+        else:
+            default = (meta or {}).get("default", defaults[kind])
+            params.append(inspect.Parameter(arg, inspect.Parameter.KEYWORD_ONLY, default=default, annotation=kind))
+    try:
+        return inspect.Signature(params)
+    except ValueError:
+        return inspect.Signature()
+
+
+def _schema_doc(name: str, schema: Dict[str, Any], spec: Any) -> str:
+    """One-line MCP tool description carrying each parameter's meaning."""
+    text = str(getattr(spec, "description", "") or "").strip()
+    properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    notes = []
+    for arg, meta in properties.items():
+        note = str((meta or {}).get("description") or "").strip()
+        notes.append(f"{arg}: {note}" if note else arg)
+    head = f"[MCP] {text}" if text else f"[MCP] {name}"
+    return f"{head} | args: {', '.join(notes)}" if notes else head
+
+
+def _clip_doc(doc: str, budget: int) -> str:
+    """Cut the prose head but never the parameter notes that follow the bar."""
+    if len(doc) <= budget:
+        return doc
+    head, bar, tail = doc.rpartition(" | ")
+    keep = budget - len(tail) - 3
+    if bar and keep > 40:
+        return f"{head[:keep].rstrip()} | {tail}"
+    return doc[:budget].rstrip()
+
+
+def _signature_text(func: Any, limit: int = 90) -> str:
+    """Signature string, dropping type hints only when it would be too long."""
+    try:
+        sig = inspect.signature(func)
+    except (ValueError, TypeError):
+        return "(...)"
+    text = str(sig).replace(" -> str", "")
+    if len(text) <= limit:
+        return text
+    bare = inspect.Signature(
+        [p.replace(annotation=inspect.Parameter.empty) for p in sig.parameters.values()
+         if p.kind not in (p.VAR_KEYWORD, p.VAR_POSITIONAL)],
+        return_annotation=inspect.Signature.empty,
+    )
+    return str(bare)
+
+
 def get_tools_schema(tools: dict = None, compact: bool = False) -> str:
+    """Render every tool as one line: name, real signature, short purpose."""
     source = tools if tools is not None else TOOL_REGISTRY
-    schema = []
+    lines = []
     for name, func in source.items():
-        try:
-            params = str(inspect.signature(func)).replace(" -> str", "").replace("**kwargs", "")
-        except (ValueError, TypeError):
-            params = "(...)"
-        doc = inspect.getdoc(func) or ""
+        params = _signature_text(func)
+        doc = " ".join((inspect.getdoc(func) or "").split())
         if compact:
-            doc = " ".join(doc.split())[:180]
-        schema.append(f"- {name}{params}" + (f": {doc}" if doc else ""))
-    return "\n".join(schema)
+            doc = _clip_doc(doc, 240)
+        lines.append(f"- {name}{params}" + (f": {doc}" if doc else ""))
+    return "\n".join(lines)
 
 
 TOOL_REGISTRY = MappingProxyType(_generate_registry())
