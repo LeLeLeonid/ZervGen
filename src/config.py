@@ -313,12 +313,12 @@ class GlobalSettings(BaseModel):
     resume_enabled: bool = True
     checkpoint_max_snapshots: int = 30
     trace_enabled: bool = True
-    external_skills_enabled: bool = True
+    external_skills_enabled: bool = False
     external_skill_roots: List[str] = Field(default_factory=lambda: ["tmp"])
     prompt_show_internal_skills: bool = True
     prompt_show_external_skills: bool = False
     prompt_auto_trigger_skills: bool = True
-    prompt_auto_trigger_external_skills: bool = True
+    prompt_auto_trigger_external_skills: bool = False
     prompt_show_mcp_tools: bool = True
     prompt_max_chars: int = 14000
     prompt_memory_limit: int = 4

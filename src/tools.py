@@ -14,7 +14,7 @@ import hashlib
 import secrets
 import warnings
 from dataclasses import dataclass
-from typing import List
+from typing import Any, Dict, List
 from pathlib import Path
 from urllib.parse import quote, urlparse
 from types import MappingProxyType
@@ -50,11 +50,19 @@ def reload_allowed_roots():
 _load_allowed_roots()
 
 def _is_safe_path(path: str) -> bool:
+    """True when the resolved path stays inside an allowed root."""
     try:
         resolved = Path(path).resolve()
         return any(resolved.is_relative_to(root) for root in _ALLOWED_ROOTS)
     except (OSError, ValueError):
         return False
+
+def _is_link(path: Path) -> bool:
+    """True for symlinks and paths that cannot be stat'ed."""
+    try:
+        return path.is_symlink()
+    except OSError:
+        return True
 
 def _clip(s: str, n: int) -> str:
     if not s:
@@ -316,6 +324,7 @@ async def shell(command: str, timeout: int = 60) -> str:
 # ─── FILESYSTEM ──────────────────────────────────────────────────────────────
 
 async def list_files(path: str = ".", recursive: bool = False, exclude_cache: bool = True, ignore_dir: bool = True) -> str:
+    """List a directory, optionally recursive, confined to allowed roots."""
     target = Path(path)
     if not target.exists():
         return f"Error: Path does not exist: {path}"
@@ -323,19 +332,23 @@ async def list_files(path: str = ".", recursive: bool = False, exclude_cache: bo
         return f"Error: Not a directory: {path}"
     if not _is_safe_path(str(target)):
         return f"Error: Access denied to {path}"
-    if ignore_dir:
-        ignore_dirs = {'.git', '__pycache__', 'venv', 'env', 'node_modules', '.idea', '.vscode', '.kilo', 'tmp'}
+    ignore_dirs = {'.git', '__pycache__', 'venv', 'env', 'node_modules', '.idea', '.vscode', '.kilo', 'tmp'} if ignore_dir else set()
     if recursive:
         results = []
-        for root, dirs, files in os.walk(target):
-            dirs[:] = [d for d in dirs if d not in ignore_dirs]
+        for root, dirs, files in os.walk(target, followlinks=False):
+            dirs[:] = [d for d in dirs if d not in ignore_dirs and not _is_link(Path(root) / d)]
             for file in files:
                 full_path = Path(root) / file
+                if _is_link(full_path) or not _is_safe_path(str(full_path)):
+                    continue
                 results.append(str(full_path.relative_to(target)).replace("\\", "/"))
         return "\n".join(results) if results else "Directory is empty."
-    else:
-        items = [f"{'DIR' if item.is_dir() else '   '} {item.name}" for item in sorted(target.iterdir())]
-        return "\n".join(items) if items else f"(empty directory: {path})"
+    items = [
+        f"{'DIR' if item.is_dir() else '   '} {item.name}"
+        for item in sorted(target.iterdir())
+        if item.name not in ignore_dirs and not _is_link(item)
+    ]
+    return "\n".join(items) if items else f"(empty directory: {path})"
 
 
 async def read_file(path: str, offset: int = 0, max_chars: int = 8000) -> str:
@@ -401,10 +414,14 @@ async def edit_file(path: str, find: str, replace: str = "", replace_all: bool =
 
 
 async def glob_files(pattern: str = "**/*", path: str = ".") -> str:
+    """Glob under a directory, skipping symlinks and paths outside the roots."""
     base = Path(path)
     if not base.exists() or not _is_safe_path(str(base)):
         return f"Error: Invalid path or access denied: {path}"
-    matches = list(base.glob(pattern))
+    matches = [
+        item for item in base.glob(pattern)
+        if not _is_link(item) and _is_safe_path(str(item))
+    ]
     if not matches:
         return f"No files match: {pattern}"
     output = [f"Files matching '{pattern}' in {path}:\n"]
@@ -416,6 +433,7 @@ async def glob_files(pattern: str = "**/*", path: str = ".") -> str:
 
 
 async def grep_files(pattern: str, path: str = ".", file_type: str = "", use_regex: bool = False) -> str:
+    """Search file contents, skipping symlinks and paths outside the roots."""
     if not pattern or not isinstance(pattern, str):
         return "Error: No search pattern provided."
     base = Path(path)
@@ -425,6 +443,8 @@ async def grep_files(pattern: str, path: str = ".", file_type: str = "", use_reg
         search_pattern = re.compile(pattern) if use_regex else re.compile(re.escape(pattern))
         matches = []
         for file_path in base.rglob(f"*{file_type}" if file_type else "*"):
+            if _is_link(file_path) or not _is_safe_path(str(file_path)):
+                continue
             if file_path.is_file() and file_path.stat().st_size <= 1_000_000:
                 try:
                     content = file_path.read_text(encoding='utf-8', errors='ignore')
@@ -492,7 +512,19 @@ async def generate_image(prompt: str, width: int = None, height: int = None, mod
         provider = None
     if provider is not None and hasattr(provider, "generate_image"):
         try:
-            return await provider.generate_image(prompt, width=width, height=height)
+            accepted = inspect.signature(provider.generate_image).parameters
+            kwargs: Dict[str, Any] = {}
+            if width is not None and "width" in accepted:
+                kwargs["width"] = width
+            if height is not None and "height" in accepted:
+                kwargs["height"] = height
+            produced = await provider.generate_image(prompt, **kwargs)
+            if str(produced).startswith(("http://", "https://")):
+                token = getattr(config.pollinations, "token", "") or os.environ.get("POLLINATIONS_TOKEN", "")
+                return await download_and_open_image(str(produced), token=token)
+            return str(produced)
+        except NotImplementedError:
+            pass
         except Exception as e:
             return f"Error: provider image gen failed ({e}); falling back to pollinations."
     safe_prompt = quote(prompt)
