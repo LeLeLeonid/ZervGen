@@ -1291,9 +1291,8 @@ class ZervGenCLI:
             await self._agent_task
         except (asyncio.CancelledError, Exception):
             pass
-        for m in list(self.orchestrator._injected):
-            self.orchestrator._injected.remove(m)
-            self._pending_input.put_nowait(m["content"])
+        for m in self.orchestrator.coordinator.drain():
+            self._pending_input.put_nowait(m)
 
     async def _do_run(self, user_input: str) -> None:
         async with self._active_lock:
