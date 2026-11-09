@@ -382,9 +382,12 @@ class PermissionPolicy:
         self.mode = (mode or "BUILD").upper()
         self.roots = [Path(r).resolve() for r in (roots or [])]
 
+    def is_mcp(self, tool_name: str) -> bool:
+        return tool_name.startswith("mcp_") or tool_name.startswith("mcp__")
+
     def is_risky(self, tool_name: str) -> bool:
         """Whether a tool needs confirmation."""
-        return tool_name in self.RISKY or tool_name.startswith("mcp_")
+        return tool_name in self.RISKY or self.is_mcp(tool_name)
 
     def check_scope(self, args: Dict[str, Any]) -> Optional[str]:
         """Reject paths outside the allowed roots."""
@@ -406,7 +409,7 @@ class PermissionPolicy:
         """Resolve a tool call to allow, ask or deny."""
         if tool_name in self.ALWAYS_DENY:
             return "deny"
-        if self.mode != "BUILD" and (tool_name in self.BUILD_ONLY or tool_name.startswith("mcp_")):
+        if self.mode in ("ASK", "CALL") and (tool_name in self.BUILD_ONLY or self.is_mcp(tool_name)):
             return "deny"
         if self.check_scope(args):
             return "deny"

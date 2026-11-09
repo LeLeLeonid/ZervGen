@@ -884,32 +884,87 @@ class PeerCards:
 
 
 class Dreamer:
+    """Idle heartbeat: review past work, learn from failures, tidy memory.
+
+    Each beat is cursor-based, bounded (at most MAX_DIAGNOSES model calls),
+    and silent — it only writes state under ``tmp/state`` and knowledge into
+    the memory tiers. It never touches the user's active session.
+    """
+
+    STATE_FILE = Path("tmp/state/dream.json")
+    LEDGER_FILE = Path("tmp/state/dream.jsonl")
+    PATTERNS_FILE = Path("tmp/memory/error_patterns.json")
+    TODOS_FILE = Path("tmp/todos.json")
+    FAILURE_MARKERS = ("Error:", "SyntaxError", "ModuleNotFoundError", "FAILED:", "Traceback (most recent call last)", "ROLLBACK", "Timed out", "timed out")
+    IDLE_SECONDS = 45.0
+    MAX_DIAGNOSES = 2
+    MAX_FINDINGS = 10
+    MAX_HISTORY = 40
+    BEAT_TIMEOUT = 240.0
+
     def __init__(self, provider, memory, interval: int = 300, orchestrator=None):
         self.provider = provider
         self.memory = memory
         self.orchestrator = orchestrator
-        self.interval = max(60, interval)
+        self.interval = max(60, int(interval or 300))
         self._running = False
         self._task = None
         self._cards = PeerCards()
-        self._last_check = 0
-        self._error_count = 0
-        self._max_errors = 5
-        self._patterns_file = Path("tmp/memory/error_patterns.json")
+        self._failures = 0
+        self._max_failures = 5
         self._error_patterns = self._load_patterns()
+        self._state = self._load_state()
+
+    def status(self) -> Dict[str, Any]:
+        history = self._state.get("history") or []
+        return {
+            "running": self._running,
+            "interval": self.interval,
+            "beats": len(history),
+            "last_beat": self._state.get("last_beat", 0),
+            "patterns": len(self._error_patterns),
+            "open_todos": len(self._pending_todos()),
+        }
+
+    def _load_state(self) -> Dict[str, Any]:
+        state = {"last_beat": 0, "session_cursor": 0.0, "fact_cursor": 0.0, "lessons": [], "history": []}
+        try:
+            if self.STATE_FILE.exists():
+                stored = json.loads(self.STATE_FILE.read_text("utf-8"))
+                if isinstance(stored, dict):
+                    state.update(stored)
+        except Exception:
+            pass
+        state["history"] = list(state.get("history") or [])[-self.MAX_HISTORY:]
+        return state
+
+    def _save_state(self) -> None:
+        try:
+            self.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            self.STATE_FILE.write_text(json.dumps(self._state, ensure_ascii=False, indent=2), "utf-8")
+        except Exception:
+            pass
 
     def _load_patterns(self) -> Dict[str, Dict]:
-        if self._patterns_file.exists():
-            try: return json.loads(self._patterns_file.read_text("utf-8"))
-            except Exception: return {}
+        try:
+            if self.PATTERNS_FILE.exists():
+                data = json.loads(self.PATTERNS_FILE.read_text("utf-8"))
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
         return {}
 
-    def _save_patterns(self):
-        self._patterns_file.parent.mkdir(parents=True, exist_ok=True)
-        self._patterns_file.write_text(json.dumps(self._error_patterns, indent=2, ensure_ascii=False), "utf-8")
+    def _save_patterns(self) -> None:
+        try:
+            self.PATTERNS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            self.PATTERNS_FILE.write_text(json.dumps(self._error_patterns, ensure_ascii=False, indent=2), "utf-8")
+        except Exception:
+            pass
 
     async def start(self):
-        if self._running: return
+        if self._running:
+            return
         self._running = True
         self._task = asyncio.create_task(self._loop())
 
@@ -917,100 +972,171 @@ class Dreamer:
         self._running = False
         if self._task:
             self._task.cancel()
-            try: await self._task
-            except asyncio.CancelledError: pass
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
 
-    async def _loop(self):
+    async def _loop(self) -> None:
         while self._running:
             try:
                 await asyncio.sleep(self.interval)
-                if not self._running: break
-                await self._cycle()
-                self._error_count = 0
+                if not self._running:
+                    break
+                await asyncio.wait_for(self._beat(), timeout=self.BEAT_TIMEOUT)
+                self._failures = 0
             except asyncio.CancelledError:
                 break
-            except Exception as e:
-                self._error_count += 1
-                logger.error(f"Dream error ({self._error_count}/{self._max_errors}): {e}")
-                if self._error_count >= self._max_errors:
-                    logger.error("Dreamer: too many errors, backing off 30min")
+            except Exception as exc:
+                self._failures += 1
+                logger.warning("Dreamer beat failed (%s/%s): %s", self._failures, self._max_failures, exc)
+                if self._failures >= self._max_failures:
+                    self._failures = 0
                     await asyncio.sleep(1800)
-                    self._error_count = 0  # reset after cooldown
-                await asyncio.sleep(min(60 * self._error_count, 300))
+                else:
+                    await asyncio.sleep(min(60 * self._failures, 300))
 
-    async def _cycle(self):
-        if self.orchestrator and getattr(self.orchestrator, '_user_active', False):
-            return
-        if self.memory and self.memory._short_term:
-            last_entry = self.memory._short_term[-1]
-            try:
-                ts = datetime.fromisoformat(last_entry.get("timestamp", "")).timestamp()
-                if time.time() - ts < 45.0:
-                    return
-            except Exception:
-                pass
-        await self._check_errors()
-        await self._check_task_state()
-        removed = self.memory.prune_toxic(threshold_hits=5, success_rate=0.5)
-        if removed > 0:
-            logger.debug(f"[DREAM] Pruned {removed} toxic memories")
-        await self._extract_facts()
-        await self._write_lessons()
-
-    async def _check_task_state(self):
-        if not self.orchestrator or not self.orchestrator.history:
-            return
-        agent = self.orchestrator
-        if getattr(agent, "_repeat_count", 0) >= 2:
-            logger.debug("[LOOP] Task stuck: same result %sx", agent._repeat_count)
-        last = agent.history[-1].get("content", "")
-        if any(s in last for s in ("[STOP]", "Max steps", "Error:")):
-            logger.debug("[STUCK] Task stalled: %s", last)
-
-    async def _check_errors(self):
-        self._error_patterns = self._load_patterns()
+    @staticmethod
+    def _epoch(value: Any) -> float:
+        if isinstance(value, (int, float)):
+            return float(value)
         try:
-            sessions = self.memory._session_db.list_sessions(limit=10)
-            for sess in sessions:
-                session_id = sess["id"]
-                session_data = self.memory._session_db.load_session(session_id)
-                if not session_data:
+            return datetime.fromisoformat(str(value)).timestamp()
+        except Exception:
+            return 0.0
+
+    def _idle(self) -> bool:
+        if self.orchestrator is not None and getattr(self.orchestrator, "_user_active", False):
+            return False
+        if self.memory and self.memory._short_term:
+            last = self._epoch(self.memory._short_term[-1].get("timestamp"))
+            if last and time.time() - last < self.IDLE_SECONDS:
+                return False
+        return True
+
+    async def _beat(self) -> Dict[str, Any]:
+        started = time.time()
+        if not self._idle():
+            return self._finish("skipped", started, reason="user_active")
+        findings = self._scan_sessions()
+        learned = await self._learn(findings)
+        facts = await self._extract_facts()
+        lessons = await self._write_lessons()
+        optimized = await self._optimize()
+        return self._finish(
+            "beat",
+            started,
+            findings=len(findings),
+            learned=learned,
+            facts=facts,
+            lessons=lessons,
+            duplicates=optimized["duplicates"],
+            toxic=optimized["toxic"],
+            todos=self._pending_todos()[:5],
+        )
+
+    def _finish(self, kind: str, started: float, **data: Any) -> Dict[str, Any]:
+        record = {"ts": round(started, 3), "kind": kind, "elapsed": round(time.time() - started, 2), **data}
+        history = list(self._state.get("history") or [])
+        history = (history + [record])[-self.MAX_HISTORY:]
+        self._state["history"] = history
+        self._state["last_beat"] = record["ts"]
+        self._save_state()
+        try:
+            self.LEDGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with self.LEDGER_FILE.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        except Exception:
+            pass
+        return record
+
+    def _pending_todos(self) -> List[str]:
+        try:
+            if not self.TODOS_FILE.exists():
+                return []
+            todos = json.loads(self.TODOS_FILE.read_text("utf-8")) or []
+        except Exception:
+            return []
+        return [str(t.get("task", "")) for t in todos if isinstance(t, dict) and not t.get("done")]
+
+    def _goal(self, messages: List[Dict]) -> str:
+        for message in messages:
+            if message.get("role") == "user" and str(message.get("content") or "").strip():
+                return str(message["content"]).strip()[:300]
+        return ""
+
+    def _context(self, messages: List[Dict], index: int) -> str:
+        window = messages[max(0, index - 4):index]
+        lines = [str(m.get("content") or "")[:300] for m in window if str(m.get("content") or "").strip()]
+        return "\n".join(lines)
+
+    def _scan_sessions(self) -> List[Dict[str, Any]]:
+        if not self.memory:
+            return []
+        cursor = float(self._state.get("session_cursor") or 0.0)
+        try:
+            sessions = self.memory._session_db.list_sessions(limit=20)
+        except Exception:
+            return []
+        findings: List[Dict[str, Any]] = []
+        newest = cursor
+        for session in sessions:
+            try:
+                data = self.memory._session_db.load_session(session["id"]) or {}
+            except Exception:
+                continue
+            messages = data.get("messages") or []
+            for index, message in enumerate(messages):
+                stamp = float(message.get("timestamp") or 0.0)
+                if stamp <= cursor:
                     continue
-                messages = session_data.get("messages", [])
-                if not messages:
+                newest = max(newest, stamp)
+                content = str(message.get("content") or "")
+                if not any(marker in content for marker in self.FAILURE_MARKERS):
                     continue
-                last_check = self._last_check
-                recent_messages = [m for m in messages[-30:] if m.get("timestamp", 0) > last_check]
-                if not recent_messages:
-                    continue
-                self._last_check = max(m.get("timestamp", 0) for m in recent_messages) if recent_messages else self._last_check
-                for i, msg in enumerate(recent_messages):
-                    content = str(msg.get("content", ""))
-                    if not any(p in content for p in ("Error:", "SyntaxError", "ModuleNotFoundError", "FAILED:")):
-                        continue
-                    context_msgs = [str(recent_messages[j].get("content", ""))[:300] for j in range(max(0, i - 3), i) if recent_messages[j].get("tool_name")]
-                    context = "\n".join(context_msgs)
-                    pattern_key = content[:120]
-                    existing = self._error_patterns.get(pattern_key, {"count": 0, "first_seen": time.time(), "last_seen": 0})
-                    existing["count"] += 1
-                    existing["last_seen"] = time.time()
-                    if existing["count"] <= 2:
-                        diag = await self._diagnose(content, context)
-                        if diag:
-                            existing.update(diag)
-                            if diag.get("detect"):
-                                self.memory.add_runtime_block(
-                                    detect=diag["detect"],
-                                    reason=diag.get("reason", ""),
-                                    fix=diag.get("fix", ""),
-                                    source=pattern_key[:80]
-                                )
-                    self._error_patterns[pattern_key] = existing
-                    self._save_patterns()
-        except Exception as e:
-            logger.error(f"Dreamer _check_errors error: {e}")
+                findings.append({
+                    "session": session["id"],
+                    "title": str(session.get("title") or ""),
+                    "goal": self._goal(messages),
+                    "error": content[:600],
+                    "context": self._context(messages, index),
+                    "at": stamp,
+                })
+        if newest > cursor:
+            self._state["session_cursor"] = newest
+            self._save_state()
+        return findings[-self.MAX_FINDINGS:]
+
+    async def _learn(self, findings: List[Dict[str, Any]]) -> int:
+        learned = 0
+        for finding in findings:
+            key = finding["error"][:120]
+            record = dict(self._error_patterns.get(key) or {})
+            record["count"] = int(record.get("count", 0) or 0) + 1
+            record.setdefault("first_seen", finding["at"])
+            record["last_seen"] = finding["at"]
+            self._error_patterns[key] = record
+            if record["count"] > 2 or record.get("fix") or learned >= self.MAX_DIAGNOSES:
+                continue
+            diagnosis = await self._diagnose(finding["error"], finding["context"])
+            if not diagnosis:
+                continue
+            record.update(diagnosis)
+            learned += 1
+            if diagnosis.get("detect"):
+                self.memory.add_runtime_block(
+                    detect=diagnosis["detect"],
+                    reason=diagnosis.get("reason", ""),
+                    fix=diagnosis.get("fix", ""),
+                    source=key[:80],
+                )
+        if findings:
+            self._save_patterns()
+        return learned
 
     async def _diagnose(self, error: str, context: str = "") -> Optional[Dict]:
+        if not self.provider:
+            return None
         try:
             ctx_part = f"\n\nCode/context that caused it:\n{context[:500]}" if context else ""
             prompt = f"""ERROR: {error}{ctx_part}
@@ -1030,48 +1156,79 @@ Be specific. The "detect" field must be a literal substring that appears in the 
             pass
         return None
 
-    async def _extract_facts(self):
+    async def _extract_facts(self) -> int:
+        if not self.memory or not self.provider:
+            return 0
         recent = self.memory.get_recent_memories(limit=30)
-        if len(recent) < 5: return
-        transcript = "\n".join(f"- {str(m.get('content', ''))[:200]}" for m in recent)
+        cursor = float(self._state.get("fact_cursor") or 0.0)
+        fresh = [m for m in recent if self._epoch(m.get("timestamp")) > cursor]
+        if len(fresh) < 3:
+            return 0
+        transcript = "\n".join(f"- {str(m.get('content', ''))[:200]}" for m in fresh[-20:])
         try:
-            r = await self.provider.generate_text([{"role": "user", "content": f"Extract facts, strategies, anti-patterns as JSON {{facts:[], strategies:[], anti_patterns:[]}}\n\n{transcript}"}], "Return JSON only.")
+            r = await self.provider.generate_text(
+                [{"role": "user", "content": f"Extract facts, strategies, anti-patterns as JSON {{facts:[], strategies:[], anti_patterns:[]}}\n\n{transcript}"}],
+                "Return JSON only.",
+            )
             content = r.get("content", "") if isinstance(r, dict) else str(r)
             m = re.search(r'\{.*\}', content, re.DOTALL)
-            if m:
-                insights = json.loads(m.group())
-                card = PeerCard(
-                    agent_id="system", domain="learned",
-                    facts=insights.get("facts", [])[:10],
-                    strategies=insights.get("strategies", [])[:5],
-                    anti_patterns=insights.get("anti_patterns", [])[:5],
-                )
-                if card.facts or card.strategies or card.anti_patterns:
-                    self._cards.upsert(card)
-        except Exception: pass
+            if not m:
+                return 0
+            insights = json.loads(m.group())
+            card = PeerCard(
+                agent_id="system", domain="learned",
+                facts=[str(x) for x in insights.get("facts", [])][:10],
+                strategies=[str(x) for x in insights.get("strategies", [])][:5],
+                anti_patterns=[str(x) for x in insights.get("anti_patterns", [])][:5],
+            )
+            if not (card.facts or card.strategies or card.anti_patterns):
+                return 0
+            self._cards.upsert(card)
+            self._state["fact_cursor"] = max(self._epoch(m2.get("timestamp")) for m2 in fresh)
+            self._save_state()
+            return len(card.facts) + len(card.strategies) + len(card.anti_patterns)
+        except Exception:
+            return 0
 
-    async def _write_lessons(self):
-        lessons = []
-        for key, data in self._error_patterns.items():
-            if data.get("count", 0) >= 2 and data.get("fix"):
-                lessons.append({
-                    "error": key,
-                    "count": data["count"],
-                    "reason": data.get("reason", ""),
-                    "fix": data.get("fix", ""),
-                    "detect": data.get("detect", ""),
-                })
+    async def _write_lessons(self) -> int:
+        lessons = [
+            {"error": key, "count": data.get("count", 0), "reason": data.get("reason", ""),
+             "fix": data.get("fix", ""), "detect": data.get("detect", "")}
+            for key, data in self._error_patterns.items()
+            if data.get("count", 0) >= 2 and data.get("fix")
+        ]
         if not lessons:
-            return
+            return 0
+        if lessons == self._state.get("lessons"):
+            return 0
         self._cards.upsert(PeerCard(
             agent_id="system",
             domain="runtime",
-            anti_patterns=[l["detect"] for l in lessons if l.get("detect")][:8],
-            strategies=[l["fix"] for l in lessons if l.get("fix")][:8],
+            anti_patterns=[item["detect"] for item in lessons if item.get("detect")][:8],
+            strategies=[item["fix"] for item in lessons if item.get("fix")][:8],
         ))
         EVOLUTION_DIR.mkdir(parents=True, exist_ok=True)
-        path = EVOLUTION_DIR / f"lessons_{int(time.time())}.json"
-        path.write_text(
-            json.dumps(lessons, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        path = EVOLUTION_DIR / "lessons_latest.json"
+        path.write_text(json.dumps(lessons, indent=2, ensure_ascii=False), encoding="utf-8")
+        self._state["lessons"] = lessons
+        self._save_state()
+        return len(lessons)
+
+    async def _optimize(self) -> Dict[str, int]:
+        duplicates = toxic = 0
+        if self.memory:
+            try:
+                report = self.memory.evolve()
+                match = re.search(r"Removed (\d+)", report or "")
+                duplicates = int(match.group(1)) if match else 0
+            except Exception:
+                pass
+            try:
+                toxic = int(self.memory.prune_toxic(threshold_hits=5, success_rate=0.5) or 0)
+            except Exception:
+                toxic = 0
+        try:
+            await self._cards.evolve()
+        except Exception:
+            pass
+        return {"duplicates": duplicates, "toxic": toxic}

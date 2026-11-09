@@ -311,9 +311,9 @@ class StemAgent:
         tools = dict(self.tools)
         for name, func in self._mcp_tools().items():
             tools.setdefault(name, func)
-        if self.mode == "BUILD":
-            return tools
-        return {k: v for k, v in tools.items() if k not in write_set}
+        if self.mode in ("ASK", "CALL"):
+            return {k: v for k, v in tools.items() if k not in write_set}
+        return tools
 
     def _tool_specs(self) -> Dict[str, Any]:
         """Active tool callables, keyed by public name (for argument binding)."""

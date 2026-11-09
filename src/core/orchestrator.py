@@ -238,33 +238,33 @@ End with exactly one line: GRADE: [1-5]"""
                 match = re.search(r"GRADE:\s*([1-5])", grade_resp)
                 grade = float(match.group(1)) if match else 1.0
 
-                post_err = SkillEngine.validate_post(skill_contract, result) if skill_contract else None
-                if post_err:
-                    grade = min(grade, float(self.settings.critic_gate_threshold) - 0.01)
-                    self._log(self.name, f"POST-VALIDATION FAILED: {post_err}", "state", self.mode)
+            post_err = SkillEngine.validate_post(skill_contract, result) if skill_contract else None
+            if post_err:
+                grade = min(grade, float(self.settings.critic_gate_threshold) - 0.01)
+                self._log(self.name, f"POST-VALIDATION FAILED: {post_err}", "state", self.mode)
 
+            if self._run:
+                self._run.metadata["last_grade"] = grade
+                self._run.metadata["verification_failures"] = verify_failures
+            if self._active_session_id:
+                memory_core._session_db.update_session_grade(self._active_session_id, grade)
+
+            await memory_core.add_memory(str(result), category="blueprint", critic_score=grade)
+
+            if grade >= self.settings.critic_gate_threshold and not verify_failures:
+                return result
+            if round_no == max_rounds:
+                if self._git_mgr:
+                    try:
+                        self._git_mgr.rollback(1)
+                        self._log(self.name, f"Auto-rollback: grade {grade}", "state", self.mode)
+                    except Exception as e:
+                        self._log(self.name, f"Rollback failed: {e}", "state", self.mode)
                 if self._run:
-                    self._run.metadata["last_grade"] = grade
-                    self._run.metadata["verification_failures"] = verify_failures
-                if self._active_session_id:
-                    memory_core._session_db.update_session_grade(self._active_session_id, grade)
+                    self._run.metadata["critic_failed"] = True
+                return f"[ROLLBACK] Grade {grade} — reverted 1 step. Escalate."
 
-                await memory_core.add_memory(str(result), category="blueprint", critic_score=grade)
-
-                if grade >= self.settings.critic_gate_threshold and not verify_failures:
-                    return result
-                if round_no == max_rounds:
-                    if self._git_mgr:
-                        try:
-                            self._git_mgr.rollback(1)
-                            self._log(self.name, f"Auto-rollback: grade {grade}", "state", self.mode)
-                        except Exception as e:
-                            self._log(self.name, f"Rollback failed: {e}", "state", self.mode)
-                    if self._run:
-                        self._run.metadata["critic_failed"] = True
-                    return f"[ROLLBACK] Grade {grade} — reverted 1 step. Escalate."
-
-                task = f"Original task: {original_task}\n\nPrevious attempt scored {grade}/5. Fix the missing/broken parts. Focus ONLY on gaps."
+            task = f"Original task: {original_task}\n\nPrevious attempt scored {grade}/5. Fix the missing/broken parts. Focus ONLY on gaps."
 
         return "Degeneration guard triggered. Halted."
 

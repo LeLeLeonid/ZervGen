@@ -1,5 +1,7 @@
 ---
+name: code
 description: "Write, debug, and refactor code in any language"
+tags: [agent, code, coding, refactor, implement, debug]
 contract:
   pre: {}
   post: {}

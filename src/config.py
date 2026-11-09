@@ -429,13 +429,17 @@ class MCPreset(TypedDict):
 MODES: Dict[str, Dict[str, str]] = {
     "ASK": {"description": "Fast, direct answers. Use tools when needed.",
             "prompt": "MODE: [ASK]. Answer directly. Use tools when needed. Do not invent missing facts."},
-    "PLAN": {"description": "Inspect and plan without changing files.",
-             "prompt": "MODE: [PLAN]. Inspect what matters, identify constraints and risks, then give a concrete execution plan. Do not make changes."},
     "BUILD": {"description": "Execution, coding, file manipulation.",
-              "prompt": "MODE: [BUILD]. Execute with available tools. Verify meaningful changes before reporting completion. Do not expose private chain-of-thought."},
+              "prompt": "MODE: [BUILD]. Execute with available tools. Verify meaningful changes before reporting completion."},
+    "CALL": {"description": "Inspect and plan without changing files.",
+             "prompt": "MODE: [CALL]. Inspect what matters, identify constraints and risks, then give a concrete execution plan. Do not make changes."},
     "DEBUG": {"description": "Diagnose and fix.",
               "prompt": "MODE: [DEBUG]. Reproduce the failure, identify the root cause from evidence, make the smallest reliable fix, and verify it."},
 }
+
+READ_ONLY_MODES = {"ASK", "CALL"}
+WRITE_MODES = {"BUILD", "DEBUG"}
+MODE_ORDER = ("ASK", "BUILD", "CALL", "DEBUG")
 
 PROVIDER_ALIASES: Dict[str, str] = {"gemini": "google"}
 

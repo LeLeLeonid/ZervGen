@@ -115,7 +115,7 @@ def _atomic_write(path: Path, content: str) -> None:
 
 # ── DELEGATION ──────────────────────────────────────────────────────────────
 
-async def delegate_to(agent_name: str = "", agent_id: str = "", task: str = "", context: str = "", agents: str = "") -> str:
+async def delegate_to(agent_name: str = "", task: str = "", context: str = "", agent_id: str = "", agents: str = "") -> str:
     """Hand a task to a role agent through the live orchestrator."""
     orchestrator = _resolve_agent()
     if orchestrator is not None and hasattr(orchestrator, "_handle_delegation"):

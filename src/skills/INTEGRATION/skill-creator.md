@@ -17,23 +17,31 @@ verification: checklist
 
 You create new ZervGen skills/agents by writing `.md` files.
 
-## Important Rule
-**For standard skills, use:** `name`, `description`, `tags`.
-Everything else lives in the Markdown body. The loader ignores extra fields unless explicitly wired.
+## Frontmatter contract
 
-## Advanced Fields
-Reserved for orchestrated, multi-step, or safety-critical workflows. If implemented in the runtime, they function as:
-- `contract.pre/post` → Python-level guards. Fails fast if required args are missing (`pre`) or output lacks expected keys/format (`post`). Bypasses critic on hard failures.
-- `procedure` → Machine-readable step list. Used by the critic as a deterministic grading rubric instead of freeform evaluation.
-- `dependencies` → Topological injection. Forces dependent skills/tools to load first. Prevents context race conditions in chained workflows.
-- `verification` → Critic mode switch. `checklist` grades against `procedure`. Future modes: `heavy` (parallel reasoning), `code_test` (unit execution), `rubric` (custom scoring).
+Required, enforced by `validate_skill` on every load — a skill that fails is logged and dropped:
 
-**Do not add these unless building state-chaining, auto-graded, or contract-bound agents.** They add zero overhead to standard skills.
+- `name` — must equal the file stem (or the directory name for `SKILL.md`), lowercase `[a-z0-9._-]`, max 64 chars.
+- `description` — one line, max 1024 chars. This is what the index shows; write it as a trigger.
+- `tags` — non-empty list. These drive `match_trigger`; include the words a user would actually type.
+
+Optional, with defaults filled in by the loader:
+
+- `tools` — list of tool names this skill needs. Use `["all"]` only for orchestrator roles.
+- `contract.pre` / `contract.post` — mappings. `post` keys are checked against the result.
+- `procedure` — ordered list. The critic grades against it when `critic_enabled`.
+- `dependencies` — list of tools or skills that must load first.
+- `verification` — `checklist` (default) or `heavy`.
+- `related`, `version`, `license`, `category`, `metadata`.
+
+Unknown top-level fields are rejected. Do not invent keys.
 
 ## Directory Map
 - `src/skills/AGENTS/` — Full agents. Requires `tools: [...]`. Spawned via `delegate_to()`.
-- `src/skills/UTILITIES/` — Context hints, routing triggers, PTC patterns. No `tools` list.
+- `src/skills/UTILITIES/` — Context hints, routing triggers, PTC patterns.
 - `src/skills/INTEGRATION/` — External APIs, webhooks, MCP bridges.
+
+One skill per file. A directory with a `SKILL.md` (plus optional `references/`, `scripts/`, `templates/`, `assets/`) is the bundled form; a flat `<name>.md` is the simple form. Do not create both for the same skill.
 
 ## How to Create a Skill
 

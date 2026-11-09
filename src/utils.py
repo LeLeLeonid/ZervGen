@@ -214,6 +214,24 @@ class TraceBus:
 # ─── TURN PARSING ────────────────────────────────────────────────────────
 
 SHORTHAND_RE = re.compile(r"^\s*::(?:(?:tool|call)\s+)?([A-Za-z_][\w.-]*)\s*(.*?)\s*$")
+
+#: Preferred short names on the ``::`` surface, resolved to real tool names.
+TOOL_ALIASES = {
+    "read": "read_file", "write": "write_file", "append": "append_file",
+    "edit": "edit_file", "ls": "list_files", "list": "list_files",
+    "glob": "glob_files", "grep": "grep_files", "sh": "shell",
+    "bash": "shell", "terminal": "shell", "exec": "shell",
+    "fetch": "fetch_url", "web_extract": "fetch_url", "browser": "shell",
+    "skill": "load_skill", "skills": "list_skills", "find": "find_skill",
+    "delegate": "delegate_to", "delegate_task": "delegate_to",
+}
+
+
+def canonical_tool(name: str) -> str:
+    """Resolve a shorthand name to the tool it means."""
+    return TOOL_ALIASES.get(name, name)
+
+
 XML_TAG_RE = re.compile(
     r"<(?P<tag>[A-Za-z_][\w.-]*)(?P<attrs>(?:\s+[A-Za-z_][\w.-]*\s*=\s*(?:\"[^\"]*\"|'[^']*'))*)"
     r"\s*(?:/>|>(?P<body>.*?)</(?P=tag)>)",
@@ -295,8 +313,8 @@ def _scalar(text: str) -> Any:
 
 _BARE = {"true": True, "false": False, "null": None, "none": None, "nil": None}
 
-def _node_value(node: ast.AST) -> Any:
-    """Value of one argument expression; bare names stay strings."""
+def _node_value(node: ast.AST, source: str = "") -> Any:
+    """Value of one argument expression; bare names and expressions stay text."""
     if isinstance(node, ast.Constant):
         return node.value
     if isinstance(node, ast.Name):
@@ -305,6 +323,9 @@ def _node_value(node: ast.AST) -> Any:
         return ast.literal_eval(node)
     except Exception:
         pass
+    segment = ast.get_source_segment(source, node) if source else ""
+    if segment:
+        return segment.strip()
     try:
         return ast.unparse(node).strip()
     except Exception:
@@ -317,14 +338,50 @@ def _parse_kwargs(blob: str) -> Optional[Dict[str, Any]]:
     )
     return {key: _scalar(value) for key, value in pairs} if pairs else None
 
+def _split_args(inner: str) -> List[str]:
+    parts, depth, quote, current = [], 0, "", []
+    for char in inner:
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = ""
+            continue
+        if char in "\"'":
+            quote = char
+            current.append(char)
+            continue
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth = max(0, depth - 1)
+        if char == "," and depth == 0:
+            parts.append("".join(current).strip())
+            current = []
+            continue
+        current.append(char)
+    tail = "".join(current).strip()
+    if tail:
+        parts.append(tail)
+    return [part for part in parts if part]
+
+def _bind_positional(names: List[str], values: List[str], spec: Any = None) -> Dict[str, Any]:
+    """Bind positional values onto the callable's parameter order."""
+    if not names:
+        return {"args": [_scalar(v) for v in values]}
+    if len(values) > len(names):
+        head = values[: len(names) - 1]
+        values = head + [", ".join(values[len(names) - 1:])]
+    return {names[i]: _scalar(value) for i, value in enumerate(values[:len(names)])}
+
 def _parse_call_expr(inner: str, spec: Any) -> Optional[Dict[str, Any]]:
     """``a, b, c=1`` inside a call, mapped onto the callable's parameters."""
     if not inner.strip():
         return {}
+    source = f"_f({inner})"
     try:
-        node = ast.parse(f"_f({inner})", mode="eval").body
+        node = ast.parse(source, mode="eval").body
     except SyntaxError:
-        return None
+        return _bind_positional(_arg_names(spec), _split_args(inner), spec)
     if not isinstance(node, ast.Call):
         return None
     names = _arg_names(spec)
@@ -333,13 +390,13 @@ def _parse_call_expr(inner: str, spec: Any) -> Optional[Dict[str, Any]]:
         if index >= len(names):
             if names or len(node.args) > 1 or node.keywords:
                 return None
-            args["text"] = _node_value(value)
+            args["text"] = _node_value(value, source)
             continue
-        args[names[index]] = _node_value(value)
+        args[names[index]] = _node_value(value, source)
     for keyword in node.keywords:
         if keyword.arg is None:
             return None
-        args[keyword.arg] = _node_value(keyword.value)
+        args[keyword.arg] = _node_value(keyword.value, source)
     return args
 
 def _parse_call_args(blob: str, spec: Any = None) -> Optional[Dict[str, Any]]:
@@ -359,7 +416,8 @@ def _parse_call_args(blob: str, spec: Any = None) -> Optional[Dict[str, Any]]:
         return _parse_kwargs(blob)
     names = _arg_names(spec)
     if names:
-        return {names[0]: _scalar(blob)}
+        values = [v.strip() for v in blob.split(",")]
+        return _bind_positional(names, values, spec)
     values = [v.strip() for v in blob.split(",")]
     if len(values) > 1:
         return {"args": [_scalar(v) for v in values]}
@@ -379,7 +437,7 @@ def parse_shorthand(text: str, names: Optional[set[str]] = None,
         match = SHORTHAND_RE.match(line)
         if not match:
             continue
-        name, blob = match.group(1), match.group(2)
+        name, blob = canonical_tool(match.group(1)), match.group(2)
         if names is not None and name not in names:
             continue
         args = _parse_call_args(blob, (specs or {}).get(name))

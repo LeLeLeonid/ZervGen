@@ -50,20 +50,35 @@ def _as_list(value: Any) -> List[str]:
 
 
 def _meta(fm: dict) -> dict:
-    """Hermes/OpenClaw style namespaced metadata, flattened."""
-    merged = {}
+    merged: Dict[str, Any] = {}
     for holder in ("metadata", "meta"):
         nested = fm.get(holder)
-        if isinstance(nested, dict):
-            for key in ("hermes", "openclaw", "zervgen"):
-                if isinstance(nested.get(key), dict):
-                    merged.update(nested[key])
+        if not isinstance(nested, dict):
+            continue
+        for key, value in nested.items():
+            if isinstance(value, dict):
+                merged.update(value)
+            else:
+                merged[key] = value
     merged.update({k: v for k, v in fm.items() if k not in ("metadata", "meta")})
     return merged
 
 
+def _contract(raw: Any) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"pre": {}, "post": {}}
+    if not isinstance(raw, dict):
+        return out
+    for key in ("pre", "post"):
+        value = raw.get(key)
+        if isinstance(value, dict):
+            out[key] = {str(k): v for k, v in value.items()}
+        elif isinstance(value, (list, tuple, str)):
+            items = _as_list(value)
+            out[key] = {"required_keys": items} if key == "post" else {item: True for item in items}
+    return out
+
+
 def _parse_frontmatter(text: str) -> Optional[dict]:
-    """Frontmatter of a skill file, or None when it is not a skill."""
     if not text.startswith("---"):
         return None
     try:
@@ -80,6 +95,12 @@ def _parse_frontmatter(text: str) -> Optional[dict]:
     fm["category"] = str(flat.get("category") or "").strip().lower()
     fm["version"] = str(flat.get("version") or "").strip()
     fm["license"] = str(flat.get("license") or "").strip()
+    fm["tools"] = _as_list(flat.get("tools") or flat.get("allowed-tools") or flat.get("allowed_tools"))
+    fm["contract"] = _contract(flat.get("contract"))
+    fm["procedure"] = _as_list(flat.get("procedure"))
+    fm["dependencies"] = _as_list(flat.get("dependencies"))
+    verification = str(flat.get("verification") or "checklist").strip().lower()
+    fm["verification"] = verification if verification in ("checklist", "heavy") else "checklist"
 
     name = str(fm["name"]).strip()
     description = " ".join(str(fm["description"]).split())
@@ -92,8 +113,41 @@ def _parse_frontmatter(text: str) -> Optional[dict]:
     return fm
 
 
+SKILL_FIELDS = {
+    "name", "description", "tags", "keywords", "tools", "allowed-tools",
+    "contract", "procedure", "dependencies", "verification", "version",
+    "license", "related", "related_skills", "category", "metadata", "meta",
+}
+
+
+def validate_skill(fm: dict, path: Path) -> List[str]:
+    problems: List[str] = []
+    expected = path.parent.name if path.name == SKILL_FILE else path.stem
+    if fm.get("name") != expected:
+        problems.append(f"name '{fm.get('name')}' must match '{expected}'")
+    if not fm.get("tags"):
+        problems.append("tags is empty")
+    if not isinstance(fm.get("tools"), list):
+        problems.append("tools must be a list")
+    if not isinstance(fm.get("related"), list):
+        problems.append("related must be a list")
+    contract = fm.get("contract") or {}
+    for key in ("pre", "post"):
+        if not isinstance(contract.get(key), dict):
+            problems.append(f"contract.{key} must be a mapping")
+    if not isinstance(fm.get("procedure"), list):
+        problems.append("procedure must be a list")
+    if not isinstance(fm.get("dependencies"), list):
+        problems.append("dependencies must be a list")
+    if fm.get("verification") not in ("checklist", "heavy"):
+        problems.append("verification must be checklist or heavy")
+    unknown = sorted(set(fm) - SKILL_FIELDS)
+    if unknown:
+        problems.append(f"unknown fields: {', '.join(unknown)}")
+    return problems
+
+
 def _category(path: Path, root: Optional[Path] = None) -> str:
-    """Top-level folder a skill lives in, relative to its skills root."""
     base = Path(root).resolve() if root else SKILLS_DIR.resolve()
     try:
         parts = Path(path).resolve().relative_to(base).parts
@@ -105,7 +159,6 @@ def _category(path: Path, root: Optional[Path] = None) -> str:
 
 
 def _iter_skill_files(root: Path):
-    """Yield skill files: a directory with SKILL.md is a leaf, never recursed."""
     stack = [(root, 0)]
     while stack:
         directory, depth = stack.pop()
@@ -129,7 +182,6 @@ def _iter_skill_files(root: Path):
 
 
 def list_resources(path: Path) -> List[str]:
-    """Bundled files a skill ships under its support directories."""
     base = Path(path).parent
     found = []
     for folder in SUPPORT_DIRS:
@@ -145,7 +197,6 @@ def list_resources(path: Path) -> List[str]:
 
 
 def _root_stamp(roots: List[Path]) -> str:
-    """Cheap fingerprint so an unchanged tree is never rescanned."""
     parts = []
     for root in roots:
         try:
@@ -156,7 +207,6 @@ def _root_stamp(roots: List[Path]) -> str:
 
 
 def rebuild_catalog(force: bool = False) -> dict:
-    """Rescan every external root; first definition of a name wins."""
     roots = _external_roots()
     stamp = _root_stamp(roots)
     old: Dict[str, Any] = {}
@@ -206,8 +256,7 @@ def rebuild_catalog(force: bool = False) -> dict:
 
 
 class SkillEngine:
-    """Validate, grade, guide."""
-    
+
     @staticmethod
     def validate_pre(skill: Any, args: Dict[str, Any]) -> Optional[str]:
         missing = [k for k, v in skill.pre.items() if k not in args or not args[k]]
@@ -263,7 +312,6 @@ GRADE: [1-5]"""
 
 @dataclass
 class SkillDef:
-    """One skill: metadata eagerly, body and bundled files on demand."""
     name: str
     description: str = ""
     tags: List[str] = field(default_factory=list)
@@ -284,11 +332,9 @@ class SkillDef:
 
     @property
     def base_dir(self) -> str:
-        """Directory the skill's relative paths resolve against."""
         return str(Path(self.path).parent) if self.path else ""
 
     def match_trigger(self, user_input: str) -> bool:
-        """True when the request shares a word (or a 4+ letter stem) with a tag."""
         if not self.tags:
             return False
         words = set(re.findall(r"[a-z0-9]+", (user_input or "").lower()))
@@ -302,13 +348,12 @@ class SkillDef:
                                           for other in words if len(other) >= 4):
                     return True
         return False
-    
+
     @property
     def is_favorite(self) -> bool:
         return "favorite" in self.tags or not self.external
 
 class SkillRegistry:
-    """Loads YAML contracts, validates, topological dependency sort (GoS)."""
     _instance = None
 
     def __new__(cls):
@@ -323,10 +368,9 @@ class SkillRegistry:
         self._initialized = True
         self.skills: Dict[str, SkillDef] = {}
         self._load_all()
-        self._load_external()   
+        self._load_external()
 
     def _load_external(self) -> None:
-        """External skills stay metadata-only until their body is requested."""
         for name, meta in rebuild_catalog().items():
             if name not in self.skills:
                 self.skills[name] = SkillDef(
@@ -342,7 +386,6 @@ class SkillRegistry:
                 )
 
     def _load_all(self):
-        """Built-in skills: ``SKILL.md`` bundles plus loose category markdown."""
         for md_file in sorted(SKILLS_DIR.rglob("*.md")):
             relative = md_file.relative_to(SKILLS_DIR)
             if AGENTS_DIR in md_file.parents:
@@ -356,17 +399,21 @@ class SkillRegistry:
             fm = _parse_frontmatter(path.read_text(encoding="utf-8"))
             if not fm:
                 return
-            contract = fm.get("contract") or {}
+            problems = validate_skill(fm, path)
+            if problems:
+                logger.warning("Skill %s rejected: %s", path, "; ".join(problems))
+                return
+            contract = fm["contract"]
             self.skills[fm["name"]] = SkillDef(
                 name=fm["name"],
                 description=fm["description"],
                 tags=fm["tags"],
-                tools=fm.get("tools", []),
-                pre=contract.get("pre", {}),
-                post=contract.get("post", {}),
-                procedure=fm.get("procedure", []),
-                dependencies=fm.get("dependencies", []),
-                verification=fm.get("verification", "checklist"),
+                tools=fm["tools"],
+                pre=contract["pre"],
+                post=contract["post"],
+                procedure=fm["procedure"],
+                dependencies=fm["dependencies"],
+                verification=fm["verification"],
                 body="",
                 path=str(path),
                 files=list_resources(path),
@@ -400,7 +447,6 @@ class SkillRegistry:
         return order
 
     def get(self, name: str) -> Optional[SkillDef]:
-        """A skill, unless it is external and external skills are switched off."""
         skill = self.skills.get(name)
         if skill and skill.external and not self._external_enabled():
             return None
@@ -411,7 +457,6 @@ class SkillRegistry:
         return bool(skill and skill.external)
 
     def visible(self) -> List[SkillDef]:
-        """Skills the current configuration allows the model to see."""
         if self._external_enabled():
             return list(self.skills.values())
         return [skill for skill in self.skills.values() if not skill.external]
@@ -425,7 +470,6 @@ class SkillRegistry:
         return grouped
 
     def related(self, name: str, depth: int = 1) -> List[str]:
-        """Neighbours of a skill, breadth-first, excluding the skill itself."""
         seen = {name}
         order: List[str] = []
         frontier = [name]
@@ -445,7 +489,6 @@ class SkillRegistry:
         return [item for item in order if item in self.skills]
 
     def search(self, tags: list, limit: int = 5) -> List["SkillDef"]:
-        """Skills ranked by name, tag and description overlap with a query."""
         wanted = set()
         for tag in tags:
             words = re.findall(r"[a-z0-9]+", str(tag).lower())
@@ -489,7 +532,6 @@ class SkillRegistry:
     def index(self, budget_chars: int = 7000, desc_chars: int = 90,
               max_skills: int = 150, matched: Optional[set] = None,
               skills: Optional[List[SkillDef]] = None) -> str:
-        """Category-grouped catalog, degraded instead of cut mid-entry."""
         matched = set(matched or ())
         pool = sorted(skills if skills is not None else self.visible(),
                       key=lambda s: (s.category or "general", s.name))
@@ -514,7 +556,6 @@ class SkillRegistry:
         return f"{head}\n{self._render_index(shown, 0, matched)}{tail}"
 
     def get_body(self, name: str) -> str:
-        """The skill's instructions, read from disk the first time it is used."""
         skill = self.skills.get(name)
         if not skill:
             return f"Error: skill '{name}' not found."
@@ -529,7 +570,6 @@ class SkillRegistry:
         return skill.body or "(empty)"
 
     def pin(self, name: str) -> str:
-        """Mark an external skill as a favorite in the on-disk catalog."""
         skill = self.skills.get(name)
         if not skill or not skill.external:
             return f"Error: '{name}' is not an external skill."
@@ -549,7 +589,6 @@ class SkillRegistry:
         return f"'{name}' pinned as favorite."
 
     def aliases(self, name: str) -> List[tuple]:
-        """Foreign tool names a skill mentions, paired with this harness's name."""
         skill = self.skills.get(name)
         if not skill or not skill.path:
             return []
@@ -561,7 +600,6 @@ class SkillRegistry:
                 if re.search(r"\b" + re.escape(foreign) + r"\b", body)]
 
     def get_resource(self, name: str, relative: str) -> str:
-        """Read one bundled file, confined to the skill's own directory."""
         skill = self.skills.get(name)
         if not skill or not skill.path:
             return f"Error: skill '{name}' has no bundled files."
@@ -595,7 +633,6 @@ class SkillRegistry:
         return matches[0] if matches else None
 
     def reload(self):
-        """Drop every skill and rescan, including the external catalog."""
         self.skills.clear()
         rebuild_catalog(force=True)
         self._load_all()
@@ -614,12 +651,16 @@ def _load_from_path(path: Path) -> Optional[RoleConfig]:
         return None
     try:
         raw = path.read_text(encoding="utf-8")
-        if raw.startswith("---"):
-            parts = raw.split("---", 2)
-            if len(parts) >= 3:
-                meta = yaml.safe_load(parts[1]) or {}
-                return RoleConfig(path.stem, parts[2].strip(), meta)
-        return RoleConfig(path.stem, raw, {"description": "Legacy role", "tools": []})
+        fm = _parse_frontmatter(raw)
+        if not fm:
+            logger.warning("Role %s rejected: missing or invalid frontmatter", path)
+            return None
+        if path.parent == AGENTS_DIR:
+            problems = validate_skill(fm, path)
+            if problems:
+                logger.warning("Role %s rejected: %s", path, "; ".join(problems))
+                return None
+        return RoleConfig(path.stem, raw.split("---", 2)[2].strip(), fm)
     except Exception:
         return None
 

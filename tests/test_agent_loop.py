@@ -5,6 +5,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.core.base_agent import StemAgent
+from src.core.orchestrator import _looks_failed
 from src.core.runtime import RunStatus
 
 
@@ -249,3 +250,192 @@ def test_prompt_reports_degraded_server_with_cached_tools(tmp_path, monkeypatch)
     text = agent._prompt_mcp()
     assert "alpha: degraded (2 cached tools)" in text
     assert "mcp_execute" in text
+
+
+# --- PTC sandbox ---
+def _sandbox_agent(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    agent = StemAgent(name="system", provider=None, skill_name="system", mode="BUILD")
+    agent._silent = True
+    agent._set_status = lambda *args, **kwargs: None
+    agent._log = lambda *args, **kwargs: None
+    return agent
+
+
+def _blocked(agent, code):
+    return agent._validate_ptc(code) is not None
+
+
+def test_import_is_blocked(monkeypatch, tmp_path):
+    agent = _sandbox_agent(monkeypatch, tmp_path)
+    assert _blocked(agent, "import os\nos.system('id')")
+
+
+def test_import_after_first_node_is_blocked(monkeypatch, tmp_path):
+    agent = _sandbox_agent(monkeypatch, tmp_path)
+    assert _blocked(agent, "x = 1\ny = 2\nimport os")
+
+
+def test_private_attribute_is_blocked(monkeypatch, tmp_path):
+    agent = _sandbox_agent(monkeypatch, tmp_path)
+    assert _blocked(agent, "json.__builtins__['__import__']('os').system('id')")
+    assert _blocked(agent, "print.__self__")
+
+
+def test_dunder_class_chain_is_blocked(monkeypatch, tmp_path):
+    agent = _sandbox_agent(monkeypatch, tmp_path)
+    assert _blocked(agent, "().__class__.__base__.__subclasses__()")
+    assert _blocked(agent, "type(1).__mro__")
+
+
+def test_escape_helpers_are_blocked(monkeypatch, tmp_path):
+    agent = _sandbox_agent(monkeypatch, tmp_path)
+    assert _blocked(agent, "getattr(object, 'x')")
+    assert _blocked(agent, "open('/etc/passwd').read()")
+    assert _blocked(agent, "__import__('os')")
+
+
+def test_format_field_traversal_is_blocked(monkeypatch, tmp_path):
+    agent = _sandbox_agent(monkeypatch, tmp_path)
+    assert _blocked(agent, "'{0.__globals__[__builtins__]}'.format(json.dumps)")
+    assert _blocked(agent, "'{0.__class__.__mro__}'.format(1)")
+    # splitting the field so the literal check cannot see it must still fail
+    assert _blocked(agent, "('{' + '0.__class__' + '}').format(1)")
+    assert _blocked(agent, "'%s %s'.format_map({'a': 1})")
+
+
+def test_normal_script_passes(monkeypatch, tmp_path):
+    agent = _sandbox_agent(monkeypatch, tmp_path)
+    assert agent._validate_ptc("data = json.dumps({'a': 1})\nprint(len(data))") is None
+
+
+def test_syntax_error_is_reported(monkeypatch, tmp_path):
+    agent = _sandbox_agent(monkeypatch, tmp_path)
+    error = agent._validate_ptc("def broken(:\n    pass")
+    assert error and error.startswith("Syntax Error")
+
+
+def test_execution_rejects_escape(monkeypatch, tmp_path):
+    agent = _sandbox_agent(monkeypatch, tmp_path)
+    output = asyncio.run(agent._run_code("import os", ""))
+    assert output.startswith("PTC blocked")
+
+
+def test_execution_prints_and_returns(monkeypatch, tmp_path):
+    agent = _sandbox_agent(monkeypatch, tmp_path)
+    output = asyncio.run(agent._run_code("print('hi')\nreturn 2 + 2", ""))
+    assert output == "hi\n4"
+
+
+def test_json_namespace_exposes_only_data_helpers(monkeypatch, tmp_path):
+    agent = _sandbox_agent(monkeypatch, tmp_path)
+    output = asyncio.run(agent._run_code("return json.dumps({'k': 1})", ""))
+    assert output == '{"k": 1}'
+    rejected = asyncio.run(agent._run_code("return json.__builtins__", ""))
+    assert rejected.startswith("PTC blocked")
+
+
+# --- verification sensors ---
+
+
+def _sensor_agent(commands):
+    agent = object.__new__(StemAgent)
+    agent.mode = "BUILD"
+    agent._active_tools = lambda: {"shell": object()}
+    agent.settings = type("S", (), {"verification_commands": commands})()
+    return agent
+
+
+def test_failing_command_is_reported():
+    agent = _sensor_agent(["exit 1"])
+    failures = asyncio.run(agent._run_verification_sensors())
+    assert failures, "exit 1 must be reported as a failure"
+
+
+def test_blocked_command_is_reported():
+    agent = _sensor_agent(["rm -rf /"])
+    failures = asyncio.run(agent._run_verification_sensors())
+    assert failures
+
+
+def test_passing_commands_report_nothing():
+    agent = _sensor_agent(["true", "echo ok"])
+    failures = asyncio.run(agent._run_verification_sensors())
+    assert failures == ""
+
+
+def test_output_starting_with_Error_but_exit_zero_passes():
+    agent = _sensor_agent(["echo 'Error: not really'; exit 0"])
+    failures = asyncio.run(agent._run_verification_sensors())
+    assert failures == ""
+
+
+def test_looks_failed_markers():
+    assert _looks_failed("Error: boom")
+    assert _looks_failed("BLOCKED: nope")
+    assert _looks_failed("Timeout after 60s")
+    assert _looks_failed("Exit code: 1\nSTDOUT: x")
+    assert not _looks_failed("Exit code: 0\nSTDOUT: x")
+    assert not _looks_failed("all good")
+
+
+def _artifact_agent(paths, attempts=3):
+    agent = object.__new__(StemAgent)
+    agent.name = "system"
+    agent.mode = "BUILD"
+    agent.history = []
+    agent._sensor_attempts = 0
+    agent._run = type("R", (), {"artifacts": [type("A", (), {"path": str(p)})() for p in paths]})()
+    agent.settings = type("S", (), {
+        "verification_commands": [],
+        "sensors_enabled": True,
+        "sensor_max_attempts": attempts,
+    })()
+    agent._active_tools = lambda: set()
+    agent._log = lambda *args, **kwargs: None
+    agent.invalidate_cache = lambda: None
+    agent._finish = lambda status, message: message
+    return agent
+
+
+def test_broken_python_artifact_is_reported(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "bad.py"
+    path.write_text("def broken(:\n", encoding="utf-8")
+    assert "bad.py" in _artifact_agent([path])._file_sensor_failures()
+
+
+def test_invalid_json_artifact_is_reported(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "bad.json"
+    path.write_text("{", encoding="utf-8")
+    assert "invalid JSON" in _artifact_agent([path])._file_sensor_failures()
+
+
+def test_missing_artifact_is_reported(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert "missing" in _artifact_agent([tmp_path / "gone.py"])._file_sensor_failures()
+
+
+def test_valid_artifacts_are_silent(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "ok.py"
+    path.write_text("x = 1\n", encoding="utf-8")
+    assert _artifact_agent([path])._file_sensor_failures() == ""
+
+
+def test_escalation_after_max_sensor_attempts(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "bad.py"
+    path.write_text("def broken(:\n", encoding="utf-8")
+    agent = _artifact_agent([path], attempts=2)
+
+    handled, terminal = asyncio.run(agent._verify_or_repair())
+    assert handled and terminal is None
+    assert "Verification failed" in agent.history[-1]["content"]
+
+    handled, terminal = asyncio.run(agent._verify_or_repair())
+    assert handled and terminal is not None
+    assert "DECISION REQUIRED" in terminal
+    incidents = (tmp_path / "tmp/state/incidents.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(incidents) == 2

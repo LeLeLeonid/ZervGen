@@ -1,5 +1,7 @@
 ---
+name: system
 description: "Orchestrator. Routes tasks, manages memory, and handles general queries."
+tags: [agent, orchestrator, routing, supervisor]
 tools: ["all"]
 ---
 # IDENTITY

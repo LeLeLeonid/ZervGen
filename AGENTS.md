@@ -1,69 +1,105 @@
-# ZervGen Instructions 
+# ZervGen
 
-## Project Structure
+Agent harness: one loop, four modes, tools as Python, skills as Markdown.
+
+## Layout
 
 ```
 ZervGen/
-├── AGENTS.md              # This file
-├── config.json            # Application settings
+├── config.json            # settings (git-ignored)
+├── .zervgen/.env          # secrets (git-ignored)
+├── main.py                # entry point
 ├── src/
-│   ├── cli.py             # Rich CLI, chat loop, menus
-│   ├── config.py          # Settings loader + defaults
-│   ├── skills_loader.py   # YAML skill contract loader + registry
-│   ├── tools.py           # 27 tool functions (delegation, web, shell..)
-│   ├── utils.py           # Token counting, context discovery,compression
+│   ├── cli.py             # Rich TUI: chat loop, /commands, pickers, TAB modes
+│   ├── config.py          # settings, presets, provider/model catalog wiring
+│   ├── skills_loader.py   # skill frontmatter contract, registry, role loader
+│   ├── tools.py           # tool functions + registry + schema renderer
+│   ├── utils.py           # tokens, truncation, TraceBus, compressor, git snapshots
 │   ├── core/
-│   │   ├── base_agent.py      # StemAgent execution engine
-│   │   ├── mcp_manager.py     # Model Context Protocol client
-│   │   ├── memory.py          # Three-tier memory (KG, ChromaDB, SessionDB)
-│   │   ├── orchestrator.py    # Metacognitive supervisor, multi-wave delegation
-│   │   ├── provider.py        # LLM provider wrappers base
-│   │   └── runtime.py         # The Harness Core
-│   ├── providers/
-│   │   ├── anthropic.py       # Anthropic Claude provider
-│   │   ├── base.py            # Abstract provider interface
-│   │   ├── gemini.py          # Google Gemini provider
-│   │   ├── openai.py          # OpenAI GPT provider
-│   │   ├── openrouter.py      # OpenRouter aggregator
-│   │   └── pollinations.py    # Pollinations
+│   │   ├── base_agent.py  # StemAgent: prompt build, loop, PTC, sensors
+│   │   ├── orchestrator.py# routing, delegation waves, critic gate
+│   │   ├── runtime.py     # PermissionPolicy, ToolRuntime, Run, Session, coordinator
+│   │   ├── mcp_manager.py # MCP clients, health, namespacing
+│   │   ├── memory.py      # KG + ChromaDB + sessions, Dreamer heartbeat
+│   │   └── provider.py    # provider base, payloads, native tools, cost
+│   ├── providers/         # anthropic, openai, openrouter, gemini, pollinations
 │   └── skills/
-│       ├── AGENTS/
-│       │   ├── architect.md   # Architecture & design agent
-│       │   ├── code.md        # Code generation agent
-│       │   ├── researcher.md  # Research & data gathering agent
-│       │   └── system.md      # Orchestrator definition
-│       ├── UTILITIES/
-│       │   ├── file-ops.md    # File operations guide
-│       │   ├── web.md         # Web search & fetch guide
-│       │   └── weather.md     # Weather tool guide
-│       └── INTEGRATION/
-│           ├── github.md      # Git/GitHub operations
-│           ├── mcp-installer.md  # MCP server management
-│           └── skill-creator.md   # Skill creation
-├── tmp/
-│   ├── memory/             # Persistent stores (SQLite, ChromaDB, KG..)
-│   ├── history.log         # Event log (append-only)
-├── requirements.txt        # Python dependencies
-└── main.py                # Entry point
+│       ├── AGENTS/        # delegate roles (system, code, architect, researcher, reviewer)
+│       ├── INTEGRATION/   # github, mcp, provider, skill-creator
+│       └── UTILITIES/     # compute, delegation, file-ops, llm-wiki, media, memory, testing, weather, web
+├── tests/                 # pytest, one file per subsystem
+└── tmp/                   # runtime data: memory, state, trace, logs (git-ignored)
 ```
 
-## Programmatic Tool Calling
+## Loop
 
-All tools are called directly in Python code blocks:
+```
+user input
+  → StemAgent.run
+      build system prompt (header, run, protocol, tools, skills, memory, peers, rules)
+      provider.generate_text
+      parse turn: ```python``` PTC | ::tool shorthand | JSON/XML call | native call | answer
+      every call → ToolRuntime.execute (policy → ask → budget → timeout → one result)
+      every turn end → sensors → critic gate
+  → one answer, rendered once
+```
 
-I'm starting to work on the task...
+## Modes
+
+| mode | may | may not |
+|---|---|---|
+| `ASK` | read, search, answer | write, shell, MCP |
+| `BUILD` | everything | — |
+| `CALL` | read, search, plan | write, shell, MCP |
+| `DEBUG` | everything, focused on reproduction | — |
+
+TAB in an empty prompt cycles modes. `/mode` opens the menu.
+
+## Tools
+
+Called as Python inside a ```` ```python ```` block, or as shorthand:
+
 ```python
-# Read a file
 content = await read_file("tmp/PLAN.md")
-
-# Search memory
-results = await search_memory("database schema", limit=5)
-
-# Delegate to another agent 
+hits = await search_memory("database schema", limit=5)
 result = await delegate_to(agent_name="code", task=f"Execute: {content}")
 ```
 
+```text
+::read_file("src/cli.py", 0, 4000)
+::shell("pytest -q")
+```
+
+Shorthand binds positionally to the real signature. Use `scan_tools(name)` for an exact schema.
+
+## Skills
+
+One Markdown file per skill. Frontmatter is enforced on load:
+
+```yaml
+---
+name: kebab-case            # must equal the file stem
+description: "one line"     # shown in the index
+tags: [trigger, words]      # drive auto-match
+tools: [tool_name]          # optional
+contract: {pre: {}, post: {}}
+procedure: [step, step]
+dependencies: [tool_or_skill]
+verification: checklist     # or heavy
+---
+```
+
+A skill that fails validation is logged and dropped. `load_skill(name)` pulls the body on demand; the index is always shown.
+
 ## Configuration
 
-- **Root config:** `config.json` — application settings.
-- **Environment:** `.zervgen/.env` — API keys and secrets.
+- `config.json` — provider, model, mode, permissions, budgets. Ignored by git.
+- `.zervgen/.env` — keys, referenced as `${VAR}` from config. Never commit either file.
+- `tmp/state/` — trace JSONL, incidents, dream heartbeat state. Runtime scratch, safe to delete.
+
+## Verify
+
+```bash
+python -m compileall -q src main.py
+python -m pytest -q
+```

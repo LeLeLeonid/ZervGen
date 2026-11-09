@@ -1,5 +1,7 @@
 ---
+name: architect
 description: "Design architecture, plan systems, and create technical specifications."
+tags: [agent, architecture, design, planning, specification]
 contract:
   pre: {}
   post: {}

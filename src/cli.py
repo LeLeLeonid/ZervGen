@@ -26,13 +26,15 @@ from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.widgets import TextArea
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style as PTStyle
-from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.completion import Completer, Completion, WordCompleter
+from prompt_toolkit.document import Document
+from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.patch_stdout import patch_stdout
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=ResourceWarning)
 
-from src.config import load_config, MODES, ENV_PATH, config_entries, set_config_value
+from src.config import load_config, MODES, MODE_ORDER, ENV_PATH, config_entries, set_config_value
 from src.core.memory import memory_core
 from src.core.orchestrator import Orchestrator
 from src.core.provider import get_provider, get_model_name, list_live_models, list_providers
@@ -53,6 +55,60 @@ class CC:
     def print(*args, **kwargs):
         for arg in args:
             console.print(Align.center(arg))
+
+
+class _RankedCompleter(Completer):
+    def __init__(self, entries: List[tuple]):
+        self.entries = [
+            (str(entry[0]), str(entry[1] if len(entry) > 1 else entry[0]), str(entry[2]) if len(entry) > 2 else "")
+            for entry in entries
+        ]
+
+    @classmethod
+    def score(cls, label: str, value: str, query: str) -> Optional[tuple]:
+        if not query:
+            return (2, 0, len(label))
+        hay = f"{label} {value}".lower()
+        needle = query.lower()
+        position = hay.find(needle)
+        if position == 0:
+            return (0, 0, len(label))
+        if position > 0:
+            return (1, position, len(label))
+        cursor = 0
+        for char in needle:
+            cursor = hay.find(char, cursor)
+            if cursor < 0:
+                return None
+            cursor += 1
+        return (2, 0, len(label))
+
+    def ranked(self, query: str) -> List[tuple]:
+        scored = []
+        for value, label, meta in self.entries:
+            rank = self.score(label, value, query)
+            if rank is not None:
+                scored.append((rank, value, label, meta))
+        scored.sort(key=lambda item: item[0])
+        return scored
+
+    def exact(self, query: str) -> Optional[str]:
+        needle = query.strip().lower()
+        for value, label, _ in self.entries:
+            if value.lower() == needle or label.lower() == needle:
+                return value
+        return None
+
+    def best(self, query: str) -> Optional[str]:
+        ranked = self.ranked(query.strip())
+        if not ranked:
+            return None
+        return ranked[0][1]
+
+    def get_completions(self, document: Document, complete_event: CompleteEvent):
+        raw = document.text_before_cursor
+        for _, value, label, meta in self.ranked(raw.strip())[:100]:
+            yield Completion(value, start_position=-len(raw), display=label, display_meta=meta)
 
 
 class ZervGenCLI:
@@ -134,7 +190,7 @@ class ZervGenCLI:
         for name in chain:
             try:
                 provider = get_provider(name, self.config)
-                self.orchestrator = Orchestrator(provider, self.config, memory=memory_core)
+                self.orchestrator = Orchestrator(provider, self.config, mode=self.config.mode, memory=memory_core)
                 self.orchestrator.status_cb = self._on_status
                 if name != chosen:
                     self.config.provider = name
@@ -219,9 +275,12 @@ class ZervGenCLI:
         def _(event):
             buf = event.current_buffer
             if buf.complete_state:
-                buf.complete_next()  # Cycle through dropdown
-            else:
-                buf.start_completion(insert_common_part=True)
+                buf.complete_next()
+                return
+            if not buf.text:
+                self._cycle_mode()
+                return
+            buf.start_completion(insert_common_part=True)
 
         @kb.add("c-c")
         def _(event):
@@ -682,34 +741,52 @@ class ZervGenCLI:
         return True
 
     async def _handle_mode(self, args: Optional[str]) -> bool:
-        if not args:
-            status = self.orchestrator.get_mode_status()
-            CC.print(f"\n[bold]Current Mode:[/bold] {status['mode']}")
-            CC.print(f"\n{_acm('SELECT MODE')}")
-            CC.print("  [1] ASK    - Questions & explanations")
-            CC.print("  [2] PLAN   - Architecture & planning")
-            CC.print("  [3] BUILD   - Code generation")
-            CC.print("  [4] DEBUG  - Troubleshooting")
-            CC.print("  [b] Back")
-
-            choice = Prompt.ask(_acm("Mode"))
-            mode_map = {'1': 'ASK', '2': 'PLAN', '3': 'BUILD', '4': 'DEBUG'}
-            if choice.lower() in ('b', 'back'):
-                return True
-            if choice in mode_map:
-                if self.orchestrator.set_mode(mode_map[choice]):
-                    CC.print(f"[bold green][+] MODE SHIFTED: {mode_map[choice]}[/bold green]")
-                else:
-                    CC.print("[bold red][!] ERROR: Mode change failed[/bold red]")
+        if args:
+            if self._apply_mode(args.upper()):
+                CC.print(f"[bold green][+] MODE SHIFTED: {args.upper()}[/bold green]")
             else:
-                CC.print("[yellow]Invalid choice.[/yellow]")
+                CC.print(f"[bold red][!] ERROR: Mode '{self._escape(args.upper())}' invalid[/bold red]")
             return True
 
-        if self.orchestrator.set_mode(args.upper()):
-            CC.print(f"[bold green][+] MODE SHIFTED: {args.upper()}[/bold green]")
+        status = self.orchestrator.get_mode_status()
+        CC.print(f"\n[bold]Current Mode:[/bold] {status['mode']}")
+        CC.print(f"\n{_acm('SELECT MODE')}")
+        for index, name in enumerate(MODE_ORDER, 1):
+            CC.print(f"  [{index}] {name:<6} - {MODES[name]['description']}")
+        CC.print("  [b] Back")
+        CC.print("[dim]Tip: TAB on an empty prompt cycles modes.[/dim]")
+
+        choice = Prompt.ask(_acm("Mode"))
+        if choice.lower() in ('b', 'back'):
+            return True
+        mode_map = {str(index): name for index, name in enumerate(MODE_ORDER, 1)}
+        if choice in mode_map:
+            if self._apply_mode(mode_map[choice]):
+                CC.print(f"[bold green][+] MODE SHIFTED: {mode_map[choice]}[/bold green]")
+            else:
+                CC.print("[bold red][!] ERROR: Mode change failed[/bold red]")
         else:
-            CC.print(f"[bold red][!] ERROR: Mode '{args.upper()}' invalid[/bold red]")
+            CC.print("[yellow]Invalid choice.[/yellow]")
         return True
+
+    def _apply_mode(self, mode: str) -> bool:
+        if not self.orchestrator or not self.orchestrator.set_mode(mode):
+            return False
+        self.config.mode = mode
+        try:
+            self.config.save()
+        except Exception:
+            pass
+        return True
+
+    def _cycle_mode(self) -> None:
+        if not self.orchestrator:
+            return
+        current = str(self.orchestrator.mode).upper()
+        index = MODE_ORDER.index(current) + 1 if current in MODE_ORDER else 0
+        self._apply_mode(MODE_ORDER[index % len(MODE_ORDER)])
+        if self._app:
+            self._app.invalidate()
 
     async def _agent_menu(self) -> bool:
         roles = get_all_roles()
@@ -764,7 +841,7 @@ class ZervGenCLI:
 /provider - Show current provider & model
 
 [bold][{C}]MODE:[/{C}][/bold]
-/mode    - Show selection menu (BUILD, ASK, DEBUG, PLAN)
+/mode    - Show selection menu (ASK, BUILD, CALL, DEBUG) · TAB cycles modes
 
 [bold][{C}]TOGGLES:[/{C}][/bold]
 /critic on|off   - Toggle Self-Interrogation [dim]({'on' if self.config.critic_enabled else 'off'})[/dim]
@@ -1195,13 +1272,45 @@ class ZervGenCLI:
         section = getattr(self.config, "gemini" if p == "google" else p, None)
         return bool(section and getattr(section, "api_key", None))
 
-    def _select_model(self) -> None:
+    async def _search_pick(self, title: str, entries: List[tuple], note: str = "", allow_custom: bool = False) -> Optional[str]:
+        if not entries:
+            return None
+        CC.print(f"\n{_acm(title)}")
+        CC.print(f"[dim]{len(entries)} options · type to filter · ↑↓ choose · Enter selects · Esc cancels[/dim]")
+        if note:
+            CC.print(f"[dim]{note}[/dim]")
+        completer = _RankedCompleter(entries)
+        kb = KeyBindings()
+
+        @kb.add("enter")
+        def _(event):
+            buf = event.current_buffer
+            state = buf.complete_state
+            if state and state.completions:
+                choice = state.current_completion or state.completions[0]
+                event.app.exit(result=choice.text)
+                return
+            typed = buf.text.strip()
+            event.app.exit(result=completer.exact(typed) or completer.best(typed) or (typed if allow_custom else None))
+
+        session = PromptSession(
+            completer=completer,
+            complete_while_typing=True,
+            bottom_toolbar=" type to search · ↑↓ move · Enter selects · Ctrl+C cancels ",
+        )
+        try:
+            picked = await session.prompt_async("> ", key_bindings=kb)
+        except (KeyboardInterrupt, EOFError):
+            return None
+        picked = (picked or "").strip()
+        return picked or None
+
+    async def _select_model(self) -> None:
         from src.config import resolve_provider
         p = resolve_provider(self.config.provider)
         ps = getattr(self.config, "gemini" if p == "google" else p, None)
         current = get_model_name(p, self.config)
-        CC.print(f"[dim]Current model: {current}[/dim]")
-        models = []
+        CC.print(f"[dim]Current model: {self._escape(str(current))}[/dim]")
         if p in ("ollama", "lmstudio", "koboldcpp"):
             models = self._list_local_models()
         else:
@@ -1209,32 +1318,30 @@ class ZervGenCLI:
                 models = list_live_models(p, self.config) or ModelCatalog.list_models(p)
             except Exception:
                 models = []
-        if models:
-            f = Prompt.ask("Filter (blank=all)", default="").strip()
-            if f:
-                lf = f.lower()
-                models = [m for m in models if lf in m.lower()]
+        models = list(dict.fromkeys(str(m) for m in models if m))
         if not models:
-            CC.print("[yellow]no catalog — type name[/yellow]")
-            new_model = Prompt.ask("Model", default=current)
-        elif len(models) == 1:
-            new_model = models[0]
-        else:
-            for i, m in enumerate(models, 1):
-                info = ModelCatalog.get_info(p, m) or {}
-                ctx = (info.get("limit") or {}).get("context")
-                cost = info.get("cost") or {}
-                in_cost = cost.get('input', '?')
-                out_cost = cost.get('output', '?')
-                tag = f"[dim]{ctx // 1000 if ctx else '?'}k ctx · ${in_cost}/M in · ${out_cost}/M out[/dim]"
-                mk = " ->" if m == current else "   "
-                CC.print(f"{mk}[{i}] {self._escape(str(m))}  {tag}")
-            CC.print(f"   [{len(models) + 1}] custom...")
+            CC.print("[yellow]no catalog — type the model name[/yellow]")
             try:
-                choice = IntPrompt.ask("Select", choices=[str(i) for i in range(1, len(models) + 2)])
+                new_model = await PromptSession().prompt_async(f"Model [{current}]: ")
             except (KeyboardInterrupt, EOFError):
                 return
-            new_model = Prompt.ask("Model", default=current) if choice == len(models) + 1 else models[choice - 1]
+            new_model = (new_model or "").strip() or current
+        else:
+            entries = []
+            for model in models:
+                info = ModelCatalog.get_info(p, model) or {}
+                ctx = (info.get("limit") or {}).get("context")
+                cost = info.get("cost") or {}
+                meta = f"{ctx // 1000}k ctx · ${cost.get('input', '?')}/${cost.get('output', '?')} per M"
+                entries.append((model, model, meta))
+            picked = await self._search_pick(
+                "SELECT MODEL", entries,
+                note=f"provider: {p} · type any name to use a model outside the catalog",
+                allow_custom=True,
+            )
+            if picked is None or not str(picked).strip():
+                return
+            new_model = str(picked).strip()
         if not new_model or new_model == current:
             return
         if ps is not None and hasattr(ps, "model"):
@@ -1251,34 +1358,36 @@ class ZervGenCLI:
                 self.orchestrator.invalidate_cache()
             except Exception:
                 pass
+        CC.print(f"[bold green]✓ Model: {self._escape(new_model)}[/bold green]")
 
-    def _select_provider(self) -> None:
+    async def _select_provider(self) -> None:
         providers = list_providers()
-        console.clear()
-        CC.print(f"{_acm('SELECT PROVIDER')}\n")
-        for i, meta in enumerate(providers, 1):
-            CC.print(f"  [{i}] {meta.display_name}")
-        try:
-            choice = IntPrompt.ask("Select", choices=[str(i) for i in range(1, len(providers) + 1)])
-        except (KeyboardInterrupt, EOFError):
+        entries = [(f"{meta.display_name} [{meta.name}]", meta.name) for meta in providers]
+        picked = await self._search_pick("SELECT PROVIDER", entries)
+        if not picked:
             return
-        selected = providers[int(choice) - 1]
+        name = str(picked)
+        meta = next((m for m in providers if m.name == name), None)
+        if meta is None:
+            CC.print(f"[red]Unknown provider: {self._escape(name)}[/red]")
+            return
         old = self.config.provider
-        if selected.name not in ("pollinations", "local", "ollama", "lmstudio", "koboldcpp"):
-            self.config.provider = selected.name
+        if meta.name not in ("pollinations", "local", "ollama", "lmstudio", "koboldcpp"):
+            self.config.provider = meta.name
             if not self._has_api_key():
-                CC.print(f"[yellow]{selected.name} requires an API key.[/yellow]")
+                CC.print(f"[yellow]{meta.name} requires an API key.[/yellow]")
                 self._input_api_key()
         if self.orchestrator:
-            if self.orchestrator.switch_provider(selected.name):
+            if self.orchestrator.switch_provider(meta.name):
                 self.config.save()
-                CC.print(f"[bold green]✓ Provider: {selected.name.upper()}[/bold green]")
+                CC.print(f"[bold green]✓ Provider: {meta.name.upper()}[/bold green]")
             else:
                 self.config.provider = old
                 CC.print(f"[red]Switch failed — stayed on {old.upper()}[/red]")
         else:
             self.config.save()
-            CC.print(f"[green]Provider set: {selected.name.upper()}[/green]")
+            CC.print(f"[green]Provider set: {meta.name.upper()}[/green]")
+        return
 
     def _list_local_models(self) -> list[str]:
         urls = {

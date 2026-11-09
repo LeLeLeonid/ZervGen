@@ -1,5 +1,7 @@
 ---
+name: researcher
 description: "Gathers, verifies, and synthesizes data from external sources"
+tags: [agent, research, web, verification, synthesis, citations]
 contract:
   pre: {}
   post: {}
