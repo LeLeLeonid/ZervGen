@@ -144,15 +144,13 @@ async def web_search(query: str, limit: int = 5, region: str = "wt-wt", recency:
                 results = list(ddgs.text(query.strip(), **kw))
         if not results:
             return f"Error: No results for '{query}'."
-        structured = [
-            {
-                "title": (r.get("title") or "").strip() or "No Title",
-                "url": r.get("url") or r.get("href") or r.get("link") or "",
-                "snippet": (r.get("body") or r.get("snippet") or "").strip()[:200],
-            }
-            for r in results
-        ]
-        return structured
+        lines = []
+        for index, item in enumerate(results, 1):
+            title = (item.get("title") or "").strip() or "No Title"
+            url = item.get("url") or item.get("href") or item.get("link") or ""
+            snippet = (item.get("body") or item.get("snippet") or "").strip()[:200]
+            lines.append(f"{index}. {title}\n   {url}\n   {snippet}")
+        return "\n".join(lines)
     except ImportError:
         return "Error: ddgs not installed. pip install duckduckgo-search"
     except Exception as e:
@@ -207,14 +205,11 @@ async def get_weather(location: str, forecast: bool = False) -> str:
     client = get_http_client()
     safe_loc = quote(location.strip())
     try:
-        if forecast:
-            resp = await client.get(f"https://wttr.in/{safe_loc}?T", timeout=10.0)
-            if resp.status_code == 200 and resp.text and "Unknown location" not in resp.text:
-                return resp.text.strip()
-        else:
-            resp = await client.get(f"https://wttr.in/{safe_loc}?format=%l:+%c+%t+%h+%w", timeout=10.0)
-            if resp.status_code == 200 and resp.text:
-                return f"{resp.text.strip()}"
+        resp = await client.get(f"https://wttr.in/{safe_loc}?format=%l:+%c+%t+%h+%w", timeout=10.0)
+        if resp.status_code == 200 and resp.text and "Unknown location" not in resp.text:
+            line = re.sub(r"\x1b\[[0-9;]*m", "", resp.text).strip()
+            if line and not forecast:
+                return line
     except Exception:
         pass
     geocode_resp = await client.get("https://geocoding-api.open-meteo.com/v1/search", params={"name": location, "count": 1, "language": "en", "format": "json"})

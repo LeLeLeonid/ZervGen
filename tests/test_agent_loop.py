@@ -119,3 +119,55 @@ def test_session_history_is_the_agent_history(tmp_path, monkeypatch):
     asyncio.run(agent.run("one"))
     assert agent.history is agent.session.messages
     assert [m["content"] for m in agent.history] == ["one", "first"]
+
+
+def test_shorthand_call_runs_without_ptc(tmp_path, monkeypatch):
+    (tmp_path / "note.txt").write_text("hello", encoding="utf-8")
+    agent = _agent(tmp_path, monkeypatch, ['::tool read_file {"path": "note.txt"}', "Read it."])
+    output = asyncio.run(agent.run("read note"))
+    assert output == "Read it."
+    assert agent._run.status is RunStatus.DONE
+    assert agent.provider.calls == 2
+
+
+def test_response_is_a_loop_verb_not_a_tool(tmp_path, monkeypatch):
+    agent = _agent(tmp_path, monkeypatch, ['```python\nawait response(text="final")\n```'])
+    output = asyncio.run(agent.run("answer now"))
+    assert output == "final"
+    names = [c.name for c in agent._run.tool_calls]
+    assert "response" not in names
+
+
+def test_one_answer_renders_one_line(tmp_path, monkeypatch, capsys):
+    agent = _agent(tmp_path, monkeypatch, ["Just prose."])
+    agent._silent = False
+    asyncio.run(agent.run("say it"))
+    painted = [l for l in capsys.readouterr().out.splitlines() if "answered" in l]
+    assert len(painted) == 1
+
+
+def test_trace_bus_collapses_call_and_result(tmp_path, monkeypatch, capsys):
+    from src.utils import TraceBus
+
+    bus = TraceBus(role="t", enabled=True, root=tmp_path / "trace")
+    bus.bind("run1")
+    bus.step(1)
+    bus.tool_call("c1", "read_file", {"path": "a.py"})
+    bus.tool_result("c1", output="x" * 340, duration=0.012)
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert len(lines) == 1
+    assert "read_file" in lines[0] and "path=a.py" in lines[0] and "340ch" in lines[0]
+
+
+def test_trace_bus_drops_duplicate_within_step(tmp_path, monkeypatch, capsys):
+    from src.utils import TraceBus
+
+    bus = TraceBus(role="t", enabled=True, root=tmp_path / "trace")
+    bus.bind("run2")
+    bus.step(1)
+    bus.emit("state", "t", "same")
+    bus.emit("state", "t", "same")
+    assert len(capsys.readouterr().out.strip().splitlines()) == 1
+    bus.step(2)
+    bus.emit("state", "t", "same")
+    assert len(capsys.readouterr().out.strip().splitlines()) == 1

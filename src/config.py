@@ -158,7 +158,10 @@ _TRACE_STYLE: Dict[str, tuple[str, str]] = {
     "ptc_result":       ("📦", "dim"),
     "ptc_error":        ("⛔", "bold red"),
     "tool_call":        ("🔧", "cyan"),
+    "tool_result":      ("🔧", "cyan"),
     "tool_error":       ("⛔", "bold red"),
+    "answer":           ("✓", "bold green"),
+    "step":             ("▸", "dim"),
     "loop":             ("🔁", "bold yellow"),
     "state":            ("🧭", "magenta"),
 }

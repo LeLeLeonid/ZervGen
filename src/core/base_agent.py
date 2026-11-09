@@ -26,13 +26,22 @@ from src.core.runtime import (
     Run, ToolCall, ToolResult, Artifact, RunStatus, Task,
     Session, RunCoordinator, PermissionPolicy, ToolRuntime, Compactor,
 )
+from src.utils import SHORTHAND_RE, TERMINAL_TOOLS, TraceBus, TurnIntent, parse_turn, strip_ptc
 
 logger = logging.getLogger(__name__)
 console = Console()
 
 
 class _StreamFilter:
-    """Streams prose to stdout while hiding code fences."""
+    """Streams prose to stdout, hiding code fences and ``::tool`` lines.
+
+    With the bus collapsed, the streamed text is the only place raw model
+    output can still reach the terminal. Fenced Python is hidden; now the
+    ``::tool`` shorthand is hidden too, because it is a tool invocation, not
+    an answer — it renders once, as the collapsed tool row.
+    """
+
+    HOLD = 400
 
     def __init__(self, thought_cb=None):
         self.buf = ""
@@ -56,20 +65,42 @@ class _StreamFilter:
         self.wrote = True
         self.emitted = (self.emitted + text)[-20_000:]
 
+    def _drain(self, final: bool = False) -> None:
+        while "\n" in self.buf:
+            line, _, self.buf = self.buf.partition("\n")
+            if not SHORTHAND_RE.match(line):
+                self._emit(line + "\n")
+                self._push_thought(line)
+        if final and self.buf:
+            line, self.buf = self.buf, ""
+            if not SHORTHAND_RE.match(line):
+                self._emit(line)
+                self._push_thought(line)
+        elif len(self.buf) > self.HOLD:
+            self._drain(final=True)
+
     def __call__(self, token: str) -> None:
         self.buf += token
         while "```" in self.buf:
             pre, _, post = self.buf.partition("```")
             if not self.in_fence:
-                self._emit(pre)
-                self._push_thought(pre)
+                self.buf = pre + "\n"
+                self._drain(final=True)
             self.in_fence = not self.in_fence
             self.buf = post
-
         if not self.in_fence:
-            self._emit(self.buf)
-            self._push_thought(self.buf)
-            self.buf = ""
+            self._drain()
+
+    def flush(self) -> None:
+        """Emit the trailing partial line once the provider is done."""
+        if not self.in_fence:
+            self._drain(final=True)
+        # A trace line starts on its own row: without this, the answer receipt
+        # lands glued to the last streamed character (``…structure.19:36:41``).
+        if self.wrote and not self.emitted.endswith("\n"):
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self.emitted += "\n"
 
 
 class StemAgent:
@@ -120,10 +151,16 @@ class StemAgent:
         self._run: Optional[Run] = None
         self._trace_parent_id = ""
         self._tripwire_errors: Dict[str, int] = {}
+        self._terminal_calls: set[str] = set()
         self._task_query = ""
         self._last_streamed = False
         self._last_streamed_text = ""
         self._background_tasks: set[asyncio.Task] = set()
+        self.trace = TraceBus(
+            role=name,
+            enabled=bool(getattr(self.settings, "trace_enabled", True)),
+            capture_chars=int(getattr(self.settings, "trace_capture_chars", 2000) or 2000),
+        )
         self._load_tools()
         self.tools["set_mode"] = self._tool_set_mode
         self._runtime = None
@@ -157,16 +194,48 @@ class StemAgent:
             timeout=float(getattr(self.settings, "tool_timeout", 60) or 60),
             agent=self.name,
             on_event=self._runtime_event,
-            on_log=lambda message, kind: self._log(self.name, message, kind, self.mode),
             on_permission=self.request_permission,
         )
 
     def _runtime_event(self, kind: str, **fields) -> None:
-        """Forward a tool event onto the run trace."""
+        """Route one tool event to the trace bus; a call and its result are one row.
+
+        ``response()`` is a loop verb, not a tool: its call and result are
+        tracked by ``call_id`` and dropped before either becomes a row.
+        """
+        name = fields.get("name") or ""
+        call_id = fields.get("call_id") or ""
+        if name in TERMINAL_TOOLS:
+            if call_id:
+                self._terminal_calls.add(call_id)
+            return
+        if call_id and call_id in self._terminal_calls:
+            if kind == "tool_result":
+                self._terminal_calls.discard(call_id)
+            return
+        if kind == "tool_call":
+            self.trace.tool_call(call_id, name, fields.get("input") or {})
+            self._emit_run(kind, self.name, name=name, status=fields.get("status") or "",
+                           input=fields.get("input"), output=fields.get("output"))
+            return
+        if kind == "tool_result":
+            ok = (fields.get("status") or "") == "ok"
+            self.trace.tool_result(
+                call_id,
+                name,
+                ok=ok,
+                output=fields.get("output"),
+                error=None if ok else fields.get("output"),
+                duration=float(fields.get("duration") or 0.0),
+            )
+            self._emit_run(kind, self.name, name=name, status=fields.get("status") or "",
+                           input=fields.get("input"), output=fields.get("output"),
+                           duration_ms=float(fields.get("duration") or 0.0) * 1000)
+            return
         self._emit_run(
             kind,
             self.name,
-            name=fields.get("name") or "",
+            name=name,
             status=fields.get("status") or "",
             input=fields.get("input"),
             output=fields.get("output"),
@@ -240,10 +309,28 @@ class StemAgent:
             return tools
         return {k: v for k, v in tools.items() if k not in write_set}
 
+    async def _response_verb(self, text: Optional[str] = None) -> str:
+        """End the turn with a user-facing answer. Never reaches ToolRuntime."""
+        if text is not None and not isinstance(text, str):
+            text = json.dumps(text, ensure_ascii=False, indent=2)
+        self._response_called = True
+        self._response_value = text or ""
+        return self._response_value
+
     def _ptc_tools(self) -> Dict[str, Any]:
-        """Async wrappers binding each tool's signature to a runtime call."""
+        """Async wrappers binding each tool's signature to a runtime call.
+
+        ``response`` is the loop verb that ends a turn: it is injected straight
+        into the PTC namespace, so it produces no tool row, policy check or
+        budget entry.
+        """
         tools: Dict[str, Any] = {}
-        for name, func in self._active_tools().items():
+        active = self._active_tools()
+        if any(name in TERMINAL_TOOLS for name in active):
+            tools["response"] = self._response_verb
+        for name, func in active.items():
+            if name in TERMINAL_TOOLS:
+                continue
             try:
                 signature = inspect.signature(func)
             except (TypeError, ValueError):
@@ -338,7 +425,10 @@ class StemAgent:
             payload = event.as_dict() if hasattr(event, "as_dict") else {"event": str(event)}
         except Exception:
             payload = {"event": str(event)}
-        logger.info("[RUN_EVENT] %s", json.dumps(payload, ensure_ascii=False, default=str))
+        # Structured detail belongs in the JSONL, not in agent.log: the log
+        # stays line-for-line comparable with the terminal.
+        self.trace.record("run_event", actor, f"{kind} {name} {status}".strip(),
+                          run_event=payload)
         return event
 
     def _record_error_tripwire(self, error: str) -> bool:
@@ -553,15 +643,18 @@ class StemAgent:
         return prompt
 
     def _log(self, role: str, content: str, event_type: str = "message", mode: str = "") -> None:
-        from src.utils import redact_fast, trace_line
+        """Record one event: the bus renders + logs it once; history is written once.
+
+        No ``logger.info`` here on purpose — the bus owns the log line, so
+        ``tmp/agent.log`` and the terminal show the same sequence instead of
+        the terminal showing four lines for one event and the log eight.
+        """
+        from src.utils import redact_fast
         safe_content = redact_fast(content)
-        trace_line(role, event_type, safe_content)
-        logger.info(f"[{event_type.upper()}] {role}: {safe_content}")
-        if self._run:
-            self._run.emit(event_type, role, input=safe_content)
+        self.trace.emit(event_type, role, safe_content)
         if self._memory_on:
             self.memory.log_event_sync(role, safe_content, event_type, mode or self.mode)
-        if event_type in ("input", "response", "agent_start", "delegation_result", "loop"):
+        if event_type in ("input", "agent_start", "delegation_result"):
             if event_type == "input":
                 safe_role = "user"
             elif role in ("system", "user", "assistant"):
@@ -605,21 +698,6 @@ class StemAgent:
             return f"Error: TRIPWIRE repeated failure for {tool_name}. Escalate or change strategy."
         return error_msg
 
-    def _extract_codes(self, text: str) -> List[str]:
-        codes = []
-        for match in re.finditer(r'```python\s*\n(.*?)\n\s*```', text, re.DOTALL):
-            code = match.group(1).strip()
-            if not code:
-                continue
-            non_comment = [l for l in code.split('\n') if l.strip() and not l.strip().startswith('#')]
-            if not non_comment:
-                continue
-            xml_lines = sum(1 for l in non_comment if l.strip().startswith('<') and '>' in l)
-            if xml_lines > len(non_comment) * 0.5:
-                continue
-            codes.append(code)
-        return codes
-
     @staticmethod
     def _strip_ptc(text: str) -> str:
         text = re.sub(r'<([a-zA-Z_][\w-]*)>.*?</\1>', '', text, flags=re.DOTALL)
@@ -659,20 +737,6 @@ class StemAgent:
         ast.fix_missing_locations(tree)
         return ast.unparse(tree)
 
-    def _looks_like_code(self, text: str) -> bool:
-        try:
-            compile(text, "<ptc_probe>", "exec")
-        except (SyntaxError, ValueError):
-            return False
-        return bool(re.search(r"\bawait\s+\w+\s*\(|^\s*\w+\s*=[^=]|\bprint\s*\(", text, re.MULTILINE))
-
-    def _looks_like_xml(self, text: str) -> bool:
-        for line in text.split('\n'):
-            stripped = line.strip()
-            if stripped.startswith('<') and '>' in stripped and not stripped.startswith('```'):
-                return True
-        return False
-
     def _looks_like_shell(self, text: str) -> List[tuple[str, str]]:
         blocks = []
         for match in re.finditer(r'```(bash|cmd|shell|powershell|sh)\s*\n(.*?)\n\s*```', text, re.DOTALL | re.IGNORECASE):
@@ -708,43 +772,6 @@ class StemAgent:
             if isinstance(node, ast.Name) and node.id in self.BLOCKED_MODULES:
                 return f"PTC blocked: direct access to '{node.id}' module"
         return None
-
-    def _extract_json_tool_calls(self, text: str) -> List[Dict[str, Any]]:
-        if not getattr(self.settings, "json_tool_fallback", True):
-            return []
-        candidates = []
-        blocks = re.findall(r"```json\s*\n(.*?)\n\s*```", text, re.DOTALL | re.IGNORECASE)
-        candidates.extend(blocks)
-        stripped = text.strip()
-        if stripped.startswith("{") or stripped.startswith("["):
-            candidates.append(stripped)
-        for raw in candidates:
-            try:
-                value = json.loads(raw)
-            except Exception:
-                continue
-            items = value.get("tool_calls") if isinstance(value, dict) else value
-            if items is None and isinstance(value, dict):
-                items = [value]
-            if not isinstance(items, list):
-                items = [items]
-            out = []
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                name = item.get("tool") or item.get("name") or item.get("function")
-                args = item.get("arguments", item.get("args", {}))
-                if isinstance(name, dict):
-                    args = name.get("arguments", args)
-                    name = name.get("name")
-                if not isinstance(name, str) or name not in self._active_tools():
-                    continue
-                if not isinstance(args, dict):
-                    continue
-                out.append({"name": name, "arguments": args})
-            if out:
-                return out
-        return []
 
     def _log_ptc_error(self, message: str, full_response: str = "") -> None:
         captured = full_response.strip()
@@ -790,7 +817,8 @@ class StemAgent:
             comment_thought = ""
         thought = first_sentence or comment_thought or "Thinking..."
         self._set_status(True, f"▶ {thought}")
-        self._log(self.name, f"EXEC: {code}", "ptc_call", self.mode)
+        # PTC is a transport, not an event: one record with a compact head, no render.
+        self.trace.emit("ptc", self.name, code[: self.trace.capture_chars], paint=False)
         ptc_tools = self._ptc_tools()
         async_names = set(ptc_tools)
         fixed_code = self._auto_await_tools(code, async_names)
@@ -855,8 +883,8 @@ class StemAgent:
                 result = output_str
             elif result is None:
                 result = ""
-            if result and not is_delegate:
-                self._log(self.name, str(result), "ptc_result", self.mode)
+            if result and not is_delegate and not self._response_called:
+                self.trace.emit("ptc_result", self.name, str(result), paint=False)
             return str(result) if result else ""
         except PermissionError as e:
             err = f"PERMISSION DENIED: {e}"
@@ -946,6 +974,13 @@ class StemAgent:
                 self._set_status(False)
                 stream = _StreamFilter(thought_cb=self._live_thought)
                 response = await asyncio.wait_for(self.provider.generate_text(safe_history, full_prompt, on_token=stream), timeout=provider_timeout)
+                stream.flush()
+                # A trace line must start on its own row: without this, the
+                # answer receipt lands glued to the last streamed character.
+                if stream.wrote and not stream.emitted.endswith("\n"):
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    stream.emitted += "\n"
                 self._set_status(True)
                 self._last_streamed = stream.wrote
                 self._last_streamed_text = stream.emitted
@@ -995,6 +1030,7 @@ class StemAgent:
             final = self.coordinator.finish(status, self._run)
             if final is not None:
                 self._emit_run("run_end", self.name, status=final.value, output=message)
+        self.trace.close()
         self._set_status(False)
         self._score_recalled_memory(status)
         return message
@@ -1020,12 +1056,16 @@ class StemAgent:
             self.history.append({"role": "user", "content": f"Verification failed:\n{sensor_error}\nFix the failure and verify again."})
             self.invalidate_cache()
             return None
-        self._log(self.name, self._response_value or "(empty)", "response", self.mode)
-        return self._finish(RunStatus.DONE, self._response_value)
+        answer = self._response_value or ""
+        self.trace.answer(answer or "(empty)")
+        if answer and (not self.history or self.history[-1].get("content") != answer):
+            self.history.append({"role": "assistant", "content": answer})
+        return self._finish(RunStatus.DONE, answer)
 
     async def run(self, task: str) -> str:
         self.interrupt_event.clear()
         self._tripwire_errors = {}
+        self._terminal_calls.clear()
         if not task or not isinstance(task, str):
             return "Error: Invalid task"
         task = task.strip()
@@ -1057,6 +1097,7 @@ class StemAgent:
         self._set_status(True)
         self._run = Run.create(task, self.name, max_steps=max_steps, parent_run_id=getattr(getattr(self, "_parent_run", None), "id", None))
         self._run.status = RunStatus.RUNNING
+        self.trace.bind(self._run.id)
         self.coordinator.begin()
         self._runtime = self._build_runtime()
         self._run.budget.max_tool_calls = getattr(self.settings, "max_tool_calls", 200)
@@ -1073,6 +1114,7 @@ class StemAgent:
                     self._log(self.name, "Run timeout exceeded", "ptc_error", self.mode)
                     return self._finish(RunStatus.TIMEOUT, "Error: Run timeout exceeded.")
                 self._run.budget.steps = step
+                self.trace.step(step)
                 if self.interrupt_event.is_set():
                     self.interrupt_event.clear()
                     self._log(self.name, "Stopped by user", "ptc_error", self.mode)
@@ -1131,51 +1173,71 @@ class StemAgent:
                             import traceback
                             self._log(self.name, f"{type(e).__name__}: {e}\n{traceback.format_exc()[-800:]}", "ptc_error", self.mode)
                             return self._finish(RunStatus.FAILED, f"Error: {e}")
-                codes = self._extract_codes(response)
-                shell_blocks = self._looks_like_shell(response) if getattr(self.settings, "legacy_shell_blocks_enabled", False) else []
-                if not codes:
-                    json_calls = self._extract_json_tool_calls(response)
-                    if json_calls:
-                        outputs = []
-                        for call in json_calls:
-                            result = await self._execute_tool(call["name"], call["arguments"])
-                            outputs.append(f"{call['name']} -> {result}")
-                            if self._response_called:
-                                done = await self._finish_response()
-                                if done is not None:
-                                    return done
-                                break
-                        self._log(self.name, "\n".join(outputs), "ptc_result", self.mode)
-                        self.history.append({"role": "assistant", "content": response})
-                        self.history.append({"role": "assistant", "content": "\n".join(outputs)})
-                        self.invalidate_cache()
-                        continue
-                for lang, cmd in shell_blocks:
-                    self._log(self.name, f"SHELL ({lang}): {cmd}", "ptc_call", self.mode)
-                    shell_result = await self._execute_tool("shell", {"command": cmd})
-                    self.history.append({"role": "assistant", "content": f"[SHELL {lang}]\n{cmd}\n[OUTPUT]\n{shell_result}"})
+                # One decision per turn: what does this message ask the loop to do?
+                intent = parse_turn(response, set(self._active_tools()) | TERMINAL_TOOLS)
+                if intent.source == "auto-ptc" and not getattr(self.settings, "ptc_auto_detect", True):
+                    intent = TurnIntent("answer", answer=response.strip(), prose=response.strip(),
+                                        raw=response, source="prose")
+                if intent.source == "json" and not getattr(self.settings, "json_tool_fallback", True):
+                    intent = TurnIntent("answer", answer=response.strip(), prose=response.strip(),
+                                        raw=response, source="prose")
+
                 if self.settings.debug_mode and not self._silent:
                     self._set_status(False)
                     console.print(Panel(Text(response), title="[green]OUTPUT[/green]"))
-                if codes:
-                    prose = response.split("```", 1)[0].strip()
-                    if prose and not self._silent and not self.settings.debug_mode and not getattr(self, "_last_streamed", False):
-                        from rich.markdown import Markdown
-                        console.print(Markdown(prose))
+
+                if intent.kind == "calls" and intent.prose and not self._silent \
+                        and not self.settings.debug_mode and not getattr(self, "_last_streamed", False):
+                    from rich.markdown import Markdown
+                    self._set_status(False)
+                    console.print(Markdown(intent.prose))
                     self._set_status(True)
-                    combined_code = "\n\n".join(codes)
-                    raw_output = await self._run_code(combined_code, response)
+
+                shell_blocks = self._looks_like_shell(response) if getattr(self.settings, "legacy_shell_blocks_enabled", False) else []
+                for lang, cmd in shell_blocks:
+                    shell_result = await self._execute_tool("shell", {"command": cmd})
+                    self.history.append({"role": "assistant", "content": f"[SHELL {lang}]\n{cmd}\n[OUTPUT]\n{shell_result}"})
+
+                if intent.kind == "retry":
+                    hint = "Your previous response was raw XML/HTML." if intent.source == "markup" else "You returned nothing."
+                    self._empty_count = getattr(self, "_empty_count", 0) + 1
+                    self._empty_total = getattr(self, "_empty_total", 0) + 1
+                    if self._empty_total >= 9:
+                        return self._finish(RunStatus.FAILED, "[ERROR] Provider returned empty repeatedly. Halted.")
+                    if self._empty_count >= 3:
+                        self._empty_count = 0
+                        self._log(self.name, "Provider returned no usable turn 3x.", "ptc_error", self.mode)
+                        self.history.append({"role": "user", "content": f"[LOOP] {hint} Emit a ```python block, a ::tool line, or a plain final answer now."})
+                    self.invalidate_cache()
+                    continue
+                self._empty_count = 0
+                self._empty_total = 0
+
+                if intent.kind == "calls":
                     self.history.append({"role": "assistant", "content": response})
-                    if raw_output and str(raw_output).startswith("PTC ") and self._record_error_tripwire(str(raw_output)):
-                        return self._finish(RunStatus.FAILED, raw_output)
-                    if raw_output and (not self.history or self.history[-1].get("content") != raw_output):
-                        self.history.append({"role": "assistant", "content": raw_output})
+                    if intent.source in ("ptc", "auto-ptc"):
+                        if intent.source == "auto-ptc":
+                            self._log(self.name, "AUTO-PTC: unfenced code detected, executing", "ptc_call", self.mode)
+                        raw_output = await self._run_code(intent.code, response)
+                        if raw_output and str(raw_output).startswith("PTC ") and self._record_error_tripwire(str(raw_output)):
+                            return self._finish(RunStatus.FAILED, raw_output)
+                        if raw_output and (not self.history or self.history[-1].get("content") != raw_output):
+                            self.history.append({"role": "assistant", "content": raw_output})
+                        stable = str(raw_output)
+                    else:
+                        outputs = []
+                        for call in intent.calls:
+                            result = await self._execute_tool(call.name, call.args)
+                            outputs.append(f"{call.name} -> {result}")
+                        stacked = "\n".join(outputs)
+                        if stacked:
+                            self.history.append({"role": "assistant", "content": stacked})
+                        stable = stacked
                     if self._response_called:
                         done = await self._finish_response()
                         if done is not None:
                             return done
                         continue
-                    stable = str(raw_output)
                     if "Error" in stable or "Timeout" in stable:
                         stable = re.sub(r'\d{2}:\d{2}:\d{2}|[0-9a-f]{8}-[0-9a-f-]{8,}', '', stable)
                     if stable == self._last_stable_result:
@@ -1192,51 +1254,38 @@ class StemAgent:
                         self._repeat_count = 0
                         self._last_stable_result = stable
                     self._set_status(False)
+                    self.invalidate_cache()
                     continue
-                else:
-                    if not response or not response.strip():
-                        self._empty_count = getattr(self, "_empty_count", 0) + 1
-                        self._empty_total = getattr(self, "_empty_total", 0) + 1
-                        if self._empty_total >= 9:
-                            return self._finish(RunStatus.FAILED, "[ERROR] Provider returned empty repeatedly. Halted.")
-                        if self._empty_count >= 3:
-                            self._empty_count = 0
-                            self._log(self.name, "Provider returned empty 3x.", "ptc_error", self.mode)
-                            self.history.append({"role": "user", "content": "[LOOP] Emit a ```python block or a final answer now."})
-                        self.invalidate_cache()
-                        continue
-                    self._empty_count = 0
-                    self._empty_total = 0
-                    clean_response = self._strip_ptc(response)
-                    if getattr(self.settings, "ptc_auto_detect", True) and self._looks_like_code(clean_response):
-                        self._log(self.name, "AUTO-PTC: unfenced code detected, executing", "ptc_call", self.mode)
-                        raw_output = await self._run_code(clean_response, response)
-                        self.history.append({"role": "assistant", "content": response})
-                        if raw_output and (not self.history or self.history[-1].get("content") != raw_output):
-                            self.history.append({"role": "assistant", "content": raw_output})
-                        if self._response_called:
-                            done = await self._finish_response()
-                            if done is not None:
-                                return done
-                        self.invalidate_cache()
-                        continue
-                    if self._looks_like_xml(response):
-                        self._log(self.name, "Model output appeared to be raw XML/HTML, re-prompting with PTC format reminder", "ptc_error", self.mode)
-                        self.history.append({"role": "user", "content": "Your previous response was not in PTC format. Use ```python ...``` code blocks for tool calls. Please try again."})
-                        self.invalidate_cache()
-                        continue
-                    sensor_error = await self._run_verification_sensors()
-                    if sensor_error:
-                        self._log(self.name, sensor_error, "state", self.mode)
-                        self.history.append({"role": "user", "content": f"Verification failed:\n{sensor_error}\nFix the failure and verify again."})
-                        self.invalidate_cache()
-                        continue
-                    self._log(self.name, clean_response, "response", self.mode)
-                    if not self._is_delegated and self._memory_on and len(clean_response) > 20:
-                        task = asyncio.create_task(self.memory.add_memory(f"TASK: {task[:250]} => OUTCOME: {clean_response[:250]}", category="lesson", tier="recent", source="auto"))
-                        self._background_tasks.add(task)
-                        task.add_done_callback(self._background_tasks.discard)
-                    return self._finish(RunStatus.DONE, clean_response)
+
+                # intent.kind == "answer"
+                if intent.calls:
+                    self.history.append({"role": "assistant", "content": response})
+                    for call in intent.calls:
+                        result = await self._execute_tool(call.name, call.args)
+                        self.history.append({"role": "assistant", "content": f"{call.name} -> {result}"})
+                clean_response = (intent.answer or "").strip()
+                if intent.source == "prose":
+                    clean_response = strip_ptc(clean_response)
+                if not clean_response.strip():
+                    self._empty_count = getattr(self, "_empty_count", 0) + 1
+                    if self._empty_count >= 3:
+                        self._empty_count = 0
+                        self.history.append({"role": "user", "content": "[LOOP] Emit a ```python block or a final answer now."})
+                    self.invalidate_cache()
+                    continue
+                sensor_error = await self._run_verification_sensors()
+                if sensor_error:
+                    self._log(self.name, sensor_error, "state", self.mode)
+                    self.history.append({"role": "user", "content": f"Verification failed:\n{sensor_error}\nFix the failure and verify again."})
+                    self.invalidate_cache()
+                    continue
+                self.trace.answer(clean_response)
+                self.history.append({"role": "assistant", "content": clean_response})
+                if not self._is_delegated and self._memory_on and len(clean_response) > 20:
+                    task = asyncio.create_task(self.memory.add_memory(f"TASK: {task[:250]} => OUTCOME: {clean_response[:250]}", category="lesson", tier="recent", source="auto"))
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
+                return self._finish(RunStatus.DONE, clean_response)
             return self._finish(RunStatus.MAX_STEPS, "Max steps reached.")
         finally:
             if self._run is not None and self._run.status == RunStatus.RUNNING:

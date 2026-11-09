@@ -389,14 +389,56 @@ class ZervGenCLI:
         return True
 
     def _cmd_trace(self, args: Optional[str]) -> bool:
+        """``/trace`` toggles; ``/trace last`` and ``/trace cost`` read the JSONL."""
+        arg = (args or "").strip().lower()
+        if arg == "last":
+            CC.print(Panel(Text(self._trace_summary()), title="Last run"))
+            return True
+        if arg == "cost":
+            cost = 0.0
+            run = getattr(self.orchestrator, "_run", None) if self.orchestrator else None
+            if run is not None:
+                cost = float(run.metadata.get("cost_usd", 0.0) or 0.0)
+            CC.print(f"[bold]Cost:[/bold] ${cost:.4f}")
+            return True
         cfg = load_config()
-        if args is None:
-            cfg.trace_enabled = not cfg.trace_enabled
+        if arg in ("on", "1", "true", "enable"):
+            cfg.trace_enabled = True
+        elif arg in ("off", "0", "false", "disable"):
+            cfg.trace_enabled = False
         else:
-            cfg.trace_enabled = args.lower() in ("on", "1", "true", "enable")
+            cfg.trace_enabled = not cfg.trace_enabled
         cfg.save()
         CC.print(f"[bold]Trace: {'ON' if cfg.trace_enabled else 'OFF'}[/bold]")
         return True
+
+    def _trace_summary(self) -> str:
+        """Ten-line digest of the newest trace file: steps, tools, answers, errors."""
+        from src.utils import TRACE_ROOT
+        runs = sorted(TRACE_ROOT.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not runs:
+            return "No trace records yet."
+        path = runs[0]
+        rows = []
+        try:
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        except OSError as exc:
+            return f"Cannot read {path}: {exc}"
+        steps = max((int(r.get("step") or 0) for r in rows), default=0)
+        tools = [r for r in rows if r.get("kind") in ("tool_call", "tool_result")]
+        tools = [r for r in tools if r.get("call_id")]
+        errors = [r for r in rows if r.get("kind") == "tool_error"]
+        answers = [r for r in rows if r.get("kind") == "answer"]
+        lines = [f"run {path.stem} · {steps} steps · {len(tools)} tool rows · {len(errors)} errors"]
+        for row in tools[-6:]:
+            lines.append(f"  {row.get('kind')} {row.get('text', '')[:100]}")
+        if answers:
+            lines.append(f"  answer {answers[-1].get('chars', 0)} chars")
+        return "\n".join(lines)
 
     def _toggle_cfg_cmd(self, attr: str, label: str, args: Optional[str]) -> None:
         current = getattr(self.config, attr, False)

@@ -427,7 +427,12 @@ class ToolRuntime:
                  timeout: float = 60.0, agent: str = "agent",
                  on_event: Optional[Any] = None, on_log: Optional[Any] = None,
                  on_permission: Optional[Any] = None, spill_dir: Optional[Path] = None):
-        """Bind tools, policy and reporting hooks."""
+        """Bind tools, policy and reporting hooks.
+
+        ``on_event`` is the single reporting path. ``on_log`` is kept for
+        backwards compatibility with external callers; the runtime no longer
+        calls it, because it produced a second line for every tool call.
+        """
         self.tools = tools
         self.policy = policy
         self.run = run
@@ -497,11 +502,6 @@ class ToolRuntime:
         if self.run is not None:
             self.run.tool_calls.append(call)
         self._emit("tool_call", name=name, status="running", input=args, call_id=call_id)
-        if self.on_log is not None:
-            try:
-                self.on_log(f"TOOL: {name}({args})", "tool_call")
-            except Exception:
-                pass
         limit = float(timeout if timeout is not None else self.timeout)
         try:
             if inspect.iscoroutinefunction(func):
@@ -511,33 +511,28 @@ class ToolRuntime:
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError:
-            return self._finish(call_id, False, error=f"Error: Tool '{name}' timed out", started=started)
+            return self._finish(call_id, False, error=f"Error: Tool '{name}' timed out", started=started, name=name)
         except TypeError as exc:
             hint = ""
             try:
                 hint = f"\nExpected signature: {name}{inspect.signature(func)}"
             except Exception:
                 pass
-            return self._finish(call_id, False, error=f"TypeError: {exc}{hint}", started=started)
+            return self._finish(call_id, False, error=f"TypeError: {exc}{hint}", started=started, name=name)
         except Exception as exc:
-            return self._finish(call_id, False, error=f"Error: Tool '{name}' failed: {exc}", started=started)
+            return self._finish(call_id, False, error=f"Error: Tool '{name}' failed: {exc}", started=started, name=name)
         text = value if isinstance(value, str) else (json.dumps(value, ensure_ascii=False) if value is not None else "")
-        return self._finish(call_id, True, output=self.cap(text, name), started=started)
+        return self._finish(call_id, True, output=self.cap(text, name), started=started, name=name)
 
     def _finish(self, call_id: str, success: bool, output: Any = None, error: Optional[str] = None,
-                started: Optional[float] = None) -> "ToolResult":
+                started: Optional[float] = None, name: str = "") -> "ToolResult":
         """Record exactly one ToolResult for a call."""
         duration = time.monotonic() - (started if started is not None else time.monotonic())
         result = ToolResult(call_id, success, output, error, duration=duration, ended_at=time.time())
         if self.run is not None:
             self.run.tool_results.append(result)
-        self._emit("tool_result", status="ok" if success else "error",
+        self._emit("tool_result", name=name, status="ok" if success else "error",
                    output=output if success else error, duration=duration, call_id=call_id)
-        if not success and self.on_log is not None:
-            try:
-                self.on_log(f"TOOL ERROR: {error}", "tool_error")
-            except Exception:
-                pass
         return result
 
 
