@@ -31,7 +31,7 @@ from prompt_toolkit.patch_stdout import patch_stdout
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=ResourceWarning)
 
-from src.config import load_config, MODES
+from src.config import load_config, MODES, ENV_PATH
 from src.core.memory import memory_core
 from src.core.orchestrator import Orchestrator
 from src.core.provider import get_provider, get_model_name, list_live_models, list_providers
@@ -1064,41 +1064,35 @@ class ZervGenCLI:
             return []
 
     def _input_api_key(self) -> None:
-        p = self.config.provider
-        ps = getattr(self.config, p, None)
-        current = ""
-        if ps and getattr(ps, "api_key", None):
-            current = ps.api_key
+        from src.config import env_key_for, resolve_provider, save_env_key
+        p = resolve_provider(self.config.provider)
+        section = getattr(self.config, "gemini" if p == "google" else p, None)
+        current = getattr(section, "api_key", None) if section else None
+        env_name = env_key_for(p)
         if not current:
-            from src.config import _get_all_presets
-            preset = _get_all_presets(self.config).get(p) or {}
-            env = preset.get("api_key_env") or f"{p.upper().replace('-', '_')}_API_KEY"
-            current = os.environ.get(env, "")
+            current = os.environ.get(env_name, "")
         masked = (current[:6] + "…" + current[-4:]) if len(current) > 12 else ("(none)" if not current else current)
         CC.print(f"[dim]Current {p} key: {masked}[/dim]")
         key = Prompt.ask(f"{p.title()} API Key", password=True, default="")
         if not key:
             CC.print("[dim]kept existing[/dim]" if current else "[yellow]no key entered[/yellow]")
             return
-        os.environ[f"{p.upper()}_API_KEY"] = key
+        stored = False
         try:
-            from src.config import save_env_key
-            save_env_key(p, key)
-        except Exception:
-            pass
-        if ps and hasattr(ps, "api_key"):
-            ps.api_key = key
-            try:
-                self.config.save()
-            except Exception:
-                pass
+            stored = save_env_key(p, key)
+        except Exception as exc:
+            CC.print(f"[red]Could not write .env: {self._escape(str(exc))}[/red]")
+        os.environ[env_name] = key
+        if section is not None and hasattr(section, "api_key"):
+            section.api_key = key
+            key = ""
         if self.orchestrator:
             try:
                 self.orchestrator.provider = get_provider(p, self.config)
                 self.orchestrator.invalidate_cache()
-            except Exception as e:
-                CC.print(f"[yellow]key saved, refresh failed: {self._escape(str(e))}[/yellow]")
-        CC.print("[dim]saved to .env — table updates on redraw[/dim]")
+            except Exception as exc:
+                CC.print(f"[yellow]key set, provider refresh failed: {self._escape(str(exc))}[/yellow]")
+        CC.print(f"[dim]{env_name} saved to {ENV_PATH}[/dim]" if stored else "[yellow]key held in this session only[/yellow]")
 
     def _check_server_installed(self, cfg) -> bool:
         import shutil

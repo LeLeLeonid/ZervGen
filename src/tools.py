@@ -22,7 +22,7 @@ import aiofiles
 import httpx
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from rich.console import Console
-from src.config import load_config, _ANTI_PATTERNS, TEMP_DIR, WMO_CODES
+from src.config import load_config, shell_block_reason, TEMP_DIR, WMO_CODES
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
@@ -267,9 +267,9 @@ class ShellResult:
 async def shell_exec(command: str, timeout: int = 60) -> ShellResult:
     if not command or not isinstance(command, str) or not command.strip():
         return ShellResult(ok=False, error="Empty command.")
-    for pat, reason in _ANTI_PATTERNS:
-        if re.search(pat, command, re.IGNORECASE):
-            return ShellResult(ok=False, blocked=True, reason=f"{reason}. Command: {command[:100]}")
+    reason = shell_block_reason(command)
+    if reason:
+        return ShellResult(ok=False, blocked=True, reason=f"{reason}. Command: {command[:100]}")
     try:
         from src.core.memory import memory_core
         for block in memory_core.get_runtime_blocks():
@@ -813,21 +813,16 @@ async def add_mcp_server(name: str, command: str, args: str = "[]", env: str = "
         env_dict = json.loads(env) if isinstance(env, str) else env
     except json.JSONDecodeError:
         return "Error: Invalid JSON for args or env."
+    if not isinstance(args_list, list) or not isinstance(env_dict, dict):
+        return "Error: args must be a JSON list and env a JSON object."
     config = load_config()
     from src.config import MCPServerConfig
     config.mcp_servers[name] = MCPServerConfig(command=command, args=args_list, env=env_dict, enabled=True)
     config.save()
-    if default:
-        cfg_path = Path("src/config.py")
-        text = cfg_path.read_text(encoding="utf-8")
-        new_entry = f'    "{name}": MCPServerConfig(command="{command}", args={json.dumps(args_list)}, env={json.dumps(env_dict)}, enabled=True),\n'
-        import re
-        pattern = r'(DEFAULT_MCP_SERVERS\s*=\s*\{)(.*?)(\n\})'
-        match = re.search(pattern, text, re.DOTALL)
-        if match and name not in match.group(2):
-            text = text[:match.end(2)] + "\n" + new_entry + text[match.start(3):]
-            cfg_path.write_text(text, encoding="utf-8")
-            return f"MCP server '{name}' added to config.json AND hardcoded into src/config.py."
+    from src.config import save_env_var
+    written = [key for key, value in env_dict.items() if save_env_var(key, value)]
+    if written:
+        return f"MCP server '{name}' added; env keys stored in .env: {', '.join(written)}."
     return f"MCP server '{name}' added to config.json."
 
 

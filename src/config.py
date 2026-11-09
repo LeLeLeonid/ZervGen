@@ -11,56 +11,125 @@ ENV_PATH = Path.home() / ".zervgen" / ".env"
 ALLOWED_ROOTS_PATH = Path.home() / ".zervgen" / "allowed_roots.json"
 
 _REDACT_PATTERNS = [
-    (r'sk-[a-zA-Z0-9]{20,}', '[REDACTED_OPENAI]'),
-    (r'sk-ant-[a-zA-Z0-9-]{20,}', '[REDACTED_ANTHROPIC]'),
-    (r'sk-or-[a-zA-Z0-9-]{20,}', '[REDACTED_OPENROUTER]'),
-    (r'sk_live_[a-zA-Z0-9]{16,}', '[REDACTED_STRIPE]'),
-    (r'rk_live_[a-zA-Z0-9]{16,}', '[REDACTED_STRIPE_REST]'),
-    (r'\bgh[pousr]_[a-zA-Z0-9]{36}\b', '[REDACTED_GITHUB]'),
-    (r'github_pat_[a-zA-Z0-9_]{40,}', '[REDACTED_GITHUB_PAT]'),
-    (r'AKIA[0-9A-Z]{16}', '[REDACTED_AWS]'),
-    (r'ASIA[0-9A-Z]{16}', '[REDACTED_AWS_SESSION]'),
-    (r'AIza[a-zA-Z0-9\-_]{35}', '[REDACTED_GOOGLE]'),
-    (r'ya29\.[a-zA-Z0-9\-_]+', '[REDACTED_GOOGLE_OAUTH]'),
-    (r'xox[baprs]-[a-zA-Z0-9-]+', '[REDACTED_SLACK]'),
-    (r'SG\.[a-zA-Z0-9_\-]{16,}\.[a-zA-Z0-9_\-]{16,}', '[REDACTED_SENDGRID]'),
-    (r'npm_[a-zA-Z0-9]{36}', '[REDACTED_NPM]'),
-    (r'cf-[a-zA-Z0-9]{32,}', '[REDACTED_CLOUDFLARE]'),
-    (r'glpat-[a-zA-Z0-9_\-]{20,}', '[REDACTED_GITLAB]'),
-    (r'\b\d{8,10}:[A-Za-z0-9_-]{30,}\b', '[REDACTED_TELEGRAM_BOT_TOKEN]'),
-    (r'eyJ[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,}', '[REDACTED_JWT]'),
-    (r'-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----', '[REDACTED_PRIVATE_KEY]'),
-    (r'"(api_key|apikey|api_token|secret|client_secret|password|passwd|pwd|token)"\s*:\s*"[^"]{8,}"', '"\\1": "[REDACTED]"'),
-    (r'(?:api_key|apikey|secret|token|password|passwd|pwd|client_secret)\s*[=:]\s*["\'?]?[A-Za-z0-9_\-]{12,}["\'?]?', '[REDACTED_CREDENTIAL]'),
-    (r'Bearer\s+[A-Za-z0-9_\-\.=]{12,}', 'Bearer [REDACTED]'),
-    (r'Authorization:\s*Bearer\s+[a-zA-Z0-9\-_]{20,}', 'Authorization: Bearer [REDACTED]'),
-    (r'x-api-key:\s*[a-zA-Z0-9\-_]{20,}', 'x-api-key: [REDACTED]'),
-    (r'(?:mongodb|postgresql|mysql|redis|amqp|https?)://[^\s:@/]+:[^\s:@/]+@', '[REDACTED_CONN_STRING]'),
+    (re.compile(r'sk-ant-[a-zA-Z0-9-]{20,}', re.IGNORECASE), '[REDACTED_ANTHROPIC]'),
+    (re.compile(r'sk-or-[a-zA-Z0-9-]{20,}', re.IGNORECASE), '[REDACTED_OPENROUTER]'),
+    (re.compile(r'sk-(?:proj-|svcacct-)?[a-zA-Z0-9_-]{20,}', re.IGNORECASE), '[REDACTED_OPENAI]'),
+    (re.compile(r'sk_live_[a-zA-Z0-9]{16,}', re.IGNORECASE), '[REDACTED_STRIPE]'),
+    (re.compile(r'rk_live_[a-zA-Z0-9]{16,}', re.IGNORECASE), '[REDACTED_STRIPE_REST]'),
+    (re.compile(r'\bgh[pousr]_[a-zA-Z0-9]{36}\b', re.IGNORECASE), '[REDACTED_GITHUB]'),
+    (re.compile(r'github_pat_[a-zA-Z0-9_]{40,}', re.IGNORECASE), '[REDACTED_GITHUB_PAT]'),
+    (re.compile(r'AKIA[0-9A-Z]{16}', re.IGNORECASE), '[REDACTED_AWS]'),
+    (re.compile(r'ASIA[0-9A-Z]{16}', re.IGNORECASE), '[REDACTED_AWS_SESSION]'),
+    (re.compile(r'AIza[a-zA-Z0-9\-_]{35}', re.IGNORECASE), '[REDACTED_GOOGLE]'),
+    (re.compile(r'ya29\.[a-zA-Z0-9\-_]+', re.IGNORECASE), '[REDACTED_GOOGLE_OAUTH]'),
+    (re.compile(r'xox[baprs]-[a-zA-Z0-9-]+', re.IGNORECASE), '[REDACTED_SLACK]'),
+    (re.compile(r'SG\.[a-zA-Z0-9_\-]{16,}\.[a-zA-Z0-9_\-]{16,}', re.IGNORECASE), '[REDACTED_SENDGRID]'),
+    (re.compile(r'npm_[a-zA-Z0-9]{36}', re.IGNORECASE), '[REDACTED_NPM]'),
+    (re.compile(r'cf-[a-zA-Z0-9]{32,}', re.IGNORECASE), '[REDACTED_CLOUDFLARE]'),
+    (re.compile(r'glpat-[a-zA-Z0-9_\-]{20,}', re.IGNORECASE), '[REDACTED_GITLAB]'),
+    (re.compile(r'\b\d{8,10}:[A-Za-z0-9_-]{30,}\b', re.IGNORECASE), '[REDACTED_TELEGRAM_BOT_TOKEN]'),
+    (re.compile(r'eyJ[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,}', re.IGNORECASE), '[REDACTED_JWT]'),
+    (re.compile(r'-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----', re.IGNORECASE), '[REDACTED_PRIVATE_KEY]'),
+    (re.compile(r'"([A-Za-z0-9_]*(?:api_key|apikey|api_token|secret|password|passwd|pwd|token))"\s*:\s*"[^"]{8,}"', re.IGNORECASE), '"\\1": "[REDACTED]"'),
+    (re.compile(r'\b([A-Z0-9_]*(?:API_KEY|APIKEY|ACCESS_KEY|TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE_KEY))\s*[=:]\s*["\']?[^\s"\']{8,}["\']?', re.IGNORECASE), '\\1=[REDACTED]'),
+    (re.compile(r'(?:api_key|apikey|secret|token|password|passwd|pwd|client_secret)\s*[=:]\s*["\'?]?[A-Za-z0-9_\-]{12,}["\'?]?', re.IGNORECASE), '[REDACTED_CREDENTIAL]'),
+    (re.compile(r'Bearer\s+[A-Za-z0-9_\-\.=]{12,}', re.IGNORECASE), 'Bearer [REDACTED]'),
+    (re.compile(r'Authorization:\s*Bearer\s+[a-zA-Z0-9\-_]{20,}', re.IGNORECASE), 'Authorization: Bearer [REDACTED]'),
+    (re.compile(r'x-api-key:\s*[a-zA-Z0-9\-_]{20,}', re.IGNORECASE), 'x-api-key: [REDACTED]'),
+    (re.compile(r'(?:mongodb|postgresql|mysql|redis|amqp|https?)://[^\s:@/]+:[^\s:@/]+@', re.IGNORECASE), '[REDACTED_CONN_STRING]'),
 ]
 
 _ANTI_PATTERNS = [
-    (r"rm\s+(-rf?|--recursive)\s+[/~]", "Recursive delete from root/home"),
-    (r"rd\s+/s/q\s+[A-Z]:[\\\/]", "Windows recursive delete from root"),
-    (r"(sudo|doas)\s+", "Privilege escalation"),
-    (r"(chmod|chown)\s+777", "World-writable perms"),
-    (r">\s*/dev/sd[a-z]", "Raw disk write"),
-    (r"del\s+/[fqs]\s+[A-Z]:[\\\/]", "Windows force delete from root"),
-    (r"mkfs\.\w+", "Format filesystem"),
-    (r"dd\s+if=.*of=/dev/", "Raw disk write"),
-    (r":\(\)\s*\{.*\|.*:.*\};:", "Fork bomb"),
-    (r"(shutdown|reboot|halt|poweroff)\s", "System shutdown"),
-    (r"Stop-Computer|Restart-Computer|shutdown\s+/[srf]", "Windows shutdown"),
-    (r"curl\b.*\|\s*(bash|sh|powershell|pwsh)", "Remote code exec via curl"),
-    (r"wget\b.*\|\s*(bash|sh|powershell|pwsh)", "Remote code exec via wget"),
-    (r"iex\s*\(|Invoke-Expression", "PowerShell remote exec"),
-    (r">\s*/etc/(passwd|shadow|hosts)", "Write to system config"),
-    (r"chmod\s+[0-7]*\s+/(etc|usr|bin|sbin)", "System dir perm change"),
-    (r"Set-ExecutionPolicy\s+Bypass", "PowerShell execution bypass"),
-    (r"Remove-Item\s+-[a-z]*Recurse\s+[A-Z]:\\", "PowerShell recursive root delete"),
-    (r"format\s+[A-Z]:\s*/[yq]", "Windows disk format"),
-    (r"reg\s+delete\s+HKLM", "Registry delete"),
-    (r"Remove-ItemProperty\s+.*HKLM", "Registry delete PowerShell"),
+    (re.compile(r"rd\s+/s/q\s+[A-Z]:[\\\/]", re.IGNORECASE), "Windows recursive delete from root"),
+    (re.compile(r"(?<![\w.-])(?:sudo|doas)\s+", re.IGNORECASE), "Privilege escalation"),
+    (re.compile(r"(?:chmod|chown)\s+(?:-[a-zA-Z]+\s+)*777\b", re.IGNORECASE), "World-writable perms"),
+    (re.compile(r">\s*/dev/(?:sd|hd|nvme)", re.IGNORECASE), "Raw disk write"),
+    (re.compile(r"del\s+/[fqs]\s+[A-Z]:[\\\/]", re.IGNORECASE), "Windows force delete from root"),
+    (re.compile(r"\bmkfs\.\w+", re.IGNORECASE), "Format filesystem"),
+    (re.compile(r"\bdd\s+[^|;]*if=[^|;]*of=/dev/", re.IGNORECASE), "Raw disk write"),
+    (re.compile(r":\(\)\s*\{.*\|.*:.*\};:", re.IGNORECASE), "Fork bomb"),
+    (re.compile(r"(?<![\w.-])(?:shutdown|reboot|halt|poweroff)(?:\s|$)", re.IGNORECASE), "System shutdown"),
+    (re.compile(r"Stop-Computer|Restart-Computer|shutdown\s+/[srf]", re.IGNORECASE), "Windows shutdown"),
+    (re.compile(r"\b(?:curl|wget)\b[^|;]*\|\s*(?:bash|sh|zsh|powershell|pwsh)\b", re.IGNORECASE), "Remote code exec via pipe"),
+    (re.compile(r"iex\s*\(|Invoke-Expression", re.IGNORECASE), "PowerShell remote exec"),
+    (re.compile(r">\s*/etc/(?:passwd|shadow|hosts)", re.IGNORECASE), "Write to system config"),
+    (re.compile(r"chmod\s+[0-7]*\s+/(?:etc|usr|bin|sbin)(?:\s|$)", re.IGNORECASE), "System dir perm change"),
+    (re.compile(r"Set-ExecutionPolicy\s+Bypass", re.IGNORECASE), "PowerShell execution bypass"),
+    (re.compile(r"Remove-Item\s+-[a-z]*Recurse\s+[A-Z]:\\", re.IGNORECASE), "PowerShell recursive root delete"),
+    (re.compile(r"format\s+[A-Z]:\s*/[yq]", re.IGNORECASE), "Windows disk format"),
+    (re.compile(r"reg\s+delete\s+HKLM", re.IGNORECASE), "Registry delete"),
+    (re.compile(r"Remove-ItemProperty\s+.*HKLM", re.IGNORECASE), "Registry delete PowerShell"),
 ]
+
+_DESTRUCTIVE_ROOTS = {"/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64", "/opt",
+                      "/proc", "/root", "/sbin", "/sys", "/usr", "/var"}
+_SHELL_SPLIT = re.compile(r"(?:\|\||&&|[;|\n])")
+_SYSTEM_TREES = {"etc", "usr", "bin", "sbin", "lib", "lib64", "boot", "dev", "proc",
+                 "sys", "root", "opt", "var"}
+
+
+def _rm_target_reason(part: str) -> Optional[str]:
+    import shlex
+    try:
+        tokens = shlex.split(part, comments=False, posix=True)
+    except ValueError:
+        tokens = part.split()
+    while tokens and tokens[0] in ("command", "env"):
+        tokens.pop(0)
+        while tokens and ("=" in tokens[0] or tokens[0].startswith("-")):
+            tokens.pop(0)
+    if not tokens or os.path.basename(tokens[0]) not in ("rm", "unlink", "shred"):
+        return None
+    recursive = False
+    force = False
+    paths = []
+    for token in tokens[1:]:
+        if token == "--":
+            continue
+        if token.startswith("--"):
+            name = token[2:].split("=", 1)[0]
+            recursive = recursive or name in ("recursive", "dir")
+            force = force or name == "force"
+            continue
+        if token.startswith("-") and len(token) > 1:
+            flags = token[1:]
+            recursive = recursive or any(c in flags for c in "rR")
+            force = force or "f" in flags
+            continue
+        paths.append(token)
+    if not paths:
+        return None
+    home = str(Path.home())
+    for raw in paths:
+        expanded = raw.replace("${HOME}", home).replace("$HOME", home)
+        if not os.path.isabs(expanded) and expanded.startswith("~"):
+            expanded = os.path.expanduser(expanded)
+        target = os.path.abspath(os.path.expanduser(expanded))
+        if target == "/" or target in _DESTRUCTIVE_ROOTS:
+            return f"Destructive delete of protected path {target}"
+        if target == home and (recursive or force):
+            return f"Destructive delete of home directory {target}"
+        if recursive and target.startswith(home + os.sep) and len(Path(target).parts) <= len(Path(home).parts) + 1:
+            return f"Destructive recursive delete of {target}"
+        if recursive and target.startswith(home + os.sep) and Path(target).name in (".ssh", ".config", ".local", ".zervgen"):
+            return f"Destructive delete of {target}"
+        parts = Path(target).parts
+        if recursive and len(parts) > 1 and parts[1] in _SYSTEM_TREES:
+            return f"Destructive recursive delete of system path {target}"
+    return None
+
+
+def shell_block_reason(command: str) -> Optional[str]:
+    if not command or not command.strip():
+        return "Empty command"
+    for segment in _SHELL_SPLIT.split(command):
+        reason = _rm_target_reason(segment)
+        if reason:
+            return reason
+    for pattern, reason in _ANTI_PATTERNS:
+        if pattern.search(command):
+            return reason
+    return None
 
 INJECTION_PATTERNS = [
     r"ignore\s+(?:all\s+)?previous\s+instructions",
@@ -288,8 +357,16 @@ class GlobalSettings(BaseModel):
         for prov in ("pollinations", "gemini", "openrouter", "openai", "anthropic"):
             if prov in data and isinstance(data[prov], dict):
                 data[prov].pop("api_key", None)
-        with open(CONFIG_PATH, "w") as f:
+        for server in (data.get("mcp_servers") or {}).values():
+            if isinstance(server, dict):
+                server.pop("env", None)
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = CONFIG_PATH.with_suffix(CONFIG_PATH.suffix + ".tmp")
+        with open(tmp_path, "w") as f:
             json.dump(data, f, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, CONFIG_PATH)
 
 
 class MCPreset(TypedDict):
@@ -503,26 +580,27 @@ def _load_config_impl() -> GlobalSettings:
         return defaults
 
     try:
-        with open(CONFIG_PATH, "r") as f:
-            data = json.load(f)
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("config root must be an object")
+    except Exception as e:
+        print(f"\n[bold red]CONFIG UNREADABLE:[/bold red]\n{e}\n[dim]Running with defaults; {CONFIG_PATH} left untouched.[/dim]\n")
+        return GlobalSettings()
 
+    try:
         default_servers = {k: MCPServerConfig(**v.model_dump()) for k, v in DEFAULT_MCP_SERVERS.items()}
-        if "mcp_servers" in data:
-            merged_servers = {**default_servers}
-            for name, cfg in data.get("mcp_servers", {}).items():
-                if name.lower() == "zervgen":
-                    continue
-                merged_servers[name] = MCPServerConfig(**cfg)
-            data["mcp_servers"] = merged_servers
-
+        merged_servers = dict(default_servers)
+        for name, cfg in (data.get("mcp_servers") or {}).items():
+            if name.lower() == "zervgen" or not isinstance(cfg, dict):
+                continue
+            merged = dict(default_servers.get(name, MCPServerConfig(command="", args=[])).model_dump())
+            merged.update(cfg)
+            merged_servers[name] = MCPServerConfig(**merged)
+        data["mcp_servers"] = merged_servers
         return GlobalSettings.model_validate(data)
     except Exception as e:
-        print(f"\n[bold red]CONFIG VALIDATION FAILED:[/bold red]\n{e}\n")
-        if CONFIG_PATH.exists():
-            shutil.copy(CONFIG_PATH, CONFIG_PATH.with_suffix(".bak"))
-        defaults = GlobalSettings()
-        defaults.save()
-        return defaults
+        print(f"\n[bold red]CONFIG VALIDATION FAILED:[/bold red]\n{e}\n[dim]File left untouched: {CONFIG_PATH}[/dim]\n")
+        return GlobalSettings()
 
 
 _config_instance: Optional[GlobalSettings] = None
@@ -535,28 +613,46 @@ def load_config() -> GlobalSettings:
     return _config_instance
 
 
-def save_env_key(provider_name: str, api_key: str) -> None:
-    provider_settings = getattr(_config_instance, provider_name, None) if _config_instance else None
-    env_key = getattr(provider_settings, '_env_key', '') if provider_settings else ''
-    if not env_key:
-        return
+def env_key_for(provider_name: str) -> str:
+    section = getattr(_config_instance, provider_name, None) if _config_instance else None
+    env_key = getattr(section, "_env_key", "") if section else ""
+    if env_key:
+        return env_key
+    preset = _get_all_presets(_config_instance).get(resolve_provider(provider_name)) or {}
+    env_key = preset.get("api_key_env") or ""
+    if env_key:
+        return env_key
+    return f"{resolve_provider(provider_name).upper().replace('-', '_')}_API_KEY"
+
+
+def save_env_var(env_key: str, value: str) -> bool:
+    env_key = (env_key or "").strip()
+    if not env_key or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_key) or not value:
+        return False
     ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
-    lines = []
-    if ENV_PATH.exists():
-        lines = ENV_PATH.read_text().splitlines()
-    found = False
+    lines = ENV_PATH.read_text().splitlines() if ENV_PATH.exists() else []
     new_lines = []
+    found = False
     for line in lines:
-        stripped = line.strip()
-        if stripped.startswith(f"{env_key}="):
-            new_lines.append(f'{env_key}="{api_key}"')
+        if line.strip().startswith(f"{env_key}="):
+            new_lines.append(f'{env_key}="{value}"')
             found = True
         else:
             new_lines.append(line)
     if not found:
-        new_lines.append(f'{env_key}="{api_key}"')
-    ENV_PATH.write_text("\n".join(new_lines) + "\n")
-    os.environ[env_key] = api_key
+        new_lines.append(f'{env_key}="{value}"')
+    tmp_path = ENV_PATH.with_suffix(ENV_PATH.suffix + ".tmp")
+    tmp_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, ENV_PATH)
+    os.environ[env_key] = value
+    return True
+
+
+def save_env_key(provider_name: str, api_key: str) -> bool:
+    if not api_key:
+        return False
+    return save_env_var(env_key_for(provider_name), api_key)
 
 
 def get_allowed_roots() -> List[str]:
