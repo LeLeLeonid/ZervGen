@@ -60,17 +60,17 @@ TAB in an empty prompt cycles modes. `/mode` opens the menu.
 Called as Python inside a ```` ```python ```` block, or as shorthand:
 
 ```python
-content = await read_file("tmp/PLAN.md")
-hits = await search_memory("database schema", limit=5)
-result = await delegate_to(agent_name="code", task=f"Execute: {content}")
+content = await read("tmp/PLAN.md")
+hits = await recall("database schema", limit=5)
+result = await delegate(agent_name="code", task=f"Execute: {content}")
 ```
 
 ```text
-::read_file("src/cli.py", 0, 4000)
+::read("src/cli.py", 0, 4000)
 ::shell("pytest -q")
 ```
 
-Shorthand binds positionally to the real signature. Use `scan_tools(name)` for an exact schema.
+Shorthand binds positionally to the real signature. Use `tools(name)` for an exact schema.
 
 ## Skills
 
@@ -80,6 +80,7 @@ One Markdown file per skill. Frontmatter is enforced on load:
 ---
 name: kebab-case            # must equal the file stem
 description: "one line"     # shown in the index
+when_not: "the adjacent case this skill is wrong for"   # optional, shown as (not when: ...)
 tags: [trigger, words]      # drive auto-match
 tools: [tool_name]          # optional
 contract: {pre: {}, post: {}}

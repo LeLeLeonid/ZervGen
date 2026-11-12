@@ -1,8 +1,9 @@
 ---
 name: delegation
 description: "Route work to the right role agent and synthesize what comes back"
+when_not: "the task is a handful of tool calls"
 tags: [delegate, delegation, agent, subagent, orchestrate, route, parallel, swarm, handoff, worker]
-tools: ["delegate_to", "list_skills", "find_skill", "load_skill", "manage_todo", "response"]
+tools: ["delegate", "skills", "find", "skill", "todo", "response"]
 contract:
   pre: {}
   post: {}
@@ -27,7 +28,7 @@ Delegation pays when the work is separable and the role has a better toolset tha
 ## Choose a role
 
 ```python
-names = await list_skills()
+names = await skills()
 ```
 
 Roles are the agents under `src/skills/AGENTS`. Current set: `system` (routing), `code` (implementation), `architect` (design), `researcher` (external facts). Pick by ownership of the *output*, not by topic.
@@ -42,7 +43,7 @@ The delegate starts with none of your conversation. A task must carry:
 4. the shape of the expected reply.
 
 ```python
-result = await delegate_to(
+result = await delegate(
     agent_name="code",
     task="Add an `--json` flag to src/cli.py's parse_args. Must not change existing flags. "
          "Run python -m pytest tests/test_cli.py. Reply with the diff and the test result.",
@@ -53,8 +54,8 @@ result = await delegate_to(
 
 ```python
 results = await asyncio.gather(
-    delegate_to(agent_name="researcher", task="..."),
-    delegate_to(agent_name="code", task="..."),
+    delegate(agent_name="researcher", task="..."),
+    delegate(agent_name="code", task="..."),
 )
 ```
 

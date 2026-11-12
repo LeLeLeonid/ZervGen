@@ -1,20 +1,21 @@
 ---
 name: weather
 description: "Get weather information for any location"
+when_not: "the request does not name a place or date"
 tags: [weather, forecast, temperature, rain, sunny, cloudy, humidity, wind, climate]
 ---
 # Weather Context
 
-Use `get_weather(location)` to get weather information.
+Use `weather(location)` to get weather information.
 
 ## Usage
 ```python
-result = await get_weather(location="Minsk")
+result = await weather(location="Minsk")
 return await response(text=result)
 ```
 
 ```python
-result = await get_weather(location="London", forecast=True)
+result = await weather(location="London", forecast=True)
 return await response(text=result)
 ```
 

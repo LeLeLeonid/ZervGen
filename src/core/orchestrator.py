@@ -12,14 +12,16 @@ from src.core.base_agent import StemAgent
 from src.core.memory import memory_core
 from src.core.provider import AIProvider, get_provider
 from src.skills_loader import load_role, role_exists, skill_index, SkillEngine
-from src.tools import TOOL_REGISTRY, get_tools_schema, shell_exec
-from src.utils import get_system_context, sanitize_for_prompt, generate_random_delimiter, count_tokens, add_global_tokens, add_provider_tokens, GitManager
+from src.tools import shell_exec
+from src.utils import GitManager
 from src.core.runtime import CheckpointRef, Plan, RunStatus, Task, TaskStatus
 
 logger = logging.getLogger(__name__)
 console = Console()
 
-_FAILURE_MARKERS = re.compile(r"^(Error|BLOCKED|Timeout|TypeError|Exit code: [1-9]\d*)\b")
+_FAILURE_MARKERS = re.compile(
+    r"^(Error|BLOCKED|Timeout|TypeError|Exit code: [1-9]\d*|PRE-VALIDATION|MCP Error|"
+    r"Max steps|Stopped by user|\[CRITIC FAILED\])\b")
 
 
 def _looks_failed(text: str) -> bool:
@@ -31,6 +33,8 @@ def _child_succeeded(agent: Any, text: str) -> bool:
     run = getattr(agent, "_run", None) if agent is not None else None
     if run is not None:
         return run.status == RunStatus.DONE
+    if agent is not None:
+        return False
     return not _looks_failed(text)
 
 
@@ -41,7 +45,7 @@ class Orchestrator(StemAgent):
         self,
         provider: Optional[AIProvider] = None,
         settings: Optional[GlobalSettings] = None,
-        mode: str = "BUILD",
+        mode: str = "CALL",
         memory: Any = None,
     ):
         settings = settings or load_config()
@@ -60,6 +64,9 @@ class Orchestrator(StemAgent):
         self._user_active = True
         self._active_session_id: Optional[str] = None
         self._git_mgr = None
+        self._goal_text = ""
+        self._goal_round = 0
+        self._goal_max = 10
         if settings.checkpoints_enabled and mode.upper() == "BUILD":
             self._git_mgr = GitManager(Path.cwd(), max_snapshots=settings.checkpoint_max_snapshots)
 
@@ -159,21 +166,9 @@ class Orchestrator(StemAgent):
     async def _verify_artifacts(self) -> List[str]:
         failures = []
         for artifact in (self._run.artifacts if self._run else []):
-            path = Path(artifact.path)
-            if not path.exists():
-                failures.append(f"Missing artifact: {artifact.path}")
-                continue
-            if artifact.kind == "file" and path.suffix.lower() == ".py":
-                import py_compile
-                try:
-                    py_compile.compile(str(path), doraise=True)
-                except py_compile.PyCompileError as e:
-                    failures.append(f"Python syntax failed: {artifact.path}: {e.msg or e}")
-            elif artifact.kind == "file" and path.suffix.lower() == ".json":
-                try:
-                    json.loads(path.read_text(encoding="utf-8"))
-                except Exception as e:
-                    failures.append(f"JSON validation failed: {artifact.path}: {e}")
+            reason = self._check_file(Path(artifact.path))
+            if reason:
+                failures.append(reason)
         commands = list(getattr(self.settings, "verification_commands", []) or []) if self.mode == "BUILD" else []
         for command in commands:
             if not str(command).strip():
@@ -186,11 +181,18 @@ class Orchestrator(StemAgent):
             self._run.emit("verification", self.name, "artifacts", "passed" if not failures else "failed", output=failures or "artifact checks passed")
         return failures
 
+    def _with_goal(self, task: str) -> str:
+        """Prefix the active /goal contract and its round counter."""
+        if not self._goal_text:
+            return task
+        return f"{task}\n\n[GOAL] {self._goal_text}\n[ROUND {self._goal_round}/{self._goal_max}]"
+
     async def run(self, task: str) -> str:
         """Entry point: the supervised path, not the bare stem loop."""
         return await self.run_task(task, self.mode)
 
     async def run_task(self, task: str, mode: str = "BUILD") -> str:
+        task = self._with_goal(task)
         if not self.settings.critic_enabled:
             if self.mode == "BUILD" and self._git_mgr and self._active_session_id:
                 self._git_mgr.snapshot(self._active_session_id)
@@ -201,7 +203,7 @@ class Orchestrator(StemAgent):
         skill_contract = skill_index.get(self.skill_name)
         original_task = task
         if skill_contract:
-            pre_err = SkillEngine.validate_pre(skill_contract, {"task": task})
+            pre_err = SkillEngine.validate_pre(skill_contract, task, set(self._active_tools()))
             if pre_err:
                 return f"PRE-VALIDATION FAILED: {pre_err}"
 
@@ -254,15 +256,20 @@ End with exactly one line: GRADE: [1-5]"""
             if grade >= self.settings.critic_gate_threshold and not verify_failures:
                 return result
             if round_no == max_rounds:
-                if self._git_mgr:
+                reverted = False
+                if self._git_mgr and self._active_session_id:
                     try:
-                        self._git_mgr.rollback(1)
-                        self._log(self.name, f"Auto-rollback: grade {grade}", "state", self.mode)
+                        reverted = bool(self._git_mgr.rollback(1))
+                        if reverted:
+                            self._log(self.name, f"Auto-rollback: grade {grade}", "state", self.mode)
                     except Exception as e:
                         self._log(self.name, f"Rollback failed: {e}", "state", self.mode)
                 if self._run:
                     self._run.metadata["critic_failed"] = True
-                return f"[ROLLBACK] Grade {grade} — reverted 1 step. Escalate."
+                    self._run.metadata["critic_grade"] = grade
+                    self._run.status = RunStatus.FAILED
+                note = "reverted 1 step" if reverted else "no checkpoint available, nothing reverted"
+                return f"[CRITIC FAILED] Grade {grade} — {note}. Escalate."
 
             task = f"Original task: {original_task}\n\nPrevious attempt scored {grade}/5. Fix the missing/broken parts. Focus ONLY on gaps."
 
@@ -278,6 +285,11 @@ End with exactly one line: GRADE: [1-5]"""
         task = args.get("task", "")
         context = args.get("context", "")
         agents_list = args.get("agents", "")
+        requested_mode = str(args.get("mode") or "").upper()
+        if requested_mode:
+            from src.config import MODES
+            if requested_mode not in MODES:
+                return f"Error: unknown mode '{requested_mode}'. One of: {', '.join(MODES)}."
         full_task = f"{context}\n\n{task}" if context else task
         if not full_task.strip():
             return "Error: Empty task"
@@ -308,6 +320,13 @@ End with exactly one line: GRADE: [1-5]"""
                 all_results = []
                 results_by_id = {}
                 for wave_idx, wave_specs in enumerate(waves):
+                    skipped = [s for s in wave_specs
+                               if plan.tasks[self._task_key(s)].status == TaskStatus.BLOCKED]
+                    wave_specs = [s for s in wave_specs if s not in skipped]
+                    if skipped:
+                        all_results.extend(f"=== {self._task_key(s)}: skipped (dependency failed) ===" for s in skipped)
+                    if not wave_specs:
+                        continue
                     self._log(self.name, f"WAVE {wave_idx + 1}/{len(waves)}: {[s.get('id', s['agent_name']) for s in wave_specs]}", "delegation_start", self.mode)
                     wave_tasks = []
                     agent_id_map = {}
@@ -359,7 +378,8 @@ End with exactly one line: GRADE: [1-5]"""
                         f"=== {spec.get('id', spec['agent_name'])}: {spec['agent_name']} ===\n{str(result)}"
                         for result, spec in zip(wave_results, wave_specs)
                     )
-                    if any(plan.tasks[str(s.get("id") or s.get("task_id") or s["agent_name"])].status in {TaskStatus.FAILED, TaskStatus.BLOCKED} for s in wave_specs):
+                    waiting = [t for t in plan.tasks.values() if t.status == TaskStatus.PENDING]
+                    if not waiting:
                         break
                 if self._run:
                     self._run.plan = plan
@@ -374,6 +394,12 @@ End with exactly one line: GRADE: [1-5]"""
             agent = self.agents[agent_id]
         else:
             agent_id, agent = self._spawn_agent(role_name=agent_name, context=context, max_steps=None)
+        if requested_mode:
+            agent.mode = requested_mode
+            agent._runtime = agent._build_runtime()
+            agent.invalidate_cache()
+        if str(args.get("memory", "")).strip().lower() in ("off", "false", "0", "no"):
+            agent.memory = None
         result = await agent.run(full_task)
         self._last_agent_id = agent_id
         return str(result)
@@ -428,9 +454,10 @@ End with exactly one line: GRADE: [1-5]"""
         ]
         for msg in non_system[-6:]:
             initial_history.append({"role": msg["role"], "content": msg["content"]})
+        child_provider = self.provider.clone() if hasattr(self.provider, "clone") else self.provider
         agent = StemAgent(
             name=role_name,
-            provider=self.provider,
+            provider=child_provider,
             skill_name=role_name,
             settings=self.settings,
             mode=self.mode,
@@ -444,9 +471,10 @@ End with exactly one line: GRADE: [1-5]"""
         agent.trace.paint = False
         agent._max_steps_override = max_steps or self._get_max_steps()
         agent._is_delegated = True
+        agent._parent_run = getattr(self, "_run", None)
         agent._mcp = self._mcp
         agent._mcp_initialized = True
-        agent.tools.pop("delegate_to", None)
+        agent.tools.pop("delegate", None)
         self.agents[agent_id] = agent
         self._log(self.name, f"SPAWN: {role_name} ({agent_id})", "agent_spawn", self.mode)
         return agent_id, agent

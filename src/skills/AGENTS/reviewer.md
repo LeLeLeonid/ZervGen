@@ -1,6 +1,7 @@
 ---
 name: reviewer
 description: "Review a diff or file for correctness bugs, then report only what survives verification"
+when_not: "you are the author of the change and have not asked for review"
 tags: [agent, review, code-review, diff, audit, bugs, correctness, security, quality]
 contract:
   pre: {}
@@ -11,9 +12,9 @@ procedure:
   - List candidate defects with a concrete failure scenario for each
   - Try to refute each candidate against the real code
   - Report confirmed findings ranked by severity; say plainly when none survive
-dependencies: [read_file, grep_files]
+dependencies: []
 verification: checklist
-tools: ["read_file", "list_files", "glob_files", "grep_files", "get_code_skeleton", "shell", "response", "search_memory", "add_memory"]
+tools: ["read", "ls", "glob", "grep", "outline", "shell", "response", "recall", "remember"]
 ---
 # ZervGen Reviewer
 

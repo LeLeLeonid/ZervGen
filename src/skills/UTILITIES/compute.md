@@ -1,8 +1,9 @@
 ---
 name: compute
 description: "Exact arithmetic, JSON formatting, hashing, encoding and UUIDs"
+when_not: "the arithmetic fits in one expression you can evaluate with calc"
 tags: [calc, calculate, math, arithmetic, compute, json, format, pretty, hash, md5, sha256, base64, encode, decode, uuid, random, string]
-tools: ["calc", "format_json", "hash_string", "base64_encode", "base64_decode", "generate_uuid", "generate_random_string", "response"]
+tools: ["calc", "pretty", "hash", "b64encode", "b64decode", "uuid", "random", "response"]
 contract:
   pre: {}
   post: {}
@@ -30,8 +31,8 @@ await calc(expression="(1200 * 1.08) ** 2")
 ## JSON
 
 ```python
-await format_json(data='{"b":2,"a":[1,2]}')
-await format_json(data='{"b":2,"a":[1,2]}', mode="minify")
+await pretty(data='{"b":2,"a":[1,2]}')
+await pretty(data='{"b":2,"a":[1,2]}', mode="minify")
 ```
 
 - Accepts a dict or a JSON string. `pretty` (default) indents; `minify` compacts.
@@ -40,23 +41,23 @@ await format_json(data='{"b":2,"a":[1,2]}', mode="minify")
 ## Hashing and encoding
 
 ```python
-await hash_string(text="hello", algorithm="sha256")
-await base64_encode(text="hello")
-await base64_decode(encoded="aGVsbG8=")
+await hash(text="hello", algorithm="sha256")
+await b64encode(text="hello")
+await b64decode(encoded="aGVsbG8=")
 ```
 
-- `hash_string` supports `md5`, `sha1`, `sha256`, `sha512`. For anything security-relevant use `sha256` or better; md5 is for checksums, never for passwords.
-- `base64_encode` takes text and returns ASCII. `base64_decode` returns text; invalid input starts with `Error:`.
+- `hash` supports `md5`, `sha1`, `sha256`, `sha512`. For anything security-relevant use `sha256` or better; md5 is for checksums, never for passwords.
+- `b64encode` takes text and returns ASCII. `b64decode` returns text; invalid input starts with `Error:`.
 
 ## Identifiers
 
 ```python
-await generate_uuid()
-await generate_random_string(length=24)
+await uuid()
+await random(length=24)
 ```
 
-- `generate_uuid` returns a v4 UUID.
-- `generate_random_string` uses `secrets`. Never use it for a password you then log; never use a deterministic pattern for tokens.
+- `uuid` returns a v4 UUID.
+- `random` uses `secrets`. Never use it for a password you then log; never use a deterministic pattern for tokens.
 
 ## Rules
 

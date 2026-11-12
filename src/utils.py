@@ -1,7 +1,6 @@
 import asyncio
 import ast
 import hashlib
-import html
 import inspect
 import os
 import platform
@@ -17,17 +16,80 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, List, Any, Callable, TypeVar
 from rich.console import Console
+from rich.markdown import Markdown
 import httpx
 import json
 import logging
 import logging.handlers
 from dataclasses import dataclass, field
 
-from src.config import _REDACT_PATTERNS, CONTEXT_PRIORITY, CONTEXT_MAX_CHARS, _INJECT_RE, _TRACE_STYLE, load_config
+from src.config import _REDACT_PATTERNS, CONTEXT_PRIORITY, CONTEXT_OVERRIDE, CONTEXT_MAX_CHARS, _INJECT_RE, _TRACE_STYLE, load_config
 
 console = Console()
 
+_RICH = {"on": False}
+
+
+def rich_on() -> bool:
+    """Whether answers are boxed in Rich panels; markdown renders either way."""
+    return _RICH["on"]
+
+
+def set_rich(on: bool) -> None:
+    _RICH["on"] = bool(on)
+
+
+def print_block(text: str, panel: bool = False, emit=None) -> None:
+    """Paint markdown once; `emit` overrides the sink, `panel` adds the box frame."""
+    if not text.strip():
+        return
+    if not rich_on():
+        line = text if text.endswith("\n") else text + "\n"
+        if emit is not None:
+            emit(line)
+        else:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+        return
+    body = Markdown(text)
+    (emit or console.print)(Panel(body, border_style="cyan") if panel else body, soft_wrap=True)
+
+
 TRACE_ROOT = Path("tmp/state/trace")
+
+STATE_LIMIT = {"runs.jsonl": 500, "incidents.jsonl": 200}
+KEEP_TRACES = 200
+KEEP_PREVIEWS = 100
+
+
+def prune_state(root: Path = Path("tmp")) -> None:
+    """Bound the append-only state files and scratch previews under tmp/."""
+    log = logging.getLogger(__name__)
+    state = Path(root) / "state"
+    for name, limit in STATE_LIMIT.items():
+        path = state / name
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        if len(lines) > limit:
+            path.write_text("\n".join(lines[-limit:]) + "\n", encoding="utf-8")
+    for directory, pattern, keep in (
+        (state / "trace", "*.jsonl", KEEP_TRACES),
+        (Path(root) / "preview", "*.png", KEEP_PREVIEWS),
+    ):
+        files = []
+        for path in directory.glob(pattern):
+            try:
+                files.append((path.stat().st_mtime, path))
+            except OSError:
+                continue
+        for _, path in sorted(files)[: max(0, len(files) - keep)]:
+            try:
+                path.unlink()
+            except OSError:
+                log.debug("Could not remove %s", path)
+
 
 def trace_line(role: str, event_type: str, content: str) -> None:
     """TUI-safe dim one-liner for live agent visibility."""
@@ -40,6 +102,417 @@ def trace_line(role: str, event_type: str, content: str) -> None:
         f"[dim]{datetime.now():%H:%M:%S}[/dim] [{style}]{icon} {role}[/{style}] [dim]{snippet}[/dim]",
         soft_wrap=True,
     )
+
+class Media:
+    """Inline previews for the images and videos an agent produces.
+
+    Native protocols (kitty, iTerm2) are used when the terminal speaks them;
+    otherwise the frame is drawn as truecolor half-blocks. Anything else gets
+    one compact descriptor row — never a wall of escape codes.
+    """
+
+    VIDEO_EXT = {".mp4", ".webm", ".mov", ".mkv", ".avi"}
+    AUDIO_EXT = {".mp3", ".wav", ".ogg", ".flac", ".m4a", ".opus"}
+    MEDIA_RE = re.compile(
+        r"(?:file://)?([\w./~+-]+?\.(?:png|jpe?g|gif|webp|bmp"
+        r"|mp4|webm|mov|mkv|avi|mp3|wav|ogg|flac|m4a|opus))\b", re.I)
+    BARS = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
+    MAX_BYTES = 24 * 1024 * 1024
+    LIMIT = 8
+
+    def __init__(self, console: Optional[Console] = None, enabled: bool = True):
+        self.console = console or Console()
+        self.enabled = enabled
+        self.protocol = self._detect()
+        self._seen: set[str] = set()
+        self._dims: Dict[str, tuple] = {}
+
+    @staticmethod
+    def _detect() -> str:
+        env = os.environ
+        term = env.get("TERM", "").lower()
+        program = env.get("TERM_PROGRAM", "").lower()
+        if env.get("KITTY_WINDOW_ID") or "kitty" in term or program == "ghostty":
+            return "kitty"
+        if program in ("iterm.app", "wezterm"):
+            return "iterm"
+        if Media._has("chafa"):
+            return "chafa"
+        if env.get("COLORTERM", "").lower() in ("truecolor", "24bit") and Media._has("ffmpeg"):
+            return "halfblock"
+        return "none"
+
+    @staticmethod
+    def _has(binary: str) -> bool:
+        from shutil import which
+        return which(binary) is not None
+
+    @classmethod
+    def paths(cls, text: str) -> List[str]:
+        """Existing media files referenced by a tool result or an answer."""
+        body = str(text or "")
+        if len(body) > 400_000 or "." not in body:
+            return []
+        found = []
+        for match in cls.MEDIA_RE.finditer(body):
+            candidate = os.path.expanduser(match.group(1))
+            if candidate not in found and os.path.isfile(candidate):
+                found.append(candidate)
+        return found
+
+    def _probe(self, path: str) -> tuple[int, int, float]:
+        """Width, height and duration via ffprobe; zeros when unknown."""
+        if path in self._dims:
+            return self._dims[path]
+        size = (0, 0, 0.0)
+        if self._has("ffprobe"):
+            try:
+                out = _subprocess.run(
+                    ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                     "-show_entries", "stream=width,height:format=duration",
+                     "-of", "csv=p=0:s=x", path],
+                    capture_output=True, text=True, timeout=8).stdout
+                parts: List[str] = []
+                for line in out.splitlines():
+                    parts.extend(line.strip().split("x"))
+                numbers = [float(p) for p in parts if p.replace(".", "", 1).isdigit()]
+                if len(numbers) >= 2:
+                    duration = next((n for n in numbers[2:] if n > 0), 0.0)
+                    size = (int(numbers[0]), int(numbers[1]), duration)
+            except Exception:
+                pass
+        self._dims[path] = size
+        return size
+
+    def describe(self, path: str) -> str:
+        width, height, duration = self._probe(path)
+        suffix = Path(path).suffix.lower()
+        icon = "\U0001f3ac" if suffix in self.VIDEO_EXT else ("\U0001f50a" if suffix in self.AUDIO_EXT else "\U0001f5bc")
+        bits = [icon, os.path.basename(path)]
+        if width and height:
+            bits.append(f"{width}\u00d7{height}")
+        if duration:
+            bits.append(f"{duration:.1f}s")
+        bits.append(_human_size(os.path.getsize(path)))
+        return " ".join(bits)
+
+    def render(self, path: str, label: bool = True) -> bool:
+        """Show one media file once: a descriptor row, plus pixels when possible."""
+        if not self.enabled or not path:
+            return False
+        key = os.path.abspath(path)
+        if key in self._seen or len(self._seen) >= self.LIMIT:
+            return False
+        try:
+            if not os.path.isfile(path) or os.path.getsize(path) > self.MAX_BYTES:
+                return False
+        except OSError:
+            return False
+        self._seen.add(key)
+        try:
+            if label:
+                self.console.print(f"  [dim]{self.describe(path)}[/dim]", soft_wrap=True)
+            return True
+        except Exception:
+            logging.getLogger(__name__).debug("Media render failed", exc_info=True)
+            return False
+
+    def render_mentions(self, text: str) -> int:
+        """Render every media file an answer points at."""
+        return sum(self.render(path, label=True) for path in self.paths(text))
+
+    def _frame(self, path: str) -> Optional[str]:
+        """A PNG still for any supported media file, cached under tmp/."""
+        if Path(path).suffix.lower() not in self.VIDEO_EXT:
+            return path
+        target = Path("tmp/preview") / f"{hashlib.sha1(os.path.abspath(path).encode()).hexdigest()[:16]}.png"
+        if target.exists():
+            return str(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            _subprocess.run(
+                ["ffmpeg", "-v", "error", "-ss", "0.5", "-i", path, "-frames:v", "1", "-y", str(target)],
+                capture_output=True, timeout=20, check=True)
+        except Exception:
+            return None
+        return str(target) if target.exists() else None
+
+    def _draw(self, path: str) -> None:
+        if Path(path).suffix.lower() in self.AUDIO_EXT:
+            self._waveform(path)
+            return
+        frame = self._frame(path)
+        if frame is None:
+            return
+        if self.protocol == "kitty":
+            self._kitty(frame)
+        elif self.protocol == "iterm":
+            self._iterm(frame, path)
+        elif self.protocol == "chafa":
+            self._chafa(frame)
+        else:
+            self._halfblock(frame)
+
+    def _size(self) -> tuple[int, int]:
+        from shutil import get_terminal_size
+        columns = max(20, get_terminal_size((80, 24)).columns - 4)
+        return min(48, columns), 16
+
+    def _kitty(self, frame: str) -> None:
+        import base64
+        columns, rows = self._size()
+        data = base64.b64encode(Path(frame).read_bytes()).decode("ascii")
+        chunks = [data[i:i + 4096] for i in range(0, len(data), 4096)]
+        for index, chunk in enumerate(chunks):
+            more = "m=1" if index < len(chunks) - 1 else "m=0"
+            head = f"a=T,f=100,c={columns},r={rows},{more}" if index == 0 else more
+            sys.stdout.write(f"\x1b_G{head};{chunk}\x1b\\")
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    def _iterm(self, frame: str, source: str) -> None:
+        import base64
+        columns, _ = self._size()
+        data = base64.b64encode(Path(frame).read_bytes()).decode("ascii")
+        name = base64.b64encode(os.path.basename(source).encode()).decode("ascii")
+        sys.stdout.write(f"\x1b]1337;File=inline=1;width={columns};name={name}:{data}\a\n")
+        sys.stdout.flush()
+
+    def _waveform(self, path: str) -> None:
+        """One row of peak amplitudes — a shape, not a player."""
+        width, _ = self._size()
+        width = max(16, min(width, 100))
+        try:
+            proc = _subprocess.run(
+                ["ffmpeg", "-v", "error", "-i", path, "-ac", "1", "-ar", "8000",
+                 "-f", "s16le", "-"],
+                capture_output=True, timeout=20)
+        except Exception:
+            return
+        raw = proc.stdout
+        if not raw:
+            return
+        samples = len(raw) // 2
+        bucket = max(1, samples // width)
+        peaks = []
+        for index in range(0, samples, bucket):
+            chunk = raw[index * 2:(index + bucket) * 2]
+            peak = max((abs(int.from_bytes(chunk[i:i + 2], "little", signed=True))
+                        for i in range(0, len(chunk) - 1, 2)), default=0)
+            peaks.append(peak)
+        peak = max(peaks or [1]) or 1
+        line = "".join(self.BARS[min(len(self.BARS) - 1, value * len(self.BARS) // (peak + 1))]
+                       for value in peaks[:width])
+        self.console.print(f"  [cyan]{line}[/cyan]", soft_wrap=True)
+
+    def _chafa(self, frame: str) -> None:
+        columns, rows = self._size()
+        proc = _subprocess.run(
+            ["chafa", f"--size={columns}x{rows}", "--format=symbols", "--animate=off", frame],
+            capture_output=True, text=True, timeout=20)
+        if proc.returncode == 0 and proc.stdout.strip():
+            sys.stdout.write(proc.stdout)
+            sys.stdout.flush()
+
+    def _halfblock(self, frame: str) -> None:
+        width, rows = self._size()
+        try:
+            proc = _subprocess.run(
+                ["ffmpeg", "-v", "error", "-i", frame, "-vf",
+                 f"scale={width}:-2:flags=area", "-frames:v", "1",
+                 "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                capture_output=True, timeout=20)
+        except Exception:
+            return
+        raw = proc.stdout
+        if proc.returncode != 0 or not raw:
+            return
+        stride = width * 3
+        available = len(raw) // stride
+        if available < 2:
+            return
+        rows = min(rows, available // 2)
+        lines = []
+        for row in range(rows):
+            top = raw[row * 2 * stride:(row * 2 + 1) * stride]
+            bottom = raw[(row * 2 + 1) * stride:(row * 2 + 2) * stride]
+            parts = []
+            for column in range(width):
+                index = column * 3
+                parts.append("\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m\u2580".format(
+                    top[index], top[index + 1], top[index + 2],
+                    bottom[index], bottom[index + 1], bottom[index + 2]))
+            lines.append("".join(parts) + "\x1b[0m")
+        if lines:
+            sys.stdout.write("\n".join(lines) + "\n")
+            sys.stdout.flush()
+
+
+def _human_size(size: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{size:.1f}GB"
+
+
+@dataclass
+class _ToolRow:
+    """One finished tool call, kept so the activity can be expanded later."""
+
+    name: str
+    summary: str
+    ok: bool
+    error: str = ""
+    media: List[str] = field(default_factory=list)
+
+
+class _Activity:
+    """A run of consecutive tool calls."""
+
+    def __init__(self):
+        self.rows: List[_ToolRow] = []
+        self.started = time.monotonic()
+
+    @property
+    def elapsed(self) -> float:
+        return max(0.0, time.monotonic() - self.started)
+
+
+class ActivityRenderer:
+    """Grouped transcript: a run of tool calls is one row, details on demand.
+
+    Consecutive tool results collapse into a single activity row once there are
+    three or more; one or two stay as individual rows. Nothing is lost: rows
+    are retained, ``expand()`` reprints a group, and the JSONL keeps everything.
+    """
+
+    INDENT = "  "
+    KEEP = 20
+
+    def __init__(self, console: Optional[Console] = None, clock: bool = True, media: bool = True):
+        self.console = console or Console()
+        self.clock = clock
+        self.verbose = False
+        self.media = Media(console=self.console, enabled=media)
+        self._activity = _Activity()
+        self._groups: List[_Activity] = []
+
+    def _stamp(self) -> str:
+        return f"[dim]{datetime.now():%H:%M:%S}[/dim] " if self.clock else ""
+
+    def _write(self, line: str) -> None:
+        self.console.print(line, soft_wrap=True)
+
+    @staticmethod
+    def _escape(text: Any) -> str:
+        from rich.markup import escape
+        return escape(_flat(text))
+
+    def media_rows(self, paths: List[str]) -> None:
+        """Preview each artifact once; media is content, not noise."""
+        for path in paths:
+            self.media.render(path)
+
+    def begin(self) -> None:
+        """Start a new run: nothing may leak across tasks."""
+        self.flush()
+        self._groups.clear()
+
+    def end(self) -> None:
+        self.flush()
+
+    def event(self, role: str, kind: str, text: str, data: Dict[str, Any]) -> None:
+        """One trace event in, at most one row out."""
+        if kind in ("tool_result", "tool_error"):
+            self._activity.rows.append(_ToolRow(
+                name=str(data.get("name") or (text.split(" ")[0] if text else "tool")),
+                summary=text,
+                ok=kind == "tool_result",
+                error=str(text if kind == "tool_error" else ""),
+                media=list(data.get("media") or []) if kind == "tool_result" else [],
+            ))
+            return
+        self.flush()
+        self._row(kind, text)
+
+    def flush(self) -> None:
+        """Print the buffered activity, collapsed unless it is short or verbose."""
+        activity, self._activity = self._activity, _Activity()
+        rows = activity.rows
+        if not rows:
+            return
+        self._groups.append(activity)
+        del self._groups[:-self.KEEP]
+        if self.verbose or len(rows) <= 2:
+            for row in rows:
+                self._print_tool(row)
+        else:
+            names = ", ".join(dict.fromkeys(row.name for row in rows))
+            self._write(f"{self.INDENT}[cyan]\u25b8 activity[/cyan] [dim]({len(rows)} tools \u00b7 "
+                        f"{activity.elapsed:.1f}s)[/dim] [dim]{self._escape(names)}[/dim]")
+        for row in rows:
+            if row.media:
+                self.media_rows(row.media)
+
+    def _print_tool(self, row: _ToolRow) -> None:
+        icon, style = ("\U0001f527", "cyan") if row.ok else ("\u26d4", "bold red")
+        self._write(f"{self.INDENT}  [{style}]{icon}[/{style}] {self._escape(row.summary)}")
+        if not row.ok:
+            problem = self._first_failure(row.error)
+            if problem:
+                self._write(f"{self.INDENT}    [dim]{self._escape(problem)}[/dim]")
+
+    @staticmethod
+    def _first_failure(text: str) -> str:
+        """The line that says why it failed, not the whole traceback."""
+        for line in str(text or "").splitlines():
+            stripped = line.strip()
+            if stripped and any(marker in stripped for marker in
+                                ("Error", "error", "FAILED", "failed", "exit", "Traceback")):
+                return stripped[:150]
+        return ""
+
+    def _row(self, kind: str, text: str) -> None:
+        head = (text or "").splitlines()[0] if text else ""
+        stamp = self._stamp()
+        if kind == "step":
+            self._write(f"{stamp}[bold cyan]\u25b8[/bold cyan] [dim]{self._escape(text)}[/dim]")
+        elif kind == "answer":
+            self._write(f"{stamp}[bold green]\u2713[/bold green] {self._escape(text)}")
+        elif kind == "sensor":
+            self._write(f"{self.INDENT}[bold yellow]\U0001f9ea[/bold yellow] {self._escape(head)}")
+        elif kind == "agent_spawn":
+            self._write(f"{self.INDENT}[bold cyan]\u25b8[/bold cyan] [cyan]{self._escape(head)}[/cyan]")
+        elif kind == "delegation_start":
+            self._write(f"{self.INDENT}[bold cyan]\U0001f500[/bold cyan] {self._escape(head)}")
+        elif kind == "delegation_result":
+            self._write(f"{self.INDENT}  [green]\U0001f4e8[/green] [dim]{self._escape(head)}[/dim]")
+        elif kind in ("ptc_error", "error"):
+            self._write(f"{self.INDENT}[bold red]\u26d4[/bold red] {self._escape(head)}")
+        elif kind in ("state", "loop"):
+            self._write(f"{self.INDENT}[magenta]\U0001f9ed[/magenta] [dim]{self._escape(head)}[/dim]")
+        elif kind not in ("input", "run_end", "model_output", "run_event", "agent_start"):
+            self._write(f"{self.INDENT}[dim]\u00b7 {self._escape(head)}[/dim]")
+
+    def expand(self, index: int = -1) -> str:
+        """Reprint one retained activity with every row in full."""
+        if not self._groups:
+            return "Nothing to expand yet."
+        try:
+            group = self._groups[index]
+        except IndexError:
+            return f"No activity {index}."
+        lines = [f"{len(group.rows)} tool call(s) \u00b7 {group.elapsed:.1f}s"]
+        for row in group.rows:
+            mark = "\u2713" if row.ok else "\u26d4"
+            lines.append(f"  {mark} {row.summary}")
+            if not row.ok:
+                problem = self._first_failure(row.error)
+                if problem:
+                    lines.append(f"      {problem}")
+        return "\n".join(lines)
+
 
 def _flat(text: Any) -> str:
     """Whitespace-collapsed text."""
@@ -83,24 +556,24 @@ class TraceBus:
     capture_chars: int = 2000
     root: Path = TRACE_ROOT
 
-    #: Never rendered on their own (recorded only).
     BUFFERED = {"tool_call"}
     SILENT = {"model_output", "ptc_result", "ptc_call", "ptc", "response", "run_event"}
 
     def __init__(self, role: str = "", enabled: Optional[bool] = None,
-                 capture_chars: Optional[int] = None, root: Optional[Path] = None) -> None:
+                 capture_chars: Optional[int] = None, root: Optional[Path] = None,
+                 renderer: Optional["ActivityRenderer"] = None) -> None:
         self.role = role
         self.enabled = bool(load_config().trace_enabled) if enabled is None else bool(enabled)
         self.paint = True
         self.capture_chars = int(capture_chars or 2000)
         self.root = Path(root or TRACE_ROOT)
         self.run_id = ""
+        self.renderer = renderer
         self._pending: Dict[str, _PendingCall] = {}
         self._seen: set[str] = set()
         self._step = 0
         self._records = 0
 
-    # -- wiring ---------------------------------------------------------
     def bind(self, run_id: str) -> None:
         """Point the bus at a run so records have somewhere to land."""
         self.run_id = run_id or ""
@@ -114,23 +587,26 @@ class TraceBus:
     def path(self) -> Optional[Path]:
         return self.root / f"{self.run_id}.jsonl" if self.run_id else None
 
-    # -- recording ------------------------------------------------------
-    def _record(self, kind: str, role: str, text: str, data: Dict[str, Any]) -> None:
+    def _record(self, kind: str, role: str, text: str, data: Dict[str, Any],
+                limit: Optional[int] = None) -> None:
         path = self.path
         if path is None:
             return
+        cut = self.capture_chars if limit is None else int(limit)
+        body = str(text or "")
+        if cut > 0:
+            body = body[:cut]
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as handle:
                 record = {"ts": round(time.time(), 3), "run_id": self.run_id,
                           "step": self._step, "kind": kind, "role": role,
-                          "text": str(text or "")[: self.capture_chars], **data}
+                          "text": body, **data}
                 handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
             self._records += 1
         except Exception:
             logging.getLogger(__name__).debug("Trace record failed", exc_info=True)
 
-    # -- public API -----------------------------------------------------
     def emit(self, kind: str, role: str = "", text: str = "", *, paint: bool = True, **data: Any) -> None:
         """Record an event and render it exactly once."""
         if not self.enabled:
@@ -144,14 +620,35 @@ class TraceBus:
         self._record(kind, role, body, dict(data))
         if not paint or not self.paint or kind in self.SILENT or kind in self.BUFFERED:
             return
+        self._paint(role, kind, body, dict(data))
+        logging.getLogger(__name__).info("%s%s: %s", self._where(), kind.upper(), _flat(body)[:400])
+
+    def _paint(self, role: str, kind: str, body: str, data: Dict[str, Any]) -> None:
+        """Render through the attached renderer, else straight to the terminal."""
+        if self.renderer is not None:
+            try:
+                self.renderer.event(role, kind, body, data)
+                return
+            except Exception:
+                logging.getLogger(__name__).debug("Trace renderer failed", exc_info=True)
         trace_line(role, kind, body)
-        logging.getLogger(__name__).info("%s: %s", kind.upper(), _flat(body)[:400])
+
+    def _where(self) -> str:
+        """``run_id:step`` so a log line joins its JSONL record."""
+        if not self.run_id:
+            return ""
+        return f"[{self.run_id[:8]}:{self._step}] "
 
     def record(self, kind: str, role: str = "", text: str = "", **data: Any) -> None:
-        """Persist an event without rendering or logging it."""
+        """Persist an event; ``run_event`` details also land in ``agent.log``."""
         if not self.enabled:
             return
         self._record(kind, role or self.role, str(text or ""), dict(data))
+        event = data.get("run_event") or {}
+        if kind == "run_event" and isinstance(event, dict) and event.get("type") == "model_output":
+            body = str(event.get("output") or "")
+            if body:
+                logging.getLogger(__name__).info("%sMODEL_OUTPUT:\n%s", self._where(), body)
 
     def tool_call(self, call_id: str, name: str, args: Dict[str, Any]) -> None:
         """Buffer a call; it renders with its result."""
@@ -180,26 +677,29 @@ class TraceBus:
             kind = "tool_error"
             reason = _flat(error)[:110]
             line = f"{name} {summary} · {reason}".strip() if summary else f"{name} · {reason}"
-        self._record(kind, self.role, line, {"call_id": call_id, "name": name, "ok": ok,
-                                             "duration": round(elapsed, 4),
-                                             "chars": len(str(output or ""))})
+        data = {"call_id": call_id, "name": name, "ok": ok, "duration": round(elapsed, 4),
+                "chars": len(str(output or "")),
+                "media": Media.paths(output) if ok else []}
+        self._record(kind, self.role, line, data)
         if self.paint:
-            trace_line(self.role, kind, line)
-        logging.getLogger(__name__).info("%s: %s", kind.upper(), line[:400])
+            self._paint(self.role, kind, line, data)
+        logging.getLogger(__name__).info("%s%s: %s", self._where(), kind.upper(), line[:400])
 
     def answer(self, text: str, streamed: bool = False) -> None:
         """Record the final answer; paint a receipt only when the text is already shown."""
         if not self.enabled:
             return
-        size = len(str(text or ""))
+        body = str(text or "")
+        size = len(body)
         mark = _fingerprint("answer", self.role, f"{size}")
         if mark in self._seen:
             return
         self._seen.add(mark)
-        self._record("answer", self.role, str(text or ""), {"chars": size, "streamed": streamed})
-        if self.paint and streamed:
-            trace_line(self.role, "answer", f"answered ({size:,} chars)")
-        logging.getLogger(__name__).info("ANSWER: %d chars", size)
+        self._record("answer", self.role, body, {"chars": size, "streamed": streamed})
+        if self.paint:
+            self._paint(self.role, "answer", f"answered ({size:,} chars)",
+                        {"chars": size, "streamed": streamed})
+        logging.getLogger(__name__).info("%sANSWER: %d chars\n%s", self._where(), size, body)
 
     def close(self) -> None:
         """Flush calls whose result never arrived (interrupt, crash)."""
@@ -211,19 +711,32 @@ class TraceBus:
         return {"records": self._records, "step": self._step}
 
 
-# ─── TURN PARSING ────────────────────────────────────────────────────────
 
-SHORTHAND_RE = re.compile(r"^\s*::(?:(?:tool|call)\s+)?([A-Za-z_][\w.-]*)\s*(.*?)\s*$")
+SHORTHAND_RE = re.compile(r"^\s*[<>\-*`|]*\s*::(?:(?:tool|call)\s+)?([A-Za-z_][\w.-]*)\s*(.*?)\s*$")
 
-#: Preferred short names on the ``::`` surface, resolved to real tool names.
 TOOL_ALIASES = {
-    "read": "read_file", "write": "write_file", "append": "append_file",
-    "edit": "edit_file", "ls": "list_files", "list": "list_files",
-    "glob": "glob_files", "grep": "grep_files", "sh": "shell",
-    "bash": "shell", "terminal": "shell", "exec": "shell",
-    "fetch": "fetch_url", "web_extract": "fetch_url", "browser": "shell",
-    "skill": "load_skill", "skills": "list_skills", "find": "find_skill",
-    "delegate": "delegate_to", "delegate_task": "delegate_to",
+    "bash": "shell", "sh": "shell", "terminal": "shell", "exec": "shell",
+    "list": "ls", "web_extract": "fetch", "browser": "shell",
+    "delegate_task": "delegate", "skills_search": "skill_hub",
+    "read_file": "read", "write_file": "write", "append_file": "append",
+    "edit_file": "edit", "list_files": "ls", "glob_files": "glob",
+    "grep_files": "grep", "get_code_skeleton": "outline", "file_skeleton": "outline",
+    "get_weather": "weather", "web_search": "web", "fetch_url": "fetch",
+    "search_memory": "recall", "add_memory": "remember", "promote_memory": "promote",
+    "remember_relation": "relate",
+    "search_tgs": "graph", "manage_todo": "todo", "delegate_to": "delegate",
+    "load_skill": "skill", "list_skills": "skills", "find_skill": "find",
+    "install_skill": "skill_install", "search_skill_hub": "skill_hub",
+    "set_external_skills": "skill_external", "add_favorite": "favorite",
+    "add_mcp_server": "mcp_add", "install_mcp_server": "mcp_install",
+    "uninstall_mcp_server": "mcp_remove", "list_mcp_servers": "mcps",
+    "search_mcp_hub": "mcp_search", "mcp_execute": "mcp",
+    "scan_tools": "tools",
+    "format_json": "pretty", "hash_string": "hash", "generate_uuid": "uuid",
+    "generate_random_string": "random", "base64_encode": "b64encode",
+    "base64_decode": "b64decode", "generate_image": "image",
+    "take_screenshot": "screenshot", "analyze_screen": "vision",
+    "mouse_click": "click", "type_text": "keys", "skeleton": "outline",
 }
 
 
@@ -249,13 +762,12 @@ XML_CHILD_RE = re.compile(
 )
 XML_WRAPPERS = {"tool", "tool_call", "call", "invoke", "function_call"}
 XML_NAME_KEYS = ("name", "tool", "function", "tool_name")
+CALL_MARKUP_RE = re.compile(r"^</?(?:tool|tool_call|call|invoke|function_call)\b", re.IGNORECASE)
 PY_FENCE_RE = re.compile(r"```python\s*\n(.*?)\n\s*```", re.DOTALL)
 JSON_FENCE_RE = re.compile(r"```(?:json)?\s*\n?\s*(\{.*?\})\s*\n?\s*```", re.DOTALL)
 
-#: Tools that end a turn instead of feeding another step.
 TERMINAL_TOOLS = {"response"}
 
-#: Text that means "unfenced Python someone meant to run".
 CODE_HINTS = ("await ", "return ", "import ", "from ", "def ", "print(",
               "for ", "while ", "with open", "async ")
 
@@ -271,13 +783,13 @@ class ToolCallSpec:
 class TurnIntent:
     """What one model message asks the loop to do."""
 
-    kind: str                    # calls | answer | retry
+    kind: str
     calls: List[ToolCallSpec] = field(default_factory=list)
     code: str = ""
     answer: str = ""
     prose: str = ""
     raw: str = ""
-    source: str = ""             # shorthand | call | xml | ptc | json | auto-ptc | prose
+    source: str = ""
     reason: str = ""
 
 def _strip_fences(text: str) -> str:
@@ -516,6 +1028,7 @@ def parse_xml_calls(text: str, names: Optional[set[str]] = None,
                 name = found.group("name").strip() if found else ""
         elif known and name not in known:
             continue
+        name = canonical_tool(name)
         if not name or (known and name not in known):
             continue
         args = attrs or _xml_args(body, specs.get(name), name in TERMINAL_TOOLS)
@@ -530,7 +1043,7 @@ def parse_xml_calls(text: str, names: Optional[set[str]] = None,
         body = tag.group("body") or ""
         if not attrs and not body.strip():
             continue
-        calls.append(ToolCallSpec(name, attrs or _xml_args(body, specs.get(name), name in TERMINAL_TOOLS), "xml"))
+        calls.append(ToolCallSpec(canonical_tool(name), attrs or _xml_args(body, specs.get(name), name in TERMINAL_TOOLS), "xml"))
     return calls
 
 def _json_calls(payload: Any, names: Optional[set[str]]) -> List[ToolCallSpec]:
@@ -546,8 +1059,8 @@ def _json_calls(payload: Any, names: Optional[set[str]]) -> List[ToolCallSpec]:
     for item in items:
         if not isinstance(item, dict):
             continue
-        name = item.get("name") or item.get("tool") or ""
-        if not isinstance(name, str) or not name:
+        name = canonical_tool(str(item.get("name") or item.get("tool") or ""))
+        if not name:
             continue
         if names is not None and name not in names:
             continue
@@ -584,17 +1097,58 @@ def looks_like_markup(text: str) -> bool:
     markup = sum(1 for l in lines if l.startswith("<") and ">" in l)
     return markup > len(lines) * 0.6
 
+def _fence_calls_tools(code: str, names: Optional[set[str]]) -> bool:
+    """True when a fenced block is a script the loop should run, not a sample.
+
+    A PTC block either calls a tool, or speaks the PTC dialect (top-level
+    ``return`` / ``await``). A pasted script defines functions and has none.
+    """
+    tools = set(names or ())
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return True
+    for node in tree.body:
+        if isinstance(node, (ast.Return, ast.Await)):
+            return True
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Await):
+            return True
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            label = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+            if label in tools:
+                return True
+    return False
+
+
 def strip_ptc(text: str, names: Optional[set[str]] = None) -> str:
-    """Prose with fenced blocks and every tool-call surface removed."""
-    lines = []
-    in_fence = False
+    """Prose with tool-call surfaces and tool-running fences removed."""
+    lines: List[str] = []
+    block: Optional[List[str]] = None
+    fence = ""
     for line in (text or "").splitlines():
-        if line.strip().startswith("```"):
-            in_fence = not in_fence
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            if block is None:
+                fence, block = stripped[3:].strip().lower(), []
+                continue
+            is_script = fence in ("python", "py") and _fence_calls_tools("\n".join(block), names)
+            if not is_script:
+                lines.append("```" + fence)
+                lines.extend(block)
+                lines.append(line)
+            fence, block = "", None
             continue
-        if in_fence or SHORTHAND_RE.match(line):
+        if block is not None:
+            block.append(line)
+            continue
+        if SHORTHAND_RE.match(line):
             continue
         lines.append(line)
+    if block is not None:
+        lines.append("```" + fence)
+        lines.extend(block)
     calls = set(names or ()) | XML_WRAPPERS
     return XML_TAG_RE.sub(
         lambda m: "" if m.group("tag") in calls else m.group(0),
@@ -629,7 +1183,7 @@ def parse_turn(text: str, names: Optional[set[str]] = None,
         return _with_calls("xml", xml_calls, raw, names)
 
     fenced = [block for block in PY_FENCE_RE.findall(raw) if block.strip()]
-    if fenced:
+    if fenced and _fence_calls_tools("\n\n".join(fenced), names):
         return TurnIntent("calls", code="\n\n".join(fenced), prose=strip_ptc(raw, names),
                           raw=raw, source="ptc")
 
@@ -656,6 +1210,12 @@ def parse_turn(text: str, names: Optional[set[str]] = None,
     if looks_like_markup(body):
         return TurnIntent("retry", raw=raw, prose=strip_ptc(raw, names), source="markup",
                           reason="raw XML/HTML instead of prose or a tool call")
+
+    broken = next((line.strip() for line in body.splitlines()
+                   if line.strip().startswith("::") and len(line.strip()) > 2), "")
+    if broken:
+        return TurnIntent("retry", raw=raw, prose=strip_ptc(raw, names), source="broken-call",
+                          reason=f"tool call did not parse: {broken[:120]}")
 
     return TurnIntent("answer", answer=body, prose=body, raw=raw, source="prose")
 
@@ -733,11 +1293,22 @@ _HTTP_ALWAYS_RETRY = {408, 429, 500, 502, 503, 504}
 _TEXT_ALWAYS_RETRY = {"timeout", "timed out", "overloaded", "rate limit", "connection refused", "connection reset"}
 _TEXT_NEVER_RETRY = {"unauthorized", "forbidden", "not found", "invalid api key", "circuit open"}
 
+_LOCAL_BUGS = (NameError, AttributeError, ImportError, TypeError, KeyError, IndexError, SyntaxError)
+
 def _classify_error(err: Exception) -> str:
+    if isinstance(err, _LOCAL_BUGS) and not getattr(err, "status_code", None):
+        return "never"
     msg = str(err).lower()
     err_type = type(err).__name__.lower()
     if "circuitbreaker" in err_type or "circuit open" in msg:
         return "never"
+    if getattr(err, "stream_started", False):
+        return "never"
+    retryable = getattr(err, "retryable", None)
+    if retryable is False:
+        return "never"
+    if retryable is True:
+        return "always"
     status_code = getattr(err, "status_code", None) or getattr(err, "response_status", None)
     if isinstance(status_code, int):
         if status_code in _HTTP_NEVER_RETRY:
@@ -775,8 +1346,7 @@ def async_retry(retries: int = 3, delays=2.0, max_delays: float = 30.0):
     return decorator
 
 def get_system_context() -> str:
-    now = datetime.now()
-    tz = now.astimezone().tzname() or "UTC"
+    """Stable environment line; the clock lives in the volatile prompt tail."""
     shell = os.environ.get("SHELL", os.environ.get("COMSPEC", "Unknown"))
     branch = "none"
     try:
@@ -786,7 +1356,7 @@ def get_system_context() -> str:
         ).strip() or "none"
     except Exception:
         pass
-    return (f"[Time: {now:%Y-%m-%d %H:%M} {tz}] [OS: {platform.system()} {platform.release()}] [Shell: {shell}] [Project: {Path.cwd()}] [Git: {branch}]")
+    return (f"[OS: {platform.system()} {platform.release()}] [Shell: {shell}] [Project: {Path.cwd()}] [Git: {branch}]")
 
 def redact_fast(text: str) -> str:
     if not text or len(text) < 20:
@@ -805,8 +1375,63 @@ def redact_traceback(tb_text: str) -> str:
     return tb_text
 
 
-def discover_context_files(cwd: str = ".") -> str:
+def trim_context(text: str, limit: int) -> str:
+    """Trim to `limit` by section: every heading and its first lines survive."""
+    if len(text) <= limit:
+        return text
+    parts = re.split(r"(?m)^(?=#{1,3} )", text)
+    if len(parts) < 2:
+        return text[: max(0, limit - 24)] + "\n...[truncated]"
+    head, sections = parts[0], parts[1:]
+    per = max(120, (limit - len(head) - 40) // len(sections))
+    kept = [head]
+    for sec in sections:
+        kept.append(sec if len(sec) <= per else sec[: per - 20].rstrip() + "\n...[truncated]\n")
+    return "".join(kept)
+
+
+def _read_rule_file(path: Path) -> str:
+    """Read one rule file, strip frontmatter, block injection, cap the size."""
+    try:
+        raw = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"cannot read {path}: {e}")
+        return ""
+    if any(p.search(raw) for p in _INJECT_RE):
+        return f"[BLOCKED] {path.name} contains injection patterns."
+    if raw.lstrip().startswith("---"):
+        parts = raw.split("---", 2)
+        if len(parts) >= 3:
+            raw = parts[2]
+    if len(raw) > CONTEXT_MAX_CHARS:
+        raw = trim_context(raw, CONTEXT_MAX_CHARS)
+    return raw
+
+
+def _subdir_hint(base: Path, subdir: str) -> str:
+    """Rules living next to the files being touched, so a subpackage can differ."""
+    try:
+        target = (base / subdir).resolve()
+        if not str(target).startswith(str(base)) or not target.is_dir():
+            return ""
+        for name in CONTEXT_PRIORITY:
+            candidate = target / name
+            if candidate.exists():
+                raw = _read_rule_file(candidate)
+                if raw:
+                    return f"--- SUBDIRECTORY RULES ({subdir}/{name}) ---\n{raw}\n"
+    except Exception:
+        return ""
+    return ""
+
+
+def discover_context_files(cwd: str = ".", subdir: str = "") -> str:
+    """Project rules: override file first, then the chain, plus a subdirectory hint."""
     base = Path(cwd).resolve()
+    if subdir:
+        hint = _subdir_hint(base, subdir)
+        if hint:
+            return hint
     search = [base]
     cur = base.parent
     while cur != cur.parent and cur.exists():
@@ -816,25 +1441,18 @@ def discover_context_files(cwd: str = ".") -> str:
         search.append(cur)
         cur = cur.parent
     for sp in search:
+        override = sp / CONTEXT_OVERRIDE
+        if override.exists():
+            raw = _read_rule_file(override)
+            if raw:
+                return f"--- PROJECT RULES ({CONTEXT_OVERRIDE}) ---\n{raw}\n"
         for name in CONTEXT_PRIORITY:
-            t = sp / name
-            if not t.exists():
+            candidate = sp / name
+            if not candidate.exists():
                 continue
-            try:
-                raw = t.read_text(encoding="utf-8", errors="ignore")
-            except Exception as e:
-                logging.getLogger(__name__).warning(f"discover_context_files: cannot read {t}: {e}")
-                continue
-            if any(p.search(raw) for p in _INJECT_RE):
-                return f"[BLOCKED] {t} contains injection patterns. Skipped for safety."
-            if raw.lstrip().startswith("---"):
-                parts = raw.split("---", 2)
-                if len(parts) >= 3:
-                    raw = parts[2]
-            if len(raw) > CONTEXT_MAX_CHARS:
-                h, tl = int(CONTEXT_MAX_CHARS * 0.7), int(CONTEXT_MAX_CHARS * 0.2)
-                raw = raw[:h] + "\n\n...[truncated]...\n\n" + raw[-tl:]
-            return f"--- PROJECT RULES ({name}) ---\n{raw}\n"
+            raw = _read_rule_file(candidate)
+            if raw:
+                return f"--- PROJECT RULES ({name}) ---\n{raw}\n"
     logging.getLogger(__name__).info("discover_context_files: no project context files found")
     return ""
 
@@ -933,8 +1551,8 @@ class ContextCompressor:
             s = (r.get("content","") if isinstance(r,dict) else str(r)).strip()
             self._prev = s
         except Exception as e:
-            logging.getLogger(__name__).error(f"[{e} and {len(middle)} messages trimmed]")
-            return head + tail
+            logging.getLogger(__name__).error(f"compressor failed, keeping trimmed tail: {e}")
+            return head + [{"role": "user", "content": f"[{len(middle)} earlier messages trimmed: {e}]"}] + tail
         if not self._prev:
             return head + tail
         return head + [{"role": "user", "content": f"<context-summary>\n{self._prev}\n</context-summary>"}] + tail
@@ -967,7 +1585,8 @@ class ModelCatalog:
             try:
                 cls._data = json.loads(cls.CACHE.read_text())
                 cls._time = time.time() - cls.TTL + 300
-            except: pass
+            except Exception:
+                pass
         return cls._data
 
     @classmethod
@@ -1025,13 +1644,24 @@ class ModelCatalog:
         d = cls._fetch()
         pid = {"gemini": "google"}.get(provider, provider)
         models = d.get(pid, {}).get("models", {})
-        if not isinstance(models, dict): return None
+        if not isinstance(models, dict) or not models:
+            return cls._search_all(d, model_id.lower())
         e = models.get(model_id)
         if e: return e
         mi = model_id.lower()
         for mid, md in models.items():
             if mid.lower() == mi:
                 return md
+        return cls._any_provider_model(d.get(pid, {}), mi)
+
+    @staticmethod
+    def _any_provider_model(entry: dict, wanted: str) -> dict | None:
+        """Reseller providers carry no rates of their own; borrow the origin model's."""
+        models = entry.get("models")
+        if isinstance(models, dict):
+            for mid, md in models.items():
+                if isinstance(md, dict) and (mid.lower() == wanted or wanted.endswith("/" + mid.lower())):
+                    return md
         return None
 
     @classmethod
@@ -1048,6 +1678,17 @@ class ModelCatalog:
         cost = (cls.get_info(provider, model_id) or {}).get("cost") or {}
         rates = {k: float(v) for k, v in cost.items() if isinstance(v, (int, float))}
         return rates or None
+
+    @classmethod
+    def _search_all(cls, data: dict, wanted: str) -> dict | None:
+        """Last resort: find the model in any provider that publishes rates."""
+        for entry in data.values():
+            if not isinstance(entry, dict):
+                continue
+            found = cls._any_provider_model(entry, wanted)
+            if found and (found.get("cost") or {}):
+                return found
+        return None
 
     @classmethod
     def get_cost(cls, provider: str, model_id: str, input_tokens: int, output_tokens: int) -> Optional[float]:
@@ -1099,7 +1740,6 @@ def setup_logging(log_dir: Path = Path("tmp"), level: int = logging.INFO) -> Non
     efh.setLevel(logging.WARNING)
     efh.setFormatter(fmt)
     root.addHandler(efh)
-    # Transport chatter drowns the trace; keep only warnings from HTTP clients.
     for noisy in ("httpx", "httpcore", "urllib3", "asyncio", "hpack", "h2"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 

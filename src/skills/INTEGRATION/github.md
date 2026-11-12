@@ -1,8 +1,9 @@
 ---
 name: github
 description: "Git and GitHub operations: branch, commit, diff, PR, issues"
+when_not: "the repo has no git remote or the user asked for local-only work"
 tags: [git, github, commit, branch, merge, rebase, diff, pull-request, pr, issue, remote, clone, push, blame, log]
-tools: ["shell", "read_file", "grep_files", "response"]
+tools: ["shell", "read", "grep", "response"]
 contract:
   pre: {}
   post: {}

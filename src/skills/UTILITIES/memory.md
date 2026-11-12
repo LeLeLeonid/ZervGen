@@ -1,8 +1,9 @@
 ---
 name: memory
 description: "Store, recall and maintain long-term knowledge; track multi-step work"
-tags: [memory, recall, knowledge, remember, remember-this, context, todo, todos, plan, task-list, persistent]
-tools: ["add_memory", "promote_memory", "search_memory", "search_tgs", "manage_todo", "response"]
+when_not: "the fact only matters to this conversation"
+tags: [memory, recall, knowledge, remember, remember-this, context, todo, todos, plan, task-ls, persistent]
+tools: ["remember", "promote", "recall", "graph", "todo", "response"]
 contract:
   pre: {}
   post: {}
@@ -21,20 +22,20 @@ Memory has three tiers: short-term (this session), recent (distilled facts) and 
 ## Recall
 
 ```python
-hits = await search_memory(query="database schema", limit=5)
+hits = await recall(query="database schema", limit=5)
 
-graph = await search_tgs(query="how does auth reach the database", limit=3)
+graph = await graph(query="how does auth reach the database", limit=3)
 ```
 
-- `search_memory` is keyword/vector recall. Use it first for anything the user says "before", "earlier", "we decided".
-- `search_tgs` traces relationships across facts. Use it for multi-hop questions: "which module owns X", "what depends on Y".
+- `recall` is keyword/vector recall. Use it first for anything the user says "before", "earlier", "we decided".
+- `graph` traces relationships across facts. Use it for multi-hop questions: "which module owns X", "what depends on Y".
 - Results can be empty. An empty result is information: say "not in memory" instead of guessing.
 
 ## Store
 
 ```python
-await add_memory(content="Project uses SQLite through aiosqlite; no ORM.", category="fact")
-await add_memory(content="pytest must pass before any commit.", category="rule")
+await remember(content="Project uses SQLite through aiosqlite; no ORM.", category="fact")
+await remember(content="pytest must pass before any commit.", category="rule")
 ```
 
 Rules:
@@ -46,7 +47,7 @@ Rules:
 ## Maintain
 
 ```python
-await promote_memory(memory_id="abc123", new_tier="knowledge")
+await promote(memory_id="abc123", new_tier="knowledge")
 ```
 
 Promote a fact once it has proven useful more than once. Facts that are recalled and then contradicted by a failed outcome decay automatically; do not fight the pruning.
@@ -54,9 +55,9 @@ Promote a fact once it has proven useful more than once. Facts that are recalled
 ## Track work
 
 ```python
-await manage_todo(action="add", task="port PDF skill to single-file format")
-await manage_todo(action="list")
-await manage_todo(action="done", todo_id="3")
+await todo(action="add", task="port PDF skill to single-file format")
+await todo(action="ls")
+await todo(action="done", todo_id="3")
 ```
 
-Use TODOs for any task with three or more steps. Update the list as steps complete; do not batch the updates at the end, because an interrupted run loses the progress.
+Use TODOs for any task with three or more steps. Update the ls as steps complete; do not batch the updates at the end, because an interrupted run loses the progress.

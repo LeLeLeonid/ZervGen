@@ -1,3 +1,5 @@
+import copy
+import json
 import httpx
 import logging
 import os
@@ -20,10 +22,27 @@ class ProviderError(Exception):
         self.stream_started = stream_started
 
 
+_LOCAL_BUGS = (NameError, AttributeError, ImportError, TypeError, KeyError, IndexError, SyntaxError)
+
+
+def is_provider_fault(err: Exception) -> bool:
+    """True when the failure is the backend's, not a bug in our own code."""
+    if isinstance(err, _LOCAL_BUGS):
+        return False
+    return True
+
+
 class CircuitBreakerError(ProviderError):
-    def __init__(self, provider: str):
-        super().__init__(f"{provider} circuit open", retryable=False)
+    def __init__(self, provider: str, remaining: float = 0.0):
+        super().__init__(f"{provider} circuit open ({remaining:.0f}s left)", retryable=False)
         self.provider = provider
+        self.remaining = remaining
+
+
+def tool_envelope(name: str, result: Any) -> str:
+    """Tool output as data the model reads, never as its own words."""
+    body = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
+    return f'<tool_result name="{name}">\n{body}\n</tool_result>'
 
 
 def normalize_messages(history: List[Dict], system_prompt: str = "") -> List[Dict]:
@@ -33,7 +52,10 @@ def normalize_messages(history: List[Dict], system_prompt: str = "") -> List[Dic
     for msg in history or []:
         role = msg.get("role")
         content = msg.get("content")
-        if role not in ("system", "user", "assistant"):
+        if role == "tool":
+            content = tool_envelope(msg.get("name") or "tool", content)
+            role = "user"
+        elif role not in ("system", "user", "assistant"):
             role = "assistant"
         if isinstance(content, list):
             content = "".join(str(p.get("text", "")) if isinstance(p, dict) else str(p) for p in content)
@@ -76,6 +98,27 @@ def raise_for_status(response: httpx.Response, provider: str) -> None:
         body = ""
     retryable = response.status_code in (408, 409, 425, 429) or response.status_code >= 500
     raise ProviderError(f"{provider} HTTP {response.status_code}: {body}", status_code=response.status_code, retryable=retryable)
+
+
+MIME_BY_SUFFIX = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                  ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp"}
+
+
+def _media_type(source: str) -> str:
+    return MIME_BY_SUFFIX.get(os.path.splitext(source.split("?")[0].lower())[1], "image/png")
+
+
+async def load_image(source: str) -> tuple[bytes, str]:
+    """Image bytes and MIME type from a local path or an http(s) URL."""
+    if not source:
+        raise ProviderError("No image supplied", retryable=False)
+    if source.startswith(("http://", "https://")):
+        response = await get_http_client().get(source, follow_redirects=True)
+        if response.status_code != 200:
+            raise ProviderError(f"Image fetch failed: HTTP {response.status_code}", status_code=response.status_code)
+        return response.content, response.headers.get("content-type", "").split(";")[0] or _media_type(source)
+    with open(source, "rb") as handle:
+        return handle.read(), _media_type(source)
 
 
 def is_local_url(url: Optional[str]) -> bool:
@@ -130,8 +173,8 @@ class CircuitBreaker:
 _circuit_breaker = CircuitBreaker()
 
 
-#: Providers whose wire format carries native tool definitions.
-NATIVE_TOOL_PROVIDERS = {"openai", "anthropic", "gemini", "google", "openrouter"}
+NATIVE_TOOL_PROVIDERS = {"openai", "anthropic", "gemini", "google", "openrouter",
+                         "deepseek", "omnirouter"}
 
 
 class AIProvider:
@@ -143,7 +186,7 @@ class AIProvider:
         self.base_url = (base_url or "").rstrip("/")
         self.api_key = api_key or ""
         self.native_tools: List[Dict[str, Any]] = []
-        self.native_calls: List[Dict[str, Any]] = []
+        self.native_calls = []
         self.headers = dict(headers) if headers is not None else {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -152,21 +195,53 @@ class AIProvider:
         self.timeout = httpx.Timeout(timeout, connect=5.0)
         self._reset_usage()
 
+    def clone(self) -> "AIProvider":
+        """An independent provider per agent: call state must never be shared."""
+        twin = copy.copy(self)
+        twin.native_tools = list(self.native_tools or [])
+        twin._reset_usage()
+        return twin
+
     def _reset_usage(self) -> None:
-        self._last_usage: Dict[str, Any] = {}
+        self._last_usage = {}
         self._last_cost = 0.0
-        self.native_calls: List[Dict[str, Any]] = []
+        self.native_calls = []
 
     def _preflight(self) -> None:
         self._reset_usage()
         if not _circuit_breaker.is_available(self.name):
-            raise CircuitBreakerError(self.name)
+            raise CircuitBreakerError(self.name, _circuit_breaker.remaining(self.name))
 
     def _succeed(self) -> None:
         _circuit_breaker.record_success(self.name)
 
     def _fail(self) -> None:
         _circuit_breaker.record_failure(self.name)
+
+    def request_timeout(self, default: float) -> float:
+        """Ceiling for one provider call, widened for models that reason first."""
+        try:
+            if self._is_reasoning_model():
+                return max(float(default), 180.0)
+        except Exception:
+            pass
+        return float(default)
+
+    def _guard_stream(self, on_token):
+        """Relay tokens while remembering whether any reached the screen.
+
+        A request whose text was already painted must never be retried: the
+        second attempt would print the answer twice. Callers mark the failure
+        ``stream_started`` and the retry policy then refuses to retry it.
+        """
+        state = {"emitted": False}
+
+        def relay(text: str) -> None:
+            if text:
+                state["emitted"] = True
+            on_token(text)
+
+        return relay, state
 
     def _estimate_cost(self, input_tokens: int, output_tokens: int) -> float:
         """Cost in USD from the catalog; local and unknown models are free."""
@@ -297,7 +372,7 @@ def get_provider(name: str, settings) -> AIProvider:
         module = __import__(NATIVE_PROVIDERS[key], fromlist=["Provider"])
         section = getattr(settings, _section_name(key), settings)
         provider = module.Provider(section)
-        chosen = (getattr(settings, "provider_models", None) or {}).get(key)
+        chosen = _tier_model(settings, key) or (getattr(settings, "provider_models", None) or {}).get(key)
         if chosen:
             provider.model = chosen
         return provider
@@ -365,7 +440,8 @@ def _parse_models(data) -> List[str]:
             identifier = item
         if not identifier:
             continue
-        names.append(str(identifier).split("/", 1)[-1])
+        name = str(identifier)
+        names.append(name[len("models/"):] if name.startswith("models/") else name)
     return sorted(set(names))
 
 
@@ -380,7 +456,7 @@ def list_live_models(provider_name: str, settings=None) -> List[str]:
         response.raise_for_status()
         return _parse_models(response.json())
     except Exception as exc:
-        logger.debug("%s model listing failed: %s", key, exc)
+        logger.warning("%s model listing failed, falling back to the local catalog: %s", key, exc)
         return []
 
 

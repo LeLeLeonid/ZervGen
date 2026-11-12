@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 import asyncio
 import inspect
 import json
@@ -22,6 +22,7 @@ class RunStatus(str, Enum):
     STOPPED = "stopped"
     MAX_STEPS = "max_steps"
     TIMEOUT = "timeout"
+    BUDGET = "budget"
 
 
 class TaskStatus(str, Enum):
@@ -178,7 +179,7 @@ class Budget:
     max_tool_calls: int = 200
     max_delegations: int = 12
     max_parallel_agents: int = 4
-    max_file_writes: int = 0
+    max_file_writes: int = 20
     steps: int = 0
     tool_calls: int = 0
     delegations: int = 0
@@ -300,11 +301,28 @@ class Session:
             current = entry.get("parent_id")
         return list(reversed(chain))
 
+    def _chain_ids(self) -> List[str]:
+        """Entry ids from root to leaf."""
+        ids = []
+        current = self._leaf
+        while current and current in self._entries:
+            ids.append(current)
+            current = self._entries[current].get("parent_id")
+        return list(reversed(ids))
+
     def reset(self, messages: List[Dict[str, Any]]) -> None:
-        """Start a fresh branch from the given messages."""
-        self._leaf = None
+        """Rebuild the branch, recording only messages the branch does not have."""
+        existing = self.active_branch()
+        shared = 0
+        for old, new in zip(existing, messages):
+            if old.get("role") != new.get("role") or old.get("content") != new.get("content"):
+                break
+            shared += 1
+        ids = self._chain_ids()
+        self._leaf = ids[shared - 1] if shared else None
         list.clear(self.messages)
-        for message in messages:
+        list.extend(self.messages, messages[:shared])
+        for message in messages[shared:]:
             self.messages.append(message)
 
     def compact(self, summary: str, keep: int = 8) -> None:
@@ -371,10 +389,12 @@ class PermissionPolicy:
     """Allow/ask/deny decided in code; the prompt only describes it."""
 
     ALWAYS_DENY = {"eval", "exec", "compile", "__import__"}
-    RISKY = {"shell", "write_file", "append_file", "edit_file", "delete_file",
-             "add_mcp_server", "mcp_execute", "delegate_to", "mouse_click", "type_text"}
-    BUILD_ONLY = {"write_file", "append_file", "edit_file", "delete_file", "shell",
-                  "add_mcp_server", "mcp_execute"}
+    RISKY = {"shell", "write", "append", "edit",
+             "mcp_add", "mcp", "delegate", "click", "keys",
+             "set_mode"}
+    BUILD_ONLY = {"write", "append", "edit", "shell",
+                  "mcp_add", "mcp", "set_mode"}
+    SCOPE_KEYS = ("path", "file_path", "directory", "target", "filename", "cwd")
 
     def __init__(self, permission_mode: str = "ASK", mode: str = "BUILD", roots: Optional[List[str]] = None):
         """Bind mode, permission level and allowed roots."""
@@ -389,21 +409,54 @@ class PermissionPolicy:
         """Whether a tool needs confirmation."""
         return tool_name in self.RISKY or self.is_mcp(tool_name)
 
+    def _outside(self, value: str) -> bool:
+        try:
+            resolved = Path(value).expanduser().resolve()
+        except Exception:
+            return False
+        return not any(resolved == root or root in resolved.parents for root in self.roots)
+
+    @classmethod
+    def _scoped_values(cls, value: Any, depth: int = 0) -> List[str]:
+        """Path-like strings anywhere in an argument tree, MCP payloads included."""
+        if depth > 4:
+            return []
+        if isinstance(value, str):
+            text = value.strip()
+            if text[:1] in ("{", "["):
+                try:
+                    return cls._scoped_values(json.loads(text), depth + 1)
+                except (json.JSONDecodeError, TypeError):
+                    return []
+            return []
+        if isinstance(value, dict):
+            found = []
+            for key, item in value.items():
+                if key in cls.SCOPE_KEYS and isinstance(item, str) and item:
+                    found.append(item)
+                elif isinstance(item, (dict, list)):
+                    found.extend(cls._scoped_values(item, depth + 1))
+            return found
+        if isinstance(value, list):
+            found = []
+            for item in value:
+                found.extend(cls._scoped_values(item, depth + 1))
+            return found
+        return []
+
     def check_scope(self, args: Dict[str, Any]) -> Optional[str]:
-        """Reject paths outside the allowed roots."""
+        """Reject paths outside the allowed roots, including nested tool payloads."""
         if not self.roots:
             return None
-        for key in ("path", "file_path", "directory", "target"):
-            value = args.get(key)
-            if not isinstance(value, str) or not value:
-                continue
-            try:
-                resolved = Path(value).expanduser().resolve()
-            except Exception:
-                continue
-            if not any(resolved == root or root in resolved.parents for root in self.roots):
+        for value in self._scoped_values(args):
+            if self._outside(value):
                 return f"Error: path outside allowed roots: {value}"
         return None
+
+    @staticmethod
+    def _shell_paths(command: str) -> List[str]:
+        """Absolute paths a shell command names, quoted segments included."""
+        return re.findall(r"(?:^|[\s'\"=:])((?:~|/)[^\s'\";|&)]*)", str(command or ""))
 
     def decide(self, tool_name: str, args: Dict[str, Any]) -> str:
         """Resolve a tool call to allow, ask or deny."""
@@ -413,6 +466,10 @@ class PermissionPolicy:
             return "deny"
         if self.check_scope(args):
             return "deny"
+        scoped_outer = tool_name == "shell" and self.roots and any(
+            self._outside(path) for path in self._shell_paths(args.get("command", "")))
+        if scoped_outer:
+            return "deny" if self.permission_mode == "DENY" else "ask"
         if self.permission_mode == "AUTO":
             return "allow"
         if self.permission_mode == "DENY":
@@ -425,6 +482,12 @@ class ToolRuntime:
 
     MAX_LINES = 2000
     MAX_CHARS = 50_000
+
+    def with_hooks(self, hooks: Optional[Any], fail_closed: bool = False) -> "ToolRuntime":
+        """Attach pre/post shell hooks and return self for chaining."""
+        self.hooks = hooks
+        self.hooks_fail_closed = bool(fail_closed)
+        return self
 
     def __init__(self, tools: Dict[str, Any], policy: PermissionPolicy, run: Optional["Run"] = None,
                  timeout: float = 60.0, agent: str = "agent",
@@ -439,6 +502,8 @@ class ToolRuntime:
         self.tools = tools
         self.policy = policy
         self.run = run
+        self.hooks: Optional[Any] = getattr(on_event, "hooks", None)
+        self.hooks_fail_closed = bool(getattr(on_event, "hooks_fail_closed", False))
         self.timeout = float(timeout or 60)
         self.agent = agent
         self.on_event = on_event
@@ -450,24 +515,27 @@ class ToolRuntime:
         """Truncate output and spill the full copy to disk."""
         if not text:
             return text
-        truncated = False
+        original = len(text)
+        original_text = text
+        reasons = []
         lines = text.splitlines()
         if len(lines) > self.MAX_LINES:
             text = "\n".join(lines[: self.MAX_LINES])
-            truncated = True
+            reasons.append(f"{len(lines)} lines > {self.MAX_LINES}")
         if len(text) > self.MAX_CHARS:
             text = text[: self.MAX_CHARS]
-            truncated = True
-        if not truncated:
+            reasons.append(f"{original} chars > {self.MAX_CHARS}")
+        if not reasons:
             return text
+        note = f"[truncated: {', '.join(reasons)}"
         try:
             self.spill_dir.mkdir(parents=True, exist_ok=True)
             slug = re.sub(r"[^a-zA-Z0-9_]+", "_", name)[:32] or "output"
             path = self.spill_dir / f"{slug}_{int(time.time() * 1000)}.txt"
-            path.write_text(text, encoding="utf-8", errors="replace")
-            return f"{text}\n\n[truncated: {self.MAX_CHARS} chars / {self.MAX_LINES} lines; full copy: {path}]"
+            path.write_text(original_text, encoding="utf-8", errors="replace")
+            return f"{text}\n\n{note}; full copy: {path}]"
         except Exception:
-            return f"{text}\n\n[truncated: {self.MAX_CHARS} chars / {self.MAX_LINES} lines]"
+            return f"{text}\n\n{note}]"
 
     def _emit(self, kind: str, **kwargs) -> None:
         """Forward an event without letting it break the call."""
@@ -484,11 +552,12 @@ class ToolRuntime:
         started = time.monotonic()
         func = self.tools.get(name)
         if func is None:
-            return ToolResult(call_id, False, error=f"Error: Tool '{name}' not found")
+            return self._finish(call_id, False, error=f"Error: Tool '{name}' not found",
+                                started=started, name=name)
         decision = self.policy.decide(name, args)
         if decision == "deny":
             reason = self.policy.check_scope(args) or f"Error: {name} denied by policy."
-            return ToolResult(call_id, False, error=reason)
+            return self._finish(call_id, False, error=reason, started=started, name=name)
         if decision == "ask":
             allowed = False
             if self.on_permission is not None:
@@ -498,9 +567,19 @@ class ToolRuntime:
                 except Exception:
                     allowed = False
             if not allowed:
-                return ToolResult(call_id, False, error=f"Error: user denied {name}.")
+                return self._finish(call_id, False, error=f"Error: user denied {name}.",
+                                    started=started, name=name)
         if self.run is not None and not self.run.budget.tool():
-            return ToolResult(call_id, False, error="Error: Tool-call budget exhausted")
+            return self._finish(call_id, False, error="Error: Tool-call budget exhausted",
+                                started=started, name=name)
+        if self.hooks:
+            try:
+                blocked = await self.hooks("pre_tool_call", name, args)
+            except Exception:
+                blocked = "hook crashed (fail_closed)" if self.hooks_fail_closed else None
+            if blocked:
+                return self._finish(call_id, False, error=f"Error: blocked by hook: {blocked}",
+                                    started=started, name=name)
         call = ToolCall(call_id, name, dict(args), self.agent)
         if self.run is not None:
             self.run.tool_calls.append(call)
@@ -525,6 +604,8 @@ class ToolRuntime:
         except Exception as exc:
             return self._finish(call_id, False, error=f"Error: Tool '{name}' failed: {exc}", started=started, name=name)
         text = value if isinstance(value, str) else (json.dumps(value, ensure_ascii=False) if value is not None else "")
+        if self.hooks:
+            await self.hooks("post_tool_call", name, {**args, "_result": text[:2000]})
         return self._finish(call_id, True, output=self.cap(text, name), started=started, name=name)
 
     def _finish(self, call_id: str, success: bool, output: Any = None, error: Optional[str] = None,
@@ -566,7 +647,7 @@ class Compactor:
         return count_tokens(messages, "")[0]
 
     async def compact(self, messages: List[Dict[str, Any]], budget: int, keep: int = 8) -> List[Dict[str, Any]]:
-        """Trim a message list to a budget, keeping the tail."""
+        """Trim a message list to a budget, keeping the tail and the user's own words."""
         if self.used(messages) <= budget:
             return messages
         tail = messages[-keep:] if keep > 0 else []
@@ -574,14 +655,27 @@ class Compactor:
         summary = await self._summarize(middle, budget)
         if self.session is not None:
             self.session.compact(summary, keep=keep)
-        return [{"role": "system", "content": f"<context-summary>\n{summary}\n</context-summary>"}] + tail
+        head = f"<context-summary>\n{summary}\n</context-summary>"
+        spec = self._specification(middle)
+        if spec:
+            head += f"\n<user-specification>\n{spec}\n</user-specification>"
+        return [{"role": "system", "content": head}] + tail
+
+    @staticmethod
+    def _specification(middle: List[Dict[str, Any]]) -> str:
+        """The user's own words, verbatim, so the goal cannot drift."""
+        asked = [str(m.get("content", "")).strip() for m in middle if m.get("role") == "user"]
+        return "\n".join(a[:600] for a in [a for a in asked if a][-3:])
 
     async def _summarize(self, middle: List[Dict[str, Any]], budget: int) -> str:
-        """Build a structured checkpoint for elided turns."""
+        """Build a structured checkpoint from what the user asked and what tools returned."""
         if not middle:
             return self._summary
+        seen = [m for m in middle if m.get("role") != "assistant"]
+        if not seen:
+            return f"Earlier context elided ({len(middle)} messages)."
         transcript = "\n".join(
-            f"[{m.get('role', '?')}]: {str(m.get('content', ''))[:600]}" for m in middle
+            f"[{m.get('role', '?')}]: {str(m.get('content', ''))[:600]}" for m in seen
         )[-max(4_000, budget * 2):]
         prompt = (
             "Checkpoint the conversation above. Keep, in this order: goal, done, decided, open, files touched. "

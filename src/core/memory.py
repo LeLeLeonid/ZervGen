@@ -4,7 +4,6 @@ import logging
 import os
 import re
 import sqlite3
-import tempfile
 import time
 import uuid
 import random
@@ -16,7 +15,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from threading import Lock
 
-import yaml
 from src.config import MAX_SHORT_TERM, EVOLUTION_DIR, load_config
 
 logger = logging.getLogger(__name__)
@@ -38,12 +36,13 @@ class SessionDB:
         return asyncio.get_running_loop().run_in_executor(self._executor, func, *args)
 
     def _init_db(self) -> None:
-        conn = sqlite3.connect(str(self._db_path))
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA cache_size=10000")
-        conn.execute("PRAGMA mmap_size=30000000000")
-        conn.execute("PRAGMA temp_store=MEMORY")
+        self._conn = sqlite3.connect(str(self._db_path), timeout=10.0, check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA cache_size=10000")
+        self._conn.execute("PRAGMA mmap_size=268435456")
+        self._conn.execute("PRAGMA temp_store=MEMORY")
+        conn = self._conn
         conn.execute("""
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
@@ -55,7 +54,6 @@ class SessionDB:
                 message_count INTEGER DEFAULT 0
             )
         """)
-        # Ensure last_grade column exists for session quality tracking
         try:
             conn.execute("ALTER TABLE sessions ADD COLUMN last_grade REAL DEFAULT 0.0")
         except sqlite3.OperationalError:
@@ -103,15 +101,12 @@ class SessionDB:
     def _retry(self, func, *args, **kwargs):
         for attempt in range(self.MAX_RETRIES):
             acquired = False
+            delay = 0.0
             try:
                 self._lock.acquire()
                 acquired = True
-                conn = sqlite3.connect(str(self._db_path), timeout=10.0)
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA synchronous=NORMAL")
-                result = func(conn, *args, **kwargs)
-                conn.commit()
-                conn.close()
+                result = func(self._conn, *args, **kwargs)
+                self._conn.commit()
                 return result
             except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
                 if attempt >= self.MAX_RETRIES - 1 or "lock" not in str(e).lower():
@@ -120,7 +115,6 @@ class SessionDB:
             finally:
                 if acquired:
                     self._lock.release()
-                    acquired = False
             time.sleep(delay)
         raise RuntimeError(f"SessionDB: Failed after {self.MAX_RETRIES} retries")
 
@@ -214,7 +208,6 @@ class SessionDB:
             row = cursor.fetchone()
             if not row:
                 return None
-            #TODO: fix last_grade madness
             session = {"id": row[0], "provider": row[1], "model": row[2], "title": row[3], "started_at": row[4], "ended_at": row[5], "message_count": row[6], "last_grade": row[7] if len(row) > 7 else 0.0}
             cursor.execute("SELECT role, content, tool_name, timestamp FROM messages WHERE session_id = ? ORDER BY timestamp ASC", (session_id,))
             session["messages"] = [{"role": r, "content": c, "tool_name": t, "timestamp": ts} for r, c, t, ts in cursor.fetchall()]
@@ -263,14 +256,116 @@ class SessionDB:
         return self._retry(_stats)
 
     def close(self) -> None:
-        pass  # WAL mode handles checkpoints automatically
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+
+
+ENTITY_RE = re.compile(
+    r"\b[A-Z][A-Za-z0-9]{2,}\b"
+    r"|\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b"
+    r"|\b[a-z0-9]+\.[a-z0-9]+\b"
+    r"|`[^`\n]{2,40}`"
+)
+MAX_EDGES = 20_000
+
+
+def entities(text: str, limit: int = 12) -> List[str]:
+    """Entity-ish spans in a fact, deduped and bounded."""
+    found = []
+    for match in ENTITY_RE.finditer(str(text or "")):
+        token = match.group(0).strip("`")
+        if token and token not in found:
+            found.append(token)
+        if len(found) >= limit:
+            break
+    return found
 
 
 class KnowledgeGraph:
     def __init__(self, kg_file: Path):
         self._kg_file = kg_file
-        self._data: Dict[str, Any] = {"facts": []}
+        self._data: Dict[str, Any] = {"facts": [], "edges": {}, "edge_facts": {}}
+        self._dirty = False
         self._load()
+
+    def add_edge(self, src: str, rel: str, dst: str, fact_id: str = "", weight: float = 1.0) -> None:
+        """Typed relation; ``rel`` is free text so the model can name it."""
+        src, dst = str(src).strip(), str(dst).strip()
+        if not src or not dst or src == dst:
+            return
+        rel = str(rel or "related").strip() or "related"
+        row = self._data.setdefault("edges", {}).setdefault(src, {})
+        key = f"{rel}|{dst}"
+        row[key] = round(row.get(key, 0.0) + weight, 3)
+        back = self._data["edges"].setdefault(dst, {})
+        back[f"{rel}|{src}"] = round(back.get(f"{rel}|{src}", 0.0) + weight, 3)
+        if fact_id:
+            self._data.setdefault("edge_facts", {}).setdefault(f"{src}|{rel}|{dst}", fact_id)
+        self._dirty = True
+
+    def mark_dirty(self) -> None:
+        self._dirty = True
+
+    def _edge(self, src: str, dst: str, rel: str = "co_occurs", weight: float = 1.0) -> None:
+        self.add_edge(src, rel, dst, weight=weight)
+
+    def link(self, fact: Dict) -> None:
+        """Attach a fact to its entities and those entities to each other."""
+        names = entities(fact.get("content", ""))
+        node = f"fact:{fact.get('id', '')}"
+        for name in names:
+            self.add_edge(node, "mentions", name, fact.get("id", ""))
+        for i, a in enumerate(names):
+            for b in names[i + 1:]:
+                self.add_edge(a, "co_occurs", b, fact.get("id", ""))
+        self._trim_edges()
+
+    def _trim_edges(self) -> None:
+        edges = self._data.get("edges", {})
+        if sum(len(row) for row in edges.values()) <= MAX_EDGES:
+            return
+        ranked = sorted(((w, src, key) for src, row in edges.items() for key, w in row.items()),
+                        reverse=True)[:MAX_EDGES]
+        kept: Dict[str, Dict[str, float]] = {}
+        for weight, src, key in ranked:
+            kept.setdefault(src, {})[key] = weight
+        self._data["edges"] = kept
+
+    def neighbors(self, term: str, limit: int = 8) -> List[tuple]:
+        """Strongest neighbours of one node as ``(rel, name, weight)``."""
+        row = self._data.get("edges", {}).get(term, {})
+        out = []
+        for key, weight in row.items():
+            rel, _, name = key.partition("|")
+            out.append((rel or "related", name, weight))
+        out.sort(key=lambda item: -item[2])
+        return out[:limit]
+
+    def nodes(self) -> set:
+        return set(self._data.get("edges", {}))
+
+    def paths(self, seeds: List[str], max_hops: int = 2, limit: int = 5) -> List[List[str]]:
+        """Shortest entity paths from each seed, breadth first."""
+        out: List[List[str]] = []
+        for seed in seeds:
+            queue = deque([[seed]])
+            seen = {seed}
+            while queue and len(out) < limit:
+                path = queue.popleft()
+                if len(path) > max_hops:
+                    continue
+                for _rel, nxt, _weight in self.neighbors(path[-1], limit=6):
+                    if nxt in seen or nxt.startswith("fact:"):
+                        continue
+                    seen.add(nxt)
+                    full = path + [nxt]
+                    out.append(full)
+                    if len(out) >= limit:
+                        break
+                    queue.append(full)
+        return out
 
     def _load(self) -> None:
         if self._kg_file.exists():
@@ -279,18 +374,38 @@ class KnowledgeGraph:
                     self._data = json.load(f)
             except Exception as e:
                 logger.warning(f"Failed to load KG: {e}")
-                self._data = {"facts": []}
+                self._data = {"facts": [], "edges": {}, "edge_facts": {}}
+            self._data.setdefault("edges", {})
+            self._data.setdefault("edge_facts", {})
 
     def save(self) -> None:
+        if not self._dirty:
+            return
+        temp = None
         try:
             self._kg_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(self._kg_file, "w", encoding="utf-8") as f:
+            temp = self._kg_file.with_suffix(".tmp")
+            with open(temp, "w", encoding="utf-8") as f:
                 json.dump(self._data, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp, self._kg_file)
+            self._dirty = False
         except Exception as e:
             logger.error(f"Failed to save KG: {e}")
+            if temp is not None:
+                try:
+                    temp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def flush(self) -> None:
+        self.save()
 
     def add_fact(self, fact: Dict) -> None:
         self._data.setdefault("facts", []).append(fact)
+        self.link(fact)
+        self._dirty = True
 
     def get_facts(self, tier: Optional[str] = None) -> List[Dict]:
         facts = self._data.get("facts", [])
@@ -300,6 +415,12 @@ class KnowledgeGraph:
         facts = self._data.get("facts", [])
         original_len = len(facts)
         self._data["facts"] = [f for f in facts if f.get("id") != fact_id]
+        node = f"fact:{fact_id}"
+        edges = self._data.get("edges", {})
+        edges.pop(node, None)
+        for row in edges.values():
+            row.pop(node, None)
+        self._dirty = True
         return len(self._data["facts"]) < original_len
 
     def dedupe(self) -> int:
@@ -312,6 +433,8 @@ class KnowledgeGraph:
                 unique.append(f)
         removed = len(self._data.get("facts", [])) - len(unique)
         self._data["facts"] = unique
+        if removed:
+            self._dirty = True
         return removed
 
 
@@ -331,16 +454,28 @@ class VectorStore:
             except ImportError:
                 return
         try:
+            from chromadb.config import is_thin_client
+        except ImportError:
+            is_thin_client = False
+        if is_thin_client:
+            logger.debug("Vector search off: chromadb-client cannot persist locally")
+            return
+        try:
             self._vector_dir.mkdir(parents=True, exist_ok=True)
             self._client = chromadb.PersistentClient(path=str(self._vector_dir))
             self._collection = self._client.get_or_create_collection("zervgen_facts")
         except Exception as e:
-            logger.warning(f"VectorStore init failed: {e}")
+            logger.debug(f"VectorStore init failed: {e}")
 
     def add(self, documents: List[str], metadatas: List[Dict], ids: List[str]) -> None:
         if not self._collection: return
         try: self._collection.add(documents=documents, metadatas=metadatas, ids=ids)
         except Exception as e: logger.debug(f"Vector add failed: {e}")
+
+    def delete(self, ids: List[str]) -> None:
+        if not self._collection or not ids: return
+        try: self._collection.delete(ids=ids)
+        except Exception as e: logger.debug(f"Vector delete failed: {e}")
 
     def search(self, query: str, n: int = 10) -> List[Dict]:
         """Return nearest stored facts with their ids."""
@@ -430,7 +565,7 @@ class MemoryCore:
         self._session_db = SessionDB()
         self._min_grade = float(getattr(load_config(), "min_session_grade", 0.0) or 0.0)
         self._active_session_id: Optional[str] = None
-        self._triggered_this_session: set = set()  # track auto-injected skills per session
+        self._triggered_this_session: set = set()
         self._rebuild_bm25()
 
     def _rebuild_bm25(self):
@@ -470,6 +605,7 @@ class MemoryCore:
             fact["outcomes"] = seen + 1
             fact["wins"] = wins
             fact["success_rate"] = wins / (seen + 1)
+        self._kg.mark_dirty()
         self._kg.save()
 
     def inject_context(self, query: str, limit: int = 5, trusted_sources=None) -> str:
@@ -504,61 +640,31 @@ class MemoryCore:
         return "\n".join(selected)
 
     def search_tgs(self, query: str, limit: int = 3) -> str:
-        facts = self._kg.get_facts()
-        if len(facts) < 500 and facts:
-            text_hits = self.search_memory(query, limit=limit*2)
-            if not text_hits:
-                return ""
-            import re
-            term_pat = re.compile(r'\b[A-Z][a-z]{2,}\b|"[^"]+"|\'[^\']+\'|\b[a-z]{4,}\b')
-            adj, fact_terms = {}, {}
-            for f in facts:
-                content = f.get("content", "")
-                terms = list(set(term_pat.findall(content)))
-                fact_terms[f.get("id", id(f))] = terms
-                for t in terms:
-                    adj.setdefault(t, set()).update(terms)
-                    adj[t].discard(t)
-            query_terms = set(term_pat.findall(query))
-            seeds = [t for t in query_terms if t in adj][:3]
-            if seeds:
-                paths, visited = [], set()
-                queue = [(s, [s]) for s in seeds]
-                while queue and len(paths) < 5:
-                    node, path = queue.pop(0)
-                    if len(path) > 2:
-                        visited.add(node)
-                        continue
-                    for nb in adj.get(node, []):
-                        if nb not in path:
-                            new_path = path + [nb]
-                            if len(new_path) == 2:
-                                paths.append(new_path)
-                            else:
-                                queue.append((nb, new_path))
-                path_entities = {e for p in paths for e in p}
-                scored = []
-                for h in text_hits:
-                    content = h.get("content", "")
-                    overlap = sum(1 for e in path_entities if e in content)
-                    final_score = h.get("score", 0) * 0.7 + overlap * 0.3
-                    scored.append((final_score, h))
-                scored.sort(key=lambda x: x[0], reverse=True)
-                ranked_text = [h for _, h in scored[:limit]]
-                text_entities = set()
-                for h in ranked_text:
-                    text_entities.update(term_pat.findall(h.get("content", "")))
-                orphans = text_entities - path_entities
-                rescued = []
-                for o in list(orphans)[:2]:
-                    if o in adj and adj[o]:
-                        rescued.append([o, list(adj[o])[0]])
-                path_str = "\n".join(" -> ".join(p) for p in paths + rescued)
-                text_str = "\n".join(h.get("content", "") for h in ranked_text)
-                raw = f"[GRAPH PATHS]\n{path_str}\n[/GRAPH PATHS]\n[TEXT EVIDENCE]\n{text_str}\n[/TEXT EVIDENCE]"
-                return raw
-            return "\n".join(h.get("content", "") for h in text_hits[:limit])
-        return self.inject_context(query, limit=limit)
+        """Text hits plus the stored entity paths that connect them."""
+        hits = self.search_memory(query, limit=limit * 2)
+        if not hits:
+            return ""
+        text = "\n".join(h.get("content", "") for h in hits[:limit])
+        nodes = self._kg.nodes()
+        seeds = [name for name in entities(query) if name in nodes]
+        if not seeds:
+            seeds = [w for w in re.findall(r"[A-Za-z0-9_.]{3,}", query.lower()) if w in nodes][:3]
+        paths = self._kg.paths(seeds, max_hops=2, limit=5) if seeds else []
+        if not paths:
+            return text
+        shown = "\n".join(" -> ".join(path) for path in paths)
+        return f"[GRAPH PATHS]\n{shown}\n[/GRAPH PATHS]\n[TEXT EVIDENCE]\n{text}\n[/TEXT EVIDENCE]"
+
+    def remember_relation(self, src: str, rel: str, dst: str) -> str:
+        """Store one named relation the model asserted, as its own fact."""
+        if not (src and rel and dst):
+            return "Error: relation needs src, rel and dst."
+        fact = self._create_fact(f"{src} {rel} {dst}", "relation", "long")
+        fact["source"] = "tool_result"
+        self._kg.add_fact(fact)
+        self._kg.add_edge(src, rel, dst, fact["id"], weight=2.0)
+        self._kg.save()
+        return f"Stored relation: {src} -[{rel}]-> {dst}"
 
     def _create_fact(self, content: str, category: str, tier: str) -> Dict:
         return {"id": str(uuid.uuid4())[:8], "timestamp": time.time(), "content": str(content), "category": str(category), "tier": tier}
@@ -582,27 +688,37 @@ class MemoryCore:
         return f"Stored ({category}, grade:{critic_score or 'n/a'})"
 
     def prune_toxic(self, threshold_hits: int = 5, success_rate: float = 0.5) -> int:
-        # Auto-drop blueprints recalled often but failing
-        removed = 0
+        removed_ids = []
         for f in list(self._kg.get_facts()):
             if f.get("hits", 0) >= threshold_hits and f.get("success_rate", 1.0) < success_rate:
-                self._kg.remove_fact(f["id"])
-                removed += 1
-        if removed: self._kg.save()
-        return removed
+                if self._kg.remove_fact(f["id"]):
+                    removed_ids.append(str(f["id"]))
+        if removed_ids:
+            self._kg.save()
+            self._vector.delete(removed_ids)
+            self._rebuild_bm25()
+        return len(removed_ids)
 
     def promote_memory(self, memory_id: str, new_tier: str) -> str:
+        if new_tier not in ("short", "recent", "long_term"):
+            return f"Error: unknown tier '{new_tier}'. Use short, recent or long_term."
+        for fact in self._kg.get_facts():
+            if str(fact.get("id")) == str(memory_id):
+                fact["tier"] = new_tier
+                self._kg.mark_dirty()
+                self._kg.save()
+                return f"Promoted {memory_id} to {new_tier}"
         for item in self._short_term:
             if item.get("id") == memory_id:
                 item["tier"] = new_tier
                 if new_tier in ("recent", "long_term"):
-                    existing_ids = {f.get("id") for f in self._kg.get_facts()}
-                    if item["id"] not in existing_ids:
-                        fact = self._create_fact(item["content"], item.get("category", "general"), new_tier)
-                        fact["id"] = item["id"]
-                        self._kg.add_fact(fact)
-                        self._kg.save()
-                        self._rebuild_bm25()
+                    fact = self._create_fact(item["content"], item.get("category", "general"), new_tier)
+                    fact["id"] = item["id"]
+                    fact["source"] = item.get("source", "promotion")
+                    self._kg.add_fact(fact)
+                    self._kg.save()
+                    self._vector.add([item["content"]], [fact], [fact["id"]])
+                    self._rebuild_bm25()
                 return f"Promoted {memory_id} to {new_tier}"
         return f"Memory {memory_id} not found"
 
@@ -647,7 +763,6 @@ class MemoryCore:
         return self.search_memory(query, limit)
 
     def search_sessions(self, query: str, limit: int = 10) -> List[Dict]:
-        # Use SQLite session DB FTS search
         try:
             return self._session_db.search(query, limit)
         except Exception as e:
@@ -789,6 +904,7 @@ class PeerCard:
     strategies: List[str] = field(default_factory=list)
     anti_patterns: List[str] = field(default_factory=list)
     tool_preferences: Dict[str, float] = field(default_factory=dict)
+    tool_samples: Dict[str, int] = field(default_factory=dict)
     confidence: float = 0.5
 
     def to_prompt_block(self) -> str:
@@ -796,6 +912,10 @@ class PeerCard:
         if self.facts: lines.append("Facts: " + ", ".join(self.facts[:5]).replace("→", "->").replace("←", "<-"))
         if self.strategies: lines.append("Works: " + ", ".join(self.strategies[:3]).replace("→", "->").replace("←", "<-"))
         if self.anti_patterns: lines.append("Avoid: " + ", ".join(self.anti_patterns[:3]).replace("→", "->").replace("←", "<-"))
+        ranked = sorted(((name, rate) for name, rate in self.tool_preferences.items()
+                         if self.tool_samples.get(name, 0) >= 3), key=lambda item: -item[1])[:5]
+        if ranked:
+            lines.append("Tools: " + ", ".join(f"{name} {rate:.2f}" for name, rate in ranked))
         return "\n".join(lines)
 
 
@@ -807,6 +927,7 @@ class PeerCards:
             cls._instance = super().__new__(cls)
             cls._instance._cards = {}
             cls._instance._file = Path("tmp/memory/peer_cards.json")
+            cls._instance._dirty = False
             cls._instance._load()
         return cls._instance
 
@@ -843,7 +964,7 @@ class PeerCards:
 
     def _save(self):
         self._file.parent.mkdir(parents=True, exist_ok=True)
-        data = {k: {"agent_id": v.agent_id, "domain": v.domain, "facts": v.facts, "strategies": v.strategies, "anti_patterns": v.anti_patterns, "tool_preferences": v.tool_preferences, "confidence": v.confidence} for k, v in self._cards.items() if not k.startswith("config:")}
+        data = {k: {"agent_id": v.agent_id, "domain": v.domain, "facts": v.facts, "strategies": v.strategies, "anti_patterns": v.anti_patterns, "tool_preferences": v.tool_preferences, "tool_samples": v.tool_samples, "confidence": v.confidence} for k, v in self._cards.items() if not k.startswith("config:")}
         self._file.write_text(json.dumps(data, indent=2, ensure_ascii=False), "utf-8")
 
     def get_relevant(self, agent_id: str, query: str = "", limit: int = 2) -> List[PeerCard]:
@@ -854,11 +975,30 @@ class PeerCards:
             tokens = set(re.findall(r"[a-z0-9_\-]+", (card.domain + " " + " ".join(card.facts + card.strategies + card.anti_patterns)).lower()))
             overlap = len(q & tokens)
             agent_bonus = 2.0 if card.agent_id == agent_id else 0.0
-            score = agent_bonus + overlap + max(0.0, min(1.0, card.confidence))
-            if score > 0:
-                scored.append((score, card))
+            confidence = max(0.0, min(1.0, card.confidence))
+            if not overlap and not agent_bonus and confidence < 0.9:
+                continue
+            scored.append((agent_bonus + overlap + confidence, card))
         scored.sort(key=lambda x: x[0], reverse=True)
         return [c for _, c in scored[:limit]]
+
+    def record_tool(self, agent_id: str, tool: str, ok: bool) -> None:
+        """Exponential moving average of a tool's success rate for one agent."""
+        key = f"{agent_id}:tools"
+        card = self._cards.get(key)
+        if card is None:
+            card = PeerCard(agent_id=agent_id, domain="tools")
+            self._cards[key] = card
+        prior = card.tool_preferences.get(tool, 0.5)
+        card.tool_preferences[tool] = round(prior * 0.8 + (1.0 if ok else 0.0) * 0.2, 3)
+        card.tool_samples[tool] = card.tool_samples.get(tool, 0) + 1
+        self._dirty = True
+
+    def flush(self) -> None:
+        """Write once per run instead of once per tool call."""
+        if getattr(self, "_dirty", False):
+            self._dirty = False
+            self._save()
 
     def upsert(self, card: PeerCard):
         key = f"{card.agent_id}:{card.domain}"

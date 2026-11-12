@@ -5,12 +5,14 @@ from typing import Any, Callable, Dict, List, Optional
 import httpx
 
 from src.core.provider import (
+    is_provider_fault,
     AIProvider,
     ProviderError,
     get_http_client,
     normalize_messages,
     raise_for_status,
 )
+from src.utils import async_retry
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +24,13 @@ def _decode(raw: str) -> Dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def _rejects_tools(exc: ProviderError) -> bool:
+    """True when the backend refused the request because of its tools field."""
+    if exc.status_code not in (400, 404, 422):
+        return False
+    return "tool" in str(exc).lower()
 
 
 class OpenAIProvider(AIProvider):
@@ -53,6 +62,8 @@ class OpenAIProvider(AIProvider):
             "messages": normalize_messages(history, system_prompt),
             "stream": bool(stream),
         }
+        if stream:
+            payload["stream_options"] = {"include_usage": True}
         if not self._is_reasoning_model():
             payload["temperature"] = 0.7
         if self.native_tools:
@@ -167,31 +178,45 @@ class OpenAIProvider(AIProvider):
         return full
 
     async def _dispatch(self, history: List[Dict], system_prompt: str, on_token: Optional[Callable[[str], None]]) -> str:
+        try:
+            return await self._dispatch_once(history, system_prompt, on_token)
+        except ProviderError as exc:
+            if not self.native_tools or not _rejects_tools(exc):
+                raise
+            logger.debug("%s rejected the tools payload, continuing without it", self.name)
+            self.native_tools = []
+            return await self._dispatch_once(history, system_prompt, on_token)
+
+    async def _dispatch_once(self, history: List[Dict], system_prompt: str,
+                             on_token: Optional[Callable[[str], None]]) -> str:
         if not on_token:
             return await self._non_stream(self._payload(history, system_prompt, False))
-        emitted = False
-
-        def _relay(text: str) -> None:
-            nonlocal emitted
-            emitted = True
-            on_token(text)
-
+        relay, state = self._guard_stream(on_token)
         try:
-            return await self._stream(self._payload(history, system_prompt, True), _relay)
+            return await self._stream(self._payload(history, system_prompt, True), relay)
         except ProviderError as exc:
-            if exc.status_code is not None or exc.stream_started or emitted:
+            if state["emitted"]:
+                exc.stream_started = True
+            if exc.status_code is not None or exc.stream_started or state["emitted"]:
                 raise
             logger.debug("%s stream failed, retrying without streaming: %s", self.name, exc)
         return await self._non_stream(self._payload(history, system_prompt, False))
 
+    @async_retry(retries=5, delays=[2, 5, 10, 25, 60])
     async def generate_text(self, history: List[Dict], system_prompt: str, on_token: Callable = None) -> str:
         self._preflight()
+        self._attempts = getattr(self, "_attempts", 0) + 1
         try:
             result = await self._dispatch(history, system_prompt, on_token)
-        except Exception:
-            self._fail()
+        except Exception as exc:
+            if self._attempts >= 6:
+                self._attempts = 0
+            if is_provider_fault(exc):
+                self._fail()
             raise
         self._succeed()
+        self._last_attempts = self._attempts
+        self._attempts = 0
         return result
 
     async def generate_image(self, prompt: str, width: Optional[int] = None, height: Optional[int] = None) -> str:

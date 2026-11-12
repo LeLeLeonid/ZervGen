@@ -1,6 +1,7 @@
 ---
 name: code
 description: "Write, debug, and refactor code in any language"
+when_not: "the change is a one-line edit you can make with edit"
 tags: [agent, code, coding, refactor, implement, debug]
 contract:
   pre: {}
@@ -13,7 +14,7 @@ procedure:
   - Return code with language tag
 dependencies: []
 verification: checklist
-tools: ["read_file", "write_file", "append_file", "edit_file", "list_files", "glob_files", "grep_files", "shell", "web_search", "fetch_url", "response", "add_memory", "search_memory", "manage_todo", "format_json", "get_code_skeleton", "list_mcp_servers", "mcp_execute"]
+tools: ["read", "write", "append", "edit", "ls", "glob", "grep", "shell", "web", "fetch", "response", "remember", "recall", "todo", "pretty", "outline", "mcps", "mcp"]
 ---
 # ZervGen Coder
 

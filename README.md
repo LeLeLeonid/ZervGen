@@ -1,28 +1,11 @@
 # ZervGen
 
-**Autonomous AI Agent Framework — v1.6.0 (alpha)**
+**Agent harness — one loop, four modes, tools as Python, skills as Markdown.**
 
-[![Version](https://img.shields.io/badge/Version-1.6.0-purple?style=for-the-badge)](https://github.com/LeLeLeonid/ZervGen)
+[![Version](https://img.shields.io/badge/Version-1.6.5-purple?style=for-the-badge)](https://github.com/LeLeLeonid/ZervGen)
 [![License](https://img.shields.io/badge/License-MIT-000000?style=for-the-badge)](LICENSE)
 
-> ⚠️ **Alpha software.** v1.6.0 is a major rewrite and is **buggy**. Expect crashes, rough edges, and breaking changes. Use at your own risk.
-
-ZervGen is a multi-agent AI framework. It spins up specialized agents (coder, researcher, architect) that work together on your tasks, with persistent memory, tool execution, and Model Context Protocol (MCP) integration.
-
-## Features
-
-- **Multi-agent orchestration** — a supervisor decomposes tasks and spawns agents to work on them in parallel
-- **Provider-agnostic** — works with Anthropic, OpenAI, OpenRouter, Gemini, and Pollinations
-- **Persistent memory** — three-tier storage (knowledge graph, vector DB, session log)
-- **Tool execution** — 27 built-in tools: web search, file ops, shell, weather, git, and more
-- **MCP support** — connect external MCP servers for additional tools
-- **Skill system** — YAML-defined skills with pre/post validation contracts
-- **Slash commands** — control the agent from the terminal (role, mode, provider, memory, etc.)
-
-## Requirements
-
-- Python 3.10+
-- An API key for at least one provider (Anthropic, OpenAI, OpenRouter, Gemini, or Pollinations)
+ZervGen runs a supervisor loop that decomposes tasks and spawns specialized agents (coder, researcher, architect) working in parallel — with persistent memory, tool execution, model tiers, and MCP integration.
 
 ## Install
 
@@ -30,18 +13,14 @@ ZervGen is a multi-agent AI framework. It spins up specialized agents (coder, re
 git clone https://github.com/LeLeLeonid/ZervGen.git
 cd ZervGen
 python -m venv venv
-# Windows:
-venv\Scripts\activate
-# Linux/Mac:
-source venv/bin/activate
-
-pip install httpx pydantic rich ddgs beautifulsoup4 fake_useragent aiofiles pyyaml dirtyjson chromadb tiktoken simpleeval prompt_toolkit
+source venv/bin/activate          # Windows: venv\Scripts\activate
+pip install -r requirements.txt
 python main.py
 ```
 
-## Configuration
+## Configure
 
-Create a `.env` file in `~/.zervgen/` with your API keys:
+Put keys in `.zervgen/.env` (never in config — it's git-ignored):
 
 ```
 ANTHROPIC_API_KEY=sk-ant-...
@@ -50,39 +29,47 @@ OPENROUTER_API_KEY=sk-or-...
 GEMINI_API_KEY=...
 ```
 
-## Usage
+On first run, `config.json` is created. Edit it directly, or use the in-app `/set` and `/get` commands. Set per-tier models with `/set model_tiers.<TIER>.<provider> <model>`, then activate with `/tier`.
 
-Run `python main.py`, then chat directly or use slash commands:
+## Use
 
-- `/role` — Switch agent role (code, architect, researcher, etc.)
-- `/mode` — Switch mode (ASK, PLAN, BUILD)
-- `/provider [name]` — Switch AI provider
-- `/memory` — View memory
-- `/compact` — Compact memory
-- `/load` — Load a previous session
-- `/history` — View conversation history
-- `/help` — Show all commands
+Run `python main.py`, then chat or type slash commands:
 
-## Project Layout
+- `/role` — switch agent (code, architect, researcher…)
+- `/mode` — ASK, BUILD, CALL, DEBUG · TAB on an empty prompt cycles
+- `/provider [name]`, `/model [name]`, `/tier [name]` — model selection
+- `/memory`, `/compact`, `/load`, `/history` — memory
+- `/help` — everything
+
+## Layout
 
 ```
 ZervGen/
-├── main.py             # Entry point
+├── main.py                # entry point
 ├── src/
-│   ├── cli.py          # Terminal UI, chat loop, commands
-│   ├── config.py       # Settings + secret redaction
-│   ├── skills_loader.py# Skill validation + registry
-│   ├── tools.py        # 27 tool functions
-│   ├── utils.py        # Token counting, context, retry logic
+│   ├── cli.py             # TUI, chat loop, commands
+│   ├── config.py          # settings, presets, secret redaction
+│   ├── skills_loader.py   # skill validation + registry
+│   ├── tools.py           # tool functions + registry
+│   ├── utils.py           # tokens, truncation, trace, compressor
 │   ├── core/
-│   │   ├── base_agent.py   # StemAgent execution engine
-│   │   ├── memory.py       # Three-tier memory (KG, vector, sessions)
-│   │   ├── orchestrator.py # Metacognitive supervisor
-│   │   ├── provider.py     # Provider wrappers
-│   │   └── mcp_manager.py  # MCP client
-│   ├── providers/       # Anthropic, OpenAI, OpenRouter, Gemini, Pollinations
-│   └── skills/          # Skill definitions (AGENTS, UTILITIES, INTEGRATION)
-└── requirements.txt
+│   │   ├── base_agent.py  # StemAgent: prompt, loop, PTC, sensors
+│   │   ├── orchestrator.py# routing, delegation waves, critic gate
+│   │   ├── runtime.py     # PermissionPolicy, ToolRuntime, Run
+│   │   ├── mcp_manager.py # MCP clients, health, namespacing
+│   │   ├── memory.py      # KG + vector + sessions, Dreamer
+│   │   └── provider.py    # provider base, payloads, native tools, cost
+│   ├── providers/         # anthropic, openai, openrouter, gemini, pollinations
+│   └── skills/            # AGENTS, INTEGRATION, UTILITIES
+├── tests/                 # pytest, one file per subsystem
+└── tmp/                   # runtime data (git-ignored)
+```
+
+## Verify
+
+```bash
+python -m compileall -q src main.py
+python -m pytest -q
 ```
 
 ## License

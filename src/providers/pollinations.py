@@ -3,6 +3,7 @@ from urllib.parse import quote
 
 from src.config import PollinationsSettings
 from src.core.provider import (
+    is_provider_fault,
     AIProvider,
     ProviderError,
     ProviderMeta,
@@ -96,8 +97,9 @@ class Provider(AIProvider):
             cleaned = self._clean(content)
             if not cleaned:
                 raise ProviderError("Pollinations returned empty content", retryable=True)
-        except Exception:
-            self._fail()
+        except Exception as exc:
+            if is_provider_fault(exc):
+                self._fail()
             raise
         self._succeed()
         return cleaned

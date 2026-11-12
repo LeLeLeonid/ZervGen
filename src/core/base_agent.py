@@ -5,11 +5,12 @@ import json
 import logging
 import inspect
 import re
+import shutil
 import subprocess
 import time
 import os
 import sys
-import uuid
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -17,35 +18,38 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 from src.config import MODES, GlobalSettings, load_config, ZG_PROTOCOL
-from src.core.memory import memory_core
-from src.core.provider import AIProvider, get_provider
+from src.core.provider import AIProvider, get_provider, is_provider_fault
 from src.skills_loader import load_role, SkillEngine
-from src.tools import TOOL_REGISTRY, current_agent, shell_exec, _mcp_schema, _schema_signature, _schema_doc, _native_tool_schemas
-from src.utils import get_system_context, sanitize_for_prompt, generate_random_delimiter, count_tokens, add_global_tokens, add_provider_tokens, ContextCompressor, ModelCatalog, safe_run, GitManager, truncate_to_tokens, context_ceiling
+from src.tools import TOOL_NAMES, TOOL_REGISTRY, current_agent, shell_exec, _mcp_schema, _schema_signature, _schema_doc, _native_tool_schemas
+from src.utils import get_system_context, sanitize_for_prompt, generate_random_delimiter, count_tokens, add_global_tokens, add_provider_tokens, truncate_to_tokens, context_ceiling
 from src.core.runtime import (
-    Run, ToolCall, ToolResult, Artifact, RunStatus, Task,
+    Run, Artifact, RunStatus, Task,
     Session, RunCoordinator, PermissionPolicy, ToolRuntime, Compactor,
 )
-from src.utils import SHORTHAND_RE, TERMINAL_TOOLS, TraceBus, TurnIntent, parse_turn, strip_ptc
+from src.utils import CALL_MARKUP_RE, SHORTHAND_RE, TERMINAL_TOOLS, TraceBus, TurnIntent, canonical_tool, parse_turn, strip_ptc, looks_like_python
 
 logger = logging.getLogger(__name__)
 console = Console()
 
 
 class _StreamFilter:
-    """Streams prose to stdout, hiding code fences and ``::tool`` lines.
+    """Streams prose to the terminal as Markdown, hiding tool-call surfaces.
 
-    With the bus collapsed, the streamed text is the only place raw model
-    output can still reach the terminal. Fenced Python is hidden; now the
-    ``::tool`` shorthand is hidden too, because it is a tool invocation, not
-    an answer — it renders once, as the collapsed tool row.
+    Prose accumulates into a block and paints as Markdown when a blank line
+    closes it. Fenced Python is dropped (it is a PTC call); any other fence is
+    painted as a code block. ``::tool`` lines never reach the terminal because
+    they render as a collapsed tool row instead.
     """
 
     HOLD = 400
+    BLOCK = 1200
 
     def __init__(self, thought_cb=None):
         self.buf = ""
         self.in_fence = False
+        self.fence_lang = ""
+        self.fence_body = ""
+        self.block = ""
         self.thought_cb = thought_cb
         self.wrote = False
         self.emitted = ""
@@ -60,51 +64,72 @@ class _StreamFilter:
     def _emit(self, text: str) -> None:
         if not text.strip():
             return
-        sys.stdout.write(text)
-        sys.stdout.flush()
+        from src.utils import print_block
         self.wrote = True
         self.emitted = (self.emitted + text)[-20_000:]
+        print_block(text)
+        self._push_thought(text)
+
+    def _flush_block(self) -> None:
+        block, self.block = self.block, ""
+        if block.strip():
+            self._emit(block)
+
+    def _close_fence(self) -> None:
+        body, lang = self.fence_body.rstrip("\n"), self.fence_lang
+        self.fence_body, self.fence_lang = "", ""
+        if not body.strip():
+            return
+        if lang in ("python", "py") or (not lang and looks_like_python(body)):
+            self.emitted = (self.emitted + "\n" + body)[-20_000:]
+            return
+        self._emit(f"```{lang}\n{body}\n```\n")
+
+    def _line(self, line: str) -> None:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            if self.in_fence:
+                self._close_fence()
+            else:
+                self._flush_block()
+                self.fence_lang = stripped[3:].strip().lower()
+            self.in_fence = not self.in_fence
+            return
+        if self.in_fence:
+            self.fence_body = (self.fence_body + line + "\n")[-20_000:]
+            return
+        if SHORTHAND_RE.match(line) or CALL_MARKUP_RE.match(stripped):
+            return
+        if not stripped:
+            self._flush_block()
+            return
+        self.block += line + "\n"
+        if len(self.block) >= self.BLOCK:
+            self._flush_block()
 
     def _drain(self, final: bool = False) -> None:
         while "\n" in self.buf:
             line, _, self.buf = self.buf.partition("\n")
-            if not SHORTHAND_RE.match(line):
-                self._emit(line + "\n")
-                self._push_thought(line)
-        if final and self.buf:
+            self._line(line)
+        if self.buf and (final or len(self.buf) > self.HOLD):
             line, self.buf = self.buf, ""
-            if not SHORTHAND_RE.match(line):
-                self._emit(line)
-                self._push_thought(line)
-        elif len(self.buf) > self.HOLD:
-            self._drain(final=True)
+            self._line(line)
 
     def __call__(self, token: str) -> None:
         self.buf += token
-        while "```" in self.buf:
-            pre, _, post = self.buf.partition("```")
-            if not self.in_fence:
-                self.buf = pre + "\n"
-                self._drain(final=True)
-            self.in_fence = not self.in_fence
-            self.buf = post
-        if not self.in_fence:
-            self._drain()
+        self._drain()
 
     def flush(self) -> None:
-        """Emit the trailing partial line once the provider is done."""
-        if not self.in_fence:
-            self._drain(final=True)
-        # A trace line starts on its own row: without this, the answer receipt
-        # lands glued to the last streamed character (``…structure.19:36:41``).
-        if self.wrote and not self.emitted.endswith("\n"):
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-            self.emitted += "\n"
+        """Close the last block once the provider is done."""
+        self._drain(final=True)
+        if self.in_fence:
+            self._close_fence()
+            self.in_fence = False
+        self._flush_block()
 
 
 class StemAgent:
-    WRITE_TOOLS = {"write_file", "append_file", "edit_file", "delete_file"}
+    WRITE_TOOLS = {"write", "append", "edit"}
 
     def __init__(
         self,
@@ -120,6 +145,10 @@ class StemAgent:
     ):
         self.name = name
         self.provider = provider
+        self._primary_provider = provider
+        self._fallback_chain: List[Any] = []
+        self._fallback_index = 0
+        self._fallback_active = False
         self.skill_name = skill_name
         self.settings = settings or load_config()
         self.mode = mode.upper() if mode else "BUILD"
@@ -140,10 +169,11 @@ class StemAgent:
         self._active_todos: List[str] = []
         self._user_active = False
         self._last_result = None
-        self._last_stable_result = None
-        self._repeat_count = 0
+        self._turn_signatures: List[str] = []
+        self._touched_dirs: List[str] = []
         self._cached_system_prompt: Optional[str] = None
         self._compressor = None
+        self._compactions = 0
         self._prompt_hash = None
         self._prompt_obj_ref = None
         self._response_called = False
@@ -156,7 +186,7 @@ class StemAgent:
         self._sensor_attempts = 0
         self._last_streamed = False
         self._last_streamed_text = ""
-        self._answer_painted = False
+        self._answer_streamed = False
         self._status_base = ""
         self._background_tasks: set[asyncio.Task] = set()
         self.trace = TraceBus(
@@ -199,7 +229,71 @@ class StemAgent:
             agent=self.name,
             on_event=self._runtime_event,
             on_permission=self.request_permission,
-        )
+        ).with_hooks(self._run_hook, bool(getattr(self.settings, "hooks_fail_closed", False)))
+
+    def _fallback_entries(self) -> List[Dict[str, str]]:
+        """Ordered provider/model backups, primary excluded."""
+        raw = getattr(self.settings, "fallback_providers", None) or []
+        if isinstance(raw, dict):
+            raw = [raw]
+        entries = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            provider = str(item.get("provider") or "").strip()
+            model = str(item.get("model") or "").strip()
+            if provider and model:
+                entries.append({"provider": provider, "model": model})
+        return entries
+
+    def _activate_fallback(self, reason: str) -> bool:
+        """Swap in the next backup provider; False when the chain is exhausted."""
+        entries = self._fallback_entries()
+        while self._fallback_index < len(entries):
+            entry = entries[self._fallback_index]
+            self._fallback_index += 1
+            try:
+                from src.core.provider import get_provider
+                provider = get_provider(entry["provider"], self.settings)
+                provider.model = entry["model"]
+            except Exception as exc:
+                self._log(self.name, f"Fallback {entry['provider']} unusable: {exc}", "ptc_error", self.mode)
+                continue
+            self.provider = provider
+            self._fallback_active = True
+            self._log(self.name, f"Fallback → {entry['model']} via {entry['provider']} ({reason})",
+                      "fallback", self.mode)
+            return True
+        return False
+
+    def _restore_primary(self) -> None:
+        """Return to the configured provider after a run that used a fallback."""
+        if not self._fallback_active:
+            return
+        self.provider = self._primary_provider
+        self._fallback_active = False
+        self._fallback_index = 0
+
+    async def _run_hook(self, event: str, tool: str, args: Dict[str, Any]) -> Optional[str]:
+        """Run configured shell hooks; exit 2 blocks the call, stdout is the reason."""
+        hooks = getattr(self.settings, "tool_hooks", None) or {}
+        commands = hooks.get(event) or []
+        if isinstance(commands, str):
+            commands = [commands]
+        if not commands or not tool:
+            return None
+        import os
+        payload = json.dumps({"event": event, "tool": tool, "args": args}, ensure_ascii=False, default=str)
+        env = dict(os.environ, ZG_HOOK_EVENT=event, ZG_HOOK_TOOL=tool, ZG_HOOK_ARGS=payload[:8000])
+        for command in commands:
+            proc = await asyncio.create_subprocess_shell(
+                command, stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env)
+            out, _ = await proc.communicate(payload.encode())
+            if proc.returncode == 2:
+                reason = out.decode("utf-8", "replace").strip() or f"hook blocked {tool}"
+                return reason[:500]
+        return None
 
     def _runtime_event(self, kind: str, **fields) -> None:
         """Route one tool event to the trace bus; a call and its result are one row.
@@ -269,8 +363,11 @@ class StemAgent:
         return result
 
     async def _tool_set_mode(self, mode: str) -> str:
+        from src.config import MODES
+        if str(mode).upper() not in MODES:
+            return f"Error: unknown mode '{mode}'. One of: {', '.join(MODES)}."
         old = self.mode
-        self.mode = mode.upper()
+        self.mode = str(mode).upper()
         self._runtime = self._build_runtime()
         self.invalidate_cache()
         return f"Mode changed: {old} -> {self.mode}"
@@ -283,13 +380,13 @@ class StemAgent:
 
     def _load_tools(self) -> None:
         role_cfg = load_role(self.skill_name)
-        allowed = set(getattr(role_cfg, "tools", []) or [])
+        allowed = {canonical_tool(name) for name in getattr(role_cfg, "tools", []) or []}
         if self.skill_name == "system" or "all" in allowed:
             allowed = set(TOOL_REGISTRY.keys())
         else:
-            allowed.update({"response", "load_skill", "find_skill", "search_skill_hub", "install_skill",
-                            "search_memory", "search_tgs", "list_skills", "list_mcp_servers",
-                            "set_external_skills", "scan_tools"})
+            allowed.update({"response", "skill", "find", "skill_hub", "skill_install",
+                            "recall", "graph", "skills", "mcps",
+                            "skill_external", "tools"})
         self.tools = {k: v for k, v in TOOL_REGISTRY.items() if k in allowed}
 
     def _mcp_tools(self) -> Dict[str, Any]:
@@ -307,7 +404,7 @@ class StemAgent:
         return tools
 
     def _active_tools(self) -> dict:
-        write_set = {"write_file", "append_file", "edit_file", "delete_file", "shell"}
+        write_set = {"write", "append", "edit", "shell"}
         tools = dict(self.tools)
         for name, func in self._mcp_tools().items():
             tools.setdefault(name, func)
@@ -321,21 +418,12 @@ class StemAgent:
                 if name not in TERMINAL_TOOLS}
 
     def _native_specs(self) -> List[Dict[str, Any]]:
-        """Canonical tool descriptions, or [] when the wire stays text-only.
-
-        ``auto`` only opts known tool-capable backends in: a third-party
-        OpenAI-compatible preset may reject ``tools`` outright, and failing
-        every turn is worse than using shorthand there.
-        """
+        """Canonical tool descriptions, or [] when the wire stays text-only."""
         protocol = str(getattr(self.settings, "tool_protocol", "auto") or "auto").lower()
         if protocol not in ("native", "auto") or self.provider is None:
             return []
         if not getattr(self.provider, "supports_native_tools", False):
             return []
-        if protocol == "auto":
-            from src.core.provider import NATIVE_TOOL_PROVIDERS
-            if str(getattr(self.provider, "name", "")) not in NATIVE_TOOL_PROVIDERS:
-                return []
         return _native_tool_schemas(self._tool_specs())
 
     @staticmethod
@@ -388,6 +476,9 @@ class StemAgent:
 
             _call.__name__ = name
             tools[name] = _call
+        for legacy, public in TOOL_NAMES.items():
+            if public in tools and legacy not in tools:
+                tools[legacy] = tools[public]
         return tools
 
     async def _init_mcp(self) -> None:
@@ -470,8 +561,6 @@ class StemAgent:
             payload = event.as_dict() if hasattr(event, "as_dict") else {"event": str(event)}
         except Exception:
             payload = {"event": str(event)}
-        # Structured detail belongs in the JSONL, not in agent.log: the log
-        # stays line-for-line comparable with the terminal.
         self.trace.record("run_event", actor, f"{kind} {name} {status}".strip(),
                           run_event=payload)
         return event
@@ -511,15 +600,18 @@ class StemAgent:
         if Compactor.used(self.history) <= threshold:
             return
         keep = max(2, int(getattr(self.settings, "history_trim_size", 20) or 20))
-        if self._compressor is None:
-            self._compressor = Compactor(self.provider, getattr(self, "session", None))
-        compressor = self._compressor
-        if hasattr(compressor, "compact"):
-            compacted = await compressor.compact(list(self.history), threshold, keep=keep)
-        else:
-            compacted = await compressor.compress(list(self.history), keep_tokens=max(1000, int(threshold * 0.3)))
-        if compacted:
-            self.history = compacted
+        compactions = getattr(self, "_compactions", 0)
+        if len(self.history) >= 12 and compactions < 3:
+            self._compactions = compactions + 1
+            if self._compressor is None:
+                self._compressor = Compactor(self.provider, getattr(self, "session", None))
+            compressor = self._compressor
+            if hasattr(compressor, "compact"):
+                compacted = await compressor.compact(list(self.history), threshold, keep=keep)
+            else:
+                compacted = await compressor.compress(list(self.history), keep_tokens=max(1000, int(threshold * 0.3)))
+            if compacted:
+                self.history = compacted
         if Compactor.used(self.history) > threshold:
             body = [m for m in self.history if m.get("role") != "system"]
             head = [m for m in self.history if m.get("role") == "system"]
@@ -531,10 +623,11 @@ class StemAgent:
 
     def _prompt_header(self, role_cfg) -> str:
         role_prompt = role_cfg.prompt if role_cfg else "You are a ZervGen Agent."
-        tier = getattr(self.settings, "active_model_tier", "COOL")
+        tier = getattr(self.settings, "active_model_tier", "None") or "None"
         return f"{role_prompt}\n=== OP STATE ===\nROLE: {self.skill_name}\nMODE: {self.mode}\nTIER: {tier}"
 
     def _prompt_run(self) -> str:
+        """Volatile run state; kept last so the cached prefix stays byte-identical."""
         if not self._run:
             return ""
         b = self._run.budget
@@ -544,7 +637,8 @@ class StemAgent:
             f"STATUS: {self._run.status.value}\n"
             f"STEPS: {getattr(b, 'steps', 0)}/{getattr(b, 'max_steps', 0)}\n"
             f"TOOLS: {getattr(b, 'tool_calls', 0)}/{getattr(b, 'max_tool_calls', 0)}\n"
-            f"DELEGATIONS: {getattr(b, 'delegations', 0)}/{getattr(b, 'max_delegations', 0)}"
+            f"DELEGATIONS: {getattr(b, 'delegations', 0)}/{getattr(b, 'max_delegations', 0)}\n"
+            f"NOW: {datetime.now():%Y-%m-%d %H:%M}"
         )
 
     @property
@@ -584,7 +678,7 @@ class StemAgent:
             if srv.connected:
                 active.append(f"- {name}: {len(srv.tools)} tools")
             elif srv.state in ("degraded", "dead"):
-                active.append(f"- {name}: {srv.state} ({len(srv.tools)} cached tools) — call mcp_execute to retry")
+                active.append(f"- {name}: {srv.state} ({len(srv.tools)} cached tools) — call mcp to retry")
         return "--- MCP ---\n" + "\n".join(active) if active else ""
 
     def _prompt_skills(self, user_input: str) -> str:
@@ -606,6 +700,7 @@ class StemAgent:
                 skill.name for skill in visible
                 if (auto_external if skill.external else auto_internal)
                 and skill.match_trigger(user_input)
+                and not skill.suppressed(user_input)
             }
             return skill_index.index(
                 budget_chars=budget, desc_chars=desc_chars, max_skills=limit,
@@ -627,14 +722,28 @@ class StemAgent:
         active = self._active_tools()
         if not active:
             return ""
-        from src.tools import get_tools_schema
         subset = {k: v for k, v in active.items() if declared_names is None or k in declared_names}
-        return "--- AVAILABLE TOOLS ---\n" + get_tools_schema(subset, compact=True)
+        if self._native_specs():
+            names = ", ".join(sorted(subset))
+            return ("--- AVAILABLE TOOLS ---\n"
+                    f"{len(subset)} tools are attached to this request as native functions.\n"
+                    f"{names}\n"
+                    "Call them directly. tools(name) shows one tool's arguments.")
+        from src.tools import render_tool_index
+        budget = max(400, int(getattr(self.settings, "prompt_tools_chars", 2600) or 2600))
+        return ("--- AVAILABLE TOOLS ---\n"
+                f"{render_tool_index(subset, budget)}\n"
+                "tools(name) prints one tool's full docstring and arguments.")
 
     def _prompt_project_rules(self) -> str:
         try:
             from src.utils import discover_context_files, redact_fast
             text = discover_context_files(".")
+            touched = self._touched_dirs[-1] if self._touched_dirs else ""
+            if touched and touched not in (".", ""):
+                extra = discover_context_files(".", subdir=touched)
+                if extra:
+                    text = f"{text}\n{extra}" if text else extra
             if not text:
                 return ""
             return "--- PROJECT RULES ---\n" + redact_fast(text)
@@ -642,19 +751,24 @@ class StemAgent:
             logger.debug("Prompt project rules failed: %s", e)
             return ""
 
-    def _build_system_prompt(self, role_cfg, include_roles: bool = False, user_input: str = "") -> str:
-        sections = [
+    def _build_system_prompt(self, role_cfg, user_input: str = "") -> str:
+        """Stable sections first, volatile last, so a provider can cache the prefix."""
+        stable = [
             ("header", self._prompt_header(role_cfg), 0),
-            ("run", self._prompt_run(), 1),
             ("protocol", self._prompt_protocol(), 0),
-            ("rules", truncate_to_tokens(self._prompt_project_rules(), 1500, "\n[Project rules truncated]"), 2),
-            ("tools", self._prompt_tools(), 3),
+            ("rules", self._prompt_project_rules(), 1),
+            ("tools", self._prompt_tools(), 2),
+            ("mcp", self._prompt_mcp(), 3),
             ("skills", self._prompt_skills(user_input), 4),
-            ("mcp", self._prompt_mcp(), 5),
-            ("memory", truncate_to_tokens(self._prompt_memory(user_input), 750, "\n[Memory truncated]"), 6),
-            ("peers", truncate_to_tokens(self._prompt_peer_cards(user_input), 500, "\n[Peer cards truncated]"), 7),
-            ("context", f"--- CONTEXT ---\n{get_system_context()}", 8),
         ]
+        volatile = [
+            ("memory", self._prompt_memory(user_input), 5),
+            ("peers", self._prompt_peer_cards(user_input), 6),
+            ("context", f"--- CONTEXT ---\n{get_system_context()}", 7),
+            ("run", self._prompt_run(), 8),
+        ]
+        self._stable_prefix = "\n\n".join(text for _, text, _ in stable if text)
+        sections = stable + volatile
         prompt = "\n\n".join(text for _, text, _ in sections if text)
         cap = int(getattr(self.settings, "prompt_max_chars", 0) or 0)
         if cap and len(prompt) > cap:
@@ -662,15 +776,17 @@ class StemAgent:
             for name, text, priority in sorted(sections, key=lambda s: -s[2]):
                 if len(prompt) <= cap:
                     break
-                if not text or name in dropped or priority < 1:
+                if not text or priority < 1:
                     continue
                 dropped.add(name)
                 prompt = "\n\n".join(t for n, t, _ in sections if t and n not in dropped)
                 self.trace.record("prompt_drop", self.name, f"{name} ({len(text)} chars)")
             if len(prompt) > cap:
-                prompt = prompt[:cap] + "\n[System prompt truncated]"
+                keep = prompt.rfind("\n\n", 0, cap)
+                prompt = prompt[: keep if keep > cap // 2 else cap] + "\n[System prompt truncated]"
         self._prompt_obj_ref = prompt
         return prompt
+
 
     def _log(self, role: str, content: str, event_type: str = "message", mode: str = "") -> None:
         """Record one event: the bus renders + logs it once; history is written once.
@@ -682,7 +798,7 @@ class StemAgent:
         from src.utils import redact_fast
         safe_content = redact_fast(content)
         self.trace.emit(event_type, role, safe_content)
-        if self._memory_on:
+        if self._memory_on and event_type in ("input", "response", "delegation_result"):
             self.memory.log_event_sync(role, safe_content, event_type, mode or self.mode)
         if event_type in ("input", "agent_start", "delegation_result"):
             if event_type == "input":
@@ -693,22 +809,63 @@ class StemAgent:
                 safe_role = "assistant"
             self.history.append({"role": safe_role, "content": self._strip_ptc(safe_content)})
 
+    def _persist_turn(self, role: str, content: str) -> None:
+        """Store a finished conversation turn; logs and tool noise stay out of the session."""
+        if not self._memory_on or not content:
+            return
+        self.memory.log_event_sync(role, content, "response" if role == "assistant" else "input", self.mode)
+
+    def _record_tool_result(self, name: str, result: Any) -> None:
+        """Tool output enters history as a tool turn, never as the model's own words."""
+        body = result if isinstance(result, str) else str(result)
+        self.history.append({"role": "tool", "name": name, "content": body})
+
+    @staticmethod
+    def _call_shape(intent: Any) -> str:
+        """The calls a turn made, normalized: same call -> same shape."""
+        if str(getattr(intent, "source", "")).endswith("ptc"):
+            return " ".join(str(getattr(intent, "code", "") or "").split())[:400]
+        calls = getattr(intent, "calls", None) or []
+        return "|".join(f"{c.name}({json.dumps(c.args, sort_keys=True, default=str)})" for c in calls)[:400]
+
+    def _stagnation(self, signature: str) -> str:
+        """Name a repeating call+result shape: spinning or oscillation."""
+        if len(signature) < 40:
+            return ""
+        self._turn_signatures.append(hashlib.sha1(signature.encode("utf-8", "ignore")).hexdigest()[:12])
+        sigs = self._turn_signatures[-6:]
+        if len(sigs) >= 3 and len(set(sigs[-3:])) == 1:
+            self._turn_signatures.clear()
+            return "spinning"
+        if len(sigs) >= 4 and sigs[-4] == sigs[-2] and sigs[-3] == sigs[-1] and sigs[-1] != sigs[-2]:
+            self._turn_signatures.clear()
+            return "oscillation"
+        return ""
+
     async def _execute_tool(self, tool_name: str, args: Dict[str, Any], timeout: Optional[float] = None) -> str:
         """Dispatch one tool; the calling agent is visible to the tool."""
         runtime = self._runtime or self._build_runtime()
-        if timeout is None and tool_name == "delegate_to":
+        tool_name = canonical_tool(tool_name)
+        if timeout is None and tool_name == "delegate":
             timeout = float(getattr(self.settings, "delegation_timeout", 300) or 300)
         if tool_name in self.WRITE_TOOLS and self._run is not None and not self._run.budget.write():
             limit = self._run.budget.max_file_writes
             return f"Error: file-write budget exhausted ({limit} per run)"
+        if tool_name in self.WRITE_TOOLS:
+            self._capture_baseline(str(args.get("path", "")))
         token = current_agent.set(self)
         try:
             outcome = await runtime.execute(tool_name, args, timeout=timeout)
         finally:
             current_agent.reset(token)
+        try:
+            from src.core.memory import PeerCards
+            PeerCards().record_tool(self.name, tool_name, bool(outcome.success))
+        except Exception:
+            pass
         if outcome.success:
             output = str(outcome.output or "")
-            if tool_name in {"write_file", "append_file", "edit_file"} and self._run:
+            if tool_name in {"write", "append", "edit"} and self._run:
                 path = str(args.get("path", ""))
                 if path:
                     self._run.artifacts.append(Artifact(path=path))
@@ -717,7 +874,7 @@ class StemAgent:
                         if problem:
                             self.trace.record("sensor", self.name, problem)
                             output = f"{output}\nSENSOR: {problem}".strip()
-            if tool_name in ("read_file", "fetch_url") and output and len(output) <= 500_000:
+            if tool_name in ("read", "fetch") and output and len(output) <= 500_000:
                 try:
                     d = Path("tmp/trace")
                     d.mkdir(parents=True, exist_ok=True)
@@ -786,8 +943,6 @@ class StemAgent:
         "input", "open", "getattr", "setattr", "delattr", "object", "super", "memoryview",
     }
     BLOCKED_MODULES = {"os", "sys", "subprocess", "socket", "ctypes", "builtins", "importlib", "pathlib", "shutil"}
-    # str.format resolves attributes inside string data, which the AST cannot see:
-    # "{0.__globals__}".format(fn) escapes. f-strings are checked as normal nodes.
     BLOCKED_ATTRS = {"format", "format_map"}
 
     def _validate_ptc(self, code: str) -> Optional[str]:
@@ -852,7 +1007,6 @@ class StemAgent:
             comment_thought = ""
         thought = first_sentence or comment_thought or "Thinking..."
         self._set_status(True, f"▶ {thought}")
-        # PTC is a transport, not an event: one record with a compact head, no render.
         self.trace.emit("ptc", self.name, code[: self.trace.capture_chars], paint=False)
         ptc_tools = self._ptc_tools()
         async_names = set(ptc_tools)
@@ -970,12 +1124,15 @@ class StemAgent:
         self._set_status(True, f"▶ {text}")
 
     def _streamed_answer(self, answer: str) -> bool:
-        """Whether the final turn's stream already painted this answer."""
+        """Whether the final turn's stream put this exact answer on screen."""
         if not self._last_streamed or not answer:
             return False
-        streamed = " ".join(self._last_streamed_text.split())
-        head = " ".join(answer.split())[:200]
-        return bool(head) and head in streamed
+        return " ".join(self._last_streamed_text.split()) == " ".join(answer.split())
+
+    @property
+    def answer_streamed(self) -> bool:
+        """The one paint decision: did the stream already show the answer?"""
+        return bool(getattr(self, "_answer_streamed", False))
 
     def _set_status(self, enabled: bool, label: str = "") -> None:
         if self._silent:
@@ -1005,12 +1162,23 @@ class StemAgent:
     async def _handle_llm_turn(self, system_prompt: str) -> str:
         if self.interrupt_event.is_set():
             raise asyncio.CancelledError("Run aborted by user.")
+        started = time.monotonic()
         mode_def = MODES.get(self.mode, MODES["BUILD"])
         delim = generate_random_delimiter(16)
         full_prompt = f"{system_prompt}\n\n{delim}\nFOCUS: {mode_def['prompt']}\n{delim}"
         provider_timeout = getattr(self.settings, 'provider_timeout', 120)
-        valid_roles = {"system", "user", "assistant"}
-        safe_history = [{"role": m["role"] if m["role"] in valid_roles else "assistant", "content": m["content"]} for m in self.history]
+        try:
+            provider_timeout = float(self.provider.request_timeout(provider_timeout))
+        except Exception:
+            pass
+        valid_roles = {"system", "user", "assistant", "tool"}
+        safe_history = []
+        for m in self.history:
+            role = m["role"] if m["role"] in valid_roles else "assistant"
+            entry = {"role": role, "content": m["content"]}
+            if role == "tool" and m.get("name"):
+                entry["name"] = m["name"]
+            safe_history.append(entry)
         use_streaming = not self._silent and not self.settings.debug_mode
         self._last_streamed = False
         if self.settings.debug_mode and not self._silent:
@@ -1018,58 +1186,71 @@ class StemAgent:
             console.print(Panel(Text(full_prompt), title="[purple]INPUT[/purple]"))
         response = None
         self.provider.native_tools = self._native_specs()
-        try:
-            if use_streaming:
-                self._set_status(False)
-                stream = _StreamFilter(thought_cb=self._live_thought)
+        if use_streaming:
+            self._set_status(False)
+            stream = _StreamFilter(thought_cb=self._live_thought)
+            try:
                 response = await asyncio.wait_for(self.provider.generate_text(safe_history, full_prompt, on_token=stream), timeout=provider_timeout)
-                stream.flush()
-                # A trace line must start on its own row: without this, the
-                # answer receipt lands glued to the last streamed character.
-                if stream.wrote and not stream.emitted.endswith("\n"):
-                    sys.stdout.write("\n")
-                    sys.stdout.flush()
-                    stream.emitted += "\n"
-                self._set_status(True)
+            except asyncio.TimeoutError:
                 self._last_streamed = stream.wrote
                 self._last_streamed_text = stream.emitted
-            else:
-                self._last_streamed = False
-                self._last_streamed_text = ""
-                response = await asyncio.wait_for(self.provider.generate_text(safe_history, full_prompt), timeout=provider_timeout)
-            from src.core.provider import _record_success
-            _record_success(self.provider.name if hasattr(self.provider, 'name') else (self.provider.META.name if hasattr(self.provider, 'META') else self.settings.provider))
-        except Exception as e:
-            from src.core.provider import _record_failure
-            p_name = self.provider.name if hasattr(self.provider, 'name') else (self.provider.META.name if hasattr(self.provider, 'META') else self.settings.provider)
-            _record_failure(p_name)
-            raise
+                raise
+            stream.flush()
+            if stream.wrote and not stream.emitted.endswith("\n"):
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                stream.emitted += "\n"
+            self._set_status(True)
+            self._last_streamed = stream.wrote
+            self._last_streamed_text = stream.emitted
+        else:
+            self._last_streamed = False
+            self._last_streamed_text = ""
+            response = await asyncio.wait_for(self.provider.generate_text(safe_history, full_prompt), timeout=provider_timeout)
         response = (response or "").strip()
         if response.startswith(delim) and response.endswith(delim):
             response = response[len(delim):-len(delim)].strip()
         native = list(getattr(self.provider, "native_calls", []) or [])
         if native:
             known = set(self._active_tools()) | TERMINAL_TOOLS
-            markup = self._native_markup(call for call in native if call.get("name") in known)
+            markup = self._native_markup(
+                dict(call, name=canonical_tool(str(call.get("name") or "")))
+                for call in native if canonical_tool(str(call.get("name") or "")) in known)
             if markup:
                 response = f"{response}\n{markup}".strip() if response else markup
         self._emit_run("model_output", self.name, "llm", "received", output=response[:2000])
         in_tok, out_tok = count_tokens(self.history, response)
         add_global_tokens(in_tok + out_tok)
+        p_name = ""
         if self.provider:
             p_name = self.provider.name if hasattr(self.provider, 'name') else (self.provider.META.name if hasattr(self.provider, 'META') else self.settings.provider)
             add_provider_tokens(p_name, in_tok, out_tok)
-        if self._run:
-            provider_cost = float(getattr(self.provider, "_last_cost", 0.0) or 0.0)
-            if provider_cost > 0:
-                self._run.metadata["cost_usd"] = float(self._run.metadata.get("cost_usd", 0.0)) + provider_cost
-                max_cost = float(getattr(self.settings, "max_cost_usd", 0.0) or 0.0)
-                if max_cost and self._run.metadata["cost_usd"] > max_cost:
-                    raise RuntimeError(f"Cost budget exceeded (${max_cost:.4f})")
+        provider_cost = float(getattr(self.provider, "_last_cost", 0.0) or 0.0)
+        attempts = int(getattr(self.provider, "_last_attempts", 1) or 1)
+        if attempts > 1:
+            self.trace.record("retry", self.name, f"{attempts} provider attempts")
+        if self._run and provider_cost > 0:
+            self._run.metadata["cost_usd"] = float(self._run.metadata.get("cost_usd", 0.0)) + provider_cost
+        self.trace.record(
+            "llm", self.name,
+            model=str(getattr(self.provider, "model", "") or ""),
+            provider=str(p_name or self.settings.provider or ""),
+            input_tokens=in_tok, output_tokens=out_tok,
+            cost_usd=round(provider_cost, 6),
+            elapsed_ms=round((time.monotonic() - started) * 1000),
+        )
         return response
 
+    def _cost_exhausted(self) -> bool:
+        """True when the run has already spent past its cost ceiling."""
+        if self._run is None:
+            return False
+        max_cost = float(getattr(self.settings, "max_cost_usd", 0.0) or 0.0)
+        return bool(max_cost) and float(self._run.metadata.get("cost_usd", 0.0)) > max_cost
+
     async def _run_verification_sensors(self) -> str:
-        failures = [self._file_sensor_failures()]
+        failures = [self._file_sensor_failures(), await self._lsp_sensor_failures(),
+                    await self._test_sensor_failures()]
         commands = list(getattr(self.settings, "verification_commands", []) or [])
         if self.mode == "BUILD" and commands and "shell" in self._active_tools():
             for command in commands:
@@ -1077,6 +1258,128 @@ class StemAgent:
                 if not result.ok:
                     failures.append(f"{command}: {result.to_text()}")
         return "\n".join(failure for failure in failures if failure)
+
+    async def _test_sensor_failures(self) -> str:
+        """Run the project suite once a Python file changed and a suite exists."""
+        if self.mode != "BUILD" or not getattr(self.settings, "sensors_enabled", True):
+            return ""
+        if not getattr(self.settings, "sensor_tests_enabled", True):
+            return ""
+        run = getattr(self, "_run", None)
+        if run is None or not any(Path(a.path).suffix == ".py" for a in run.artifacts):
+            return ""
+        if not (Path("tests").is_dir() or Path("pytest.ini").exists() or Path("pyproject.toml").exists()):
+            return ""
+        timeout = int(float(getattr(self.settings, "sensor_tests_timeout", 300) or 300))
+        result = await shell_exec(f"{sys.executable} -m pytest -x -q --no-header", timeout=timeout)
+        if result.ok:
+            return ""
+        return "tests: " + self._first_failure_line(result.to_text())
+
+    @staticmethod
+    def _first_failure_line(text: str) -> str:
+        """The line that names the failure, not the whole pytest transcript."""
+        lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+        for prefixes in (("FAILED", "ERROR"), ("E   ",), ("",)):
+            for line in lines:
+                if prefixes and not line.startswith(prefixes):
+                    continue
+                if prefixes or " failed" in line:
+                    return line[:300]
+        return " ".join(str(text or "").split())[-300:]
+
+    async def _lsp_sensor_failures(self) -> str:
+        """Report only diagnostics an edit introduced, not pre-existing noise."""
+        if self.mode != "BUILD" or not getattr(self.settings, "sensors_enabled", True):
+            return ""
+        if not getattr(self.settings, "sensor_lsp_enabled", True) or not getattr(self, "_run", None):
+            return ""
+        command = str(getattr(self.settings, "sensor_lsp_command", "") or "").strip()
+        if not command:
+            command = self._default_linter()
+        if not command:
+            return await self._import_sensor_failures()
+        seen, failures = set(), []
+        for artifact in self._run.artifacts:
+            path = Path(artifact.path)
+            if path.suffix != ".py" or path in seen or not path.is_file():
+                continue
+            seen.add(path)
+            result = await shell_exec(f"{command} {path}", timeout=30)
+            found = self._diagnostic_keys(result.to_text(), path)
+            if not found:
+                continue
+            baseline = self._diagnostic_baseline(str(path))
+            new = found - baseline
+            self._save_diagnostic_baseline(str(path), baseline | found)
+            for key in sorted(new)[:5]:
+                failures.append(f"{path}: {key}")
+        return "\n".join(failures)
+
+    @staticmethod
+    def _diagnostic_keys(text: str, path: Path) -> set:
+        """Normalize linter output to ``line: code message`` keys."""
+        keys = set()
+        for raw in str(text or "").splitlines():
+            line = raw.strip()
+            if not line or line.startswith(("Found ", "No errors", "Success", "All checks")):
+                continue
+            if str(path.name) not in line and ":" not in line:
+                continue
+            keys.add(re.sub(r"^.*?:\d+:", "", line).strip()[:200])
+        return keys
+
+    async def _import_sensor_failures(self) -> str:
+        """Import each touched module; catches NameError-class breakage a compile check misses."""
+        seen, failures = set(), []
+        for artifact in self._run.artifacts:
+            path = Path(artifact.path)
+            if path.suffix != ".py" or path in seen or not path.is_file():
+                continue
+            seen.add(path)
+            module = self._module_name(path)
+            if not module:
+                continue
+            result = await shell_exec(f"{sys.executable} -c \"import {module}\"", timeout=30)
+            if result.ok:
+                continue
+            reason = self._first_failure_line(result.to_text())
+            if self._new_failure(path, reason):
+                failures.append(f"{path}: import failed: {reason}")
+        return "\n".join(failures)
+
+    @staticmethod
+    def _module_name(path: Path) -> str:
+        """Dotted module path for a file inside this project, else empty."""
+        try:
+            parts = list(path.resolve().relative_to(Path.cwd().resolve()).with_suffix("").parts)
+        except ValueError:
+            return ""
+        if not parts or parts[0].startswith("."):
+            return ""
+        if parts[-1] == "__init__":
+            parts.pop()
+        return ".".join(parts)
+
+    def _default_linter(self) -> str:
+        """Ruff or pyflakes when installed; otherwise nothing to run."""
+        if shutil.which("ruff"):
+            return "ruff check --quiet --output-format=concise"
+        if shutil.which("pyflakes"):
+            return "pyflakes"
+        return ""
+
+    def _diagnostic_baseline(self, path: str) -> set:
+        """Diagnostics already present before this session's edits."""
+        store = getattr(self, "_diag_baseline", None)
+        if store is None:
+            store = {}
+            self._diag_baseline = store
+        return store.get(path, set())
+
+    def _save_diagnostic_baseline(self, path: str, keys: set) -> None:
+        self._diagnostic_baseline(path)
+        self._diag_baseline[path] = keys
 
     def _file_sensor_failures(self) -> str:
         """Compile or parse every artifact this run wrote; report what broke."""
@@ -1088,9 +1391,43 @@ class StemAgent:
                 continue
             seen.add(artifact.path)
             reason = self._check_file(Path(artifact.path))
-            if reason:
+            if reason and self._new_failure(Path(artifact.path), reason):
                 failures.append(reason)
         return "\n".join(failures)
+
+    def _capture_baseline(self, path: str) -> None:
+        """Remember the file's pre-edit state so old breakage is not blamed on this edit."""
+        if not path:
+            return
+        store = getattr(self, "_file_baseline", None)
+        if store is None:
+            store = {}
+            self._file_baseline = store
+        target = Path(path)
+        store[path] = target.read_bytes() if target.is_file() else None
+
+    def _new_failure(self, path: Path, reason: str) -> bool:
+        """True when this failure was not already present before the edit."""
+        store = getattr(self, "_file_baseline", {}) or {}
+        if str(path) not in store:
+            return True
+        before = store[str(path)]
+        if before is None:
+            return True
+        try:
+            previous = before.decode("utf-8", "replace")
+            if path.suffix.lower() == ".py":
+                compile(previous, str(path), "exec")
+            elif path.suffix.lower() == ".json":
+                json.loads(previous)
+            elif path.suffix.lower() in (".yaml", ".yml"):
+                import yaml
+                yaml.safe_load(previous)
+            else:
+                return True
+        except Exception:
+            return False
+        return True
 
     @staticmethod
     def _check_file(path: Path) -> str:
@@ -1153,12 +1490,20 @@ class StemAgent:
         """Close the run with a terminal status exactly once."""
         if self._run is not None:
             final = self.coordinator.finish(status, self._run)
+            actual = final or self._run.status or status
             if final is not None:
                 self._emit_run("run_end", self.name, status=final.value, output=message)
-            self._record_run_summary(status, message)
+            self._record_run_summary(actual, message)
+            self._score_recalled_memory(actual)
+            try:
+                from src.core.memory import PeerCards
+                PeerCards().flush()
+                self.memory._kg.flush()
+            except Exception:
+                pass
         self.trace.close()
         self._set_status(False)
-        self._score_recalled_memory(status)
+        self._restore_primary()
         return message
 
     def _record_run_summary(self, status: RunStatus, message: str) -> None:
@@ -1191,23 +1536,28 @@ class StemAgent:
     async def _finish_response(self) -> Optional[str]:
         """Close a response()-ended turn, or re-prompt when verification still fails."""
         self._response_called = False
-        self._repeat_count = 0
-        self._last_stable_result = None
+        self._turn_signatures = []
         queued, terminal = await self._verify_or_repair()
         if terminal is not None:
             return terminal
         if queued:
             return None
         answer = self._response_value or ""
-        self.trace.answer(answer or "(empty)", streamed=self._streamed_answer(answer))
+        self._answer_streamed = self._streamed_answer(answer)
+        self.trace.answer(answer or "(empty)", streamed=self._answer_streamed)
         if answer and (not self.history or self.history[-1].get("content") != answer):
             self.history.append({"role": "assistant", "content": answer})
+            self._persist_turn("assistant", answer)
         return self._finish(RunStatus.DONE, answer)
 
     async def run(self, task: str) -> str:
         self.interrupt_event.clear()
         self._tripwire_errors = {}
         self._terminal_calls.clear()
+        self._compactions = 0
+        self._sensor_attempts = 0
+        self._empty_total = 0
+        self._turn_signatures = []
         if not task or not isinstance(task, str):
             return "Error: Invalid task"
         task = task.strip()
@@ -1224,7 +1574,7 @@ class StemAgent:
             from src.skills_loader import skill_index
             skill_contract = skill_index.get(self.skill_name)
             if skill_contract:
-                pre_err = SkillEngine.validate_pre(skill_contract, {"task": task})
+                pre_err = SkillEngine.validate_pre(skill_contract, task, set(self._active_tools()))
                 if pre_err:
                     return f"PRE-VALIDATION FAILED: {pre_err}"
         except Exception:
@@ -1236,22 +1586,22 @@ class StemAgent:
         self.invalidate_cache()
         self._response_called = False
         self._response_value = ""
-        self._answer_painted = False
+        self._answer_streamed = False
         self._set_status(True)
         self._run = Run.create(task, self.name, max_steps=max_steps, parent_run_id=getattr(getattr(self, "_parent_run", None), "id", None))
         self._run.status = RunStatus.RUNNING
         self.trace.bind(self._run.id)
-        self.trace.paint = not self._silent
         self.trace.paint = not self._silent
         self.coordinator.begin()
         self._runtime = self._build_runtime()
         self._run.budget.max_tool_calls = getattr(self.settings, "max_tool_calls", 200)
         self._run.budget.max_delegations = getattr(self.settings, "max_delegations", 12)
         self._run.budget.max_parallel_agents = getattr(self.settings, "max_parallel_agents", 4)
-        self._run.budget.max_file_writes = int(getattr(self.settings, "max_file_writes", 0) or 0)
+        self._run.budget.max_file_writes = int(getattr(self.settings, "max_file_writes", 20) or 20)
         self._run.plan.add(Task(id="root", objective=task, agent=self.name))
         self._run.metadata["cost_usd"] = 0.0
-        deadline = time.monotonic() + max(0, int(getattr(self.settings, "run_timeout", 0)))
+        timeout = int(getattr(self.settings, "run_timeout", 0) or 0)
+        deadline = (time.monotonic() + timeout) if timeout > 0 else None
         try:
             while step < max_steps:
                 step += 1
@@ -1260,6 +1610,11 @@ class StemAgent:
                     return self._finish(RunStatus.TIMEOUT, "Error: Run timeout exceeded.")
                 self._run.budget.steps = step
                 self.trace.step(step)
+                if self._cost_exhausted():
+                    spent = float(self._run.metadata.get("cost_usd", 0.0))
+                    ceiling = float(getattr(self.settings, "max_cost_usd", 0.0))
+                    self._log(self.name, f"Cost ceiling reached (${spent:.4f} > ${ceiling:.4f})", "error", self.mode)
+                    return self._finish(RunStatus.BUDGET, f"Stopped: cost ceiling reached (${spent:.4f} > ${ceiling:.4f}).")
                 if self.interrupt_event.is_set():
                     self.interrupt_event.clear()
                     self._log(self.name, "Stopped by user", "ptc_error", self.mode)
@@ -1275,9 +1630,10 @@ class StemAgent:
                 await self._trim_history()
                 if self._cached_system_prompt is None:
                     role_cfg = load_role(self.skill_name) or load_role("system")
-                    self._cached_system_prompt = self._build_system_prompt(role_cfg, include_roles=self.skill_name == "system", user_input=task)
-                    self._prompt_hash = hashlib.sha1(self._cached_system_prompt.encode("utf-8", "replace")).hexdigest()[:12]
-                tokens = count_tokens(self.history, "")[0]
+                    self._cached_system_prompt = self._build_system_prompt(role_cfg, user_input=task)
+                    stable = getattr(self, "_stable_prefix", "") or self._cached_system_prompt
+                    self._prompt_hash = hashlib.sha1(stable.encode("utf-8", "replace")).hexdigest()[:12]
+                tokens = count_tokens(self.history, "")[0] + count_tokens(self._cached_system_prompt or "", "")[0]
                 cost = float(self._run.metadata.get("cost_usd", 0.0) or 0.0)
                 self.trace.emit(
                     "step", self.name,
@@ -1296,6 +1652,9 @@ class StemAgent:
                     except asyncio.TimeoutError:
                         max_retries = max(1, int(getattr(self.settings, "max_retries", 3)))
                         if attempt >= max_retries:
+                            if self._activate_fallback("provider timeout"):
+                                attempt = 0
+                                continue
                             return self._finish(RunStatus.FAILED, f"Error: Provider timeout after {max_retries} attempts.")
                         self._log(self.name, f"Timeout, retry {attempt}/{max_retries}", "ptc_error", self.mode)
                         await asyncio.sleep(2 * attempt)
@@ -1316,6 +1675,9 @@ class StemAgent:
                         elif "429" in str(e) or "rate limit" in err:
                             max_retries = max(1, int(getattr(self.settings, "max_retries", 3)))
                             if attempt >= max_retries:
+                                if self._activate_fallback("rate limited"):
+                                    attempt = 0
+                                    continue
                                 return self._finish(RunStatus.FAILED, f"Error: {e}")
                             self._log(self.name, f"Rate limited, retry {attempt}/{max_retries}", "ptc_error", self.mode)
                             await asyncio.sleep(5 * attempt)
@@ -1325,11 +1687,14 @@ class StemAgent:
                                 return self._finish(RunStatus.FAILED, f"Error: {e}")
                             self._log(self.name, f"Provider empty response, retry {attempt}/{max_retries}", "ptc_error", self.mode)
                             await asyncio.sleep(3 * attempt)
+                        elif is_provider_fault(e) and self._activate_fallback(f"{type(e).__name__}: {e}"):
+                            self.invalidate_cache()
+                            attempt = 0
+                            continue
                         else:
                             import traceback
                             self._log(self.name, f"{type(e).__name__}: {e}\n{traceback.format_exc()[-800:]}", "ptc_error", self.mode)
                             return self._finish(RunStatus.FAILED, f"Error: {e}")
-                # One decision per turn: what does this message ask the loop to do?
                 specs = self._tool_specs()
                 intent = parse_turn(response, set(specs) | TERMINAL_TOOLS, specs)
                 if intent.source == "auto-ptc" and not getattr(self.settings, "ptc_auto_detect", True):
@@ -1353,21 +1718,24 @@ class StemAgent:
                 shell_blocks = self._looks_like_shell(response) if getattr(self.settings, "legacy_shell_blocks_enabled", False) else []
                 for lang, cmd in shell_blocks:
                     shell_result = await self._execute_tool("shell", {"command": cmd})
-                    self.history.append({"role": "assistant", "content": f"[SHELL {lang}]\n{cmd}\n[OUTPUT]\n{shell_result}"})
+                    self._record_tool_result("shell", f"$ {cmd}\n{shell_result}")
 
                 if intent.kind == "retry":
-                    hint = "Your previous response was raw XML/HTML." if intent.source == "markup" else "You returned nothing."
-                    self._empty_count = getattr(self, "_empty_count", 0) + 1
+                    hint = {
+                        "markup": "That was raw XML/HTML, not a tool call or an answer.",
+                        "broken-call": f"That tool call did not parse: {getattr(intent, 'reason', '')}. "
+                                       f"Valid tools: {', '.join(sorted(specs))}.",
+                    }.get(intent.source, "You returned nothing.")
                     self._empty_total = getattr(self, "_empty_total", 0) + 1
-                    if self._empty_total >= 9:
-                        return self._finish(RunStatus.FAILED, "[ERROR] Provider returned empty repeatedly. Halted.")
-                    if self._empty_count >= 3:
-                        self._empty_count = 0
-                        self._log(self.name, "Provider returned no usable turn 3x.", "ptc_error", self.mode)
-                        self.history.append({"role": "user", "content": f"[LOOP] {hint} Emit a ```python block, a ::tool line, or a plain final answer now."})
+                    if self._empty_total >= 6:
+                        return self._finish(RunStatus.FAILED, "[ERROR] Provider returned no usable turn repeatedly. Halted.")
+                    if response.strip():
+                        self.history.append({"role": "assistant", "content": response})
+                    self._log(self.name, hint, "ptc_error", self.mode)
+                    self.history.append({"role": "user", "content":
+                                         f"[LOOP] {hint} Emit a ```python block, a ::tool line, or a plain final answer now."})
                     self.invalidate_cache()
                     continue
-                self._empty_count = 0
                 self._empty_total = 0
 
                 if intent.kind == "calls":
@@ -1379,16 +1747,15 @@ class StemAgent:
                         if raw_output and str(raw_output).startswith("PTC ") and self._record_error_tripwire(str(raw_output)):
                             return self._finish(RunStatus.FAILED, raw_output)
                         if raw_output and (not self.history or self.history[-1].get("content") != raw_output):
-                            self.history.append({"role": "assistant", "content": raw_output})
+                            self._record_tool_result("python", raw_output)
                         stable = str(raw_output)
                     else:
                         outputs = []
                         for call in intent.calls:
                             result = await self._execute_tool(call.name, call.args)
+                            self._record_tool_result(call.name, result)
                             outputs.append(f"{call.name} -> {result}")
                         stacked = "\n".join(outputs)
-                        if stacked:
-                            self.history.append({"role": "assistant", "content": stacked})
                         stable = stacked
                     if self._response_called:
                         done = await self._finish_response()
@@ -1397,37 +1764,35 @@ class StemAgent:
                         continue
                     if "Error" in stable or "Timeout" in stable:
                         stable = re.sub(r'\d{2}:\d{2}:\d{2}|[0-9a-f]{8}-[0-9a-f-]{8,}', '', stable)
-                    if stable == self._last_stable_result:
-                        self._repeat_count += 1
-                        if self._repeat_count >= 3:
-                            self._set_status(False)
-                            self._log(self.name, f"Loop detected: same result {self._repeat_count}x", "loop", self.mode)
-                            self.history.append({"role": "user", "content": f"[LOOP] Same result {self._repeat_count}x. Change strategy: different tool, different args, or answer with what you have."})
-                            self._repeat_count = 0
-                            self._last_stable_result = None
-                            self.invalidate_cache()
-                            continue
-                    else:
-                        self._repeat_count = 0
-                        self._last_stable_result = stable
+                    shape = self._stagnation(self._call_shape(intent) + "\n---\n" + stable.strip()[:400])
+                    if shape:
+                        self._set_status(False)
+                        self._log(self.name, f"Stagnation detected: {shape}", "loop", self.mode)
+                        self.history.append({"role": "user", "content": (
+                            f"[LOOP] Stagnation detected: {shape}. The last turns repeated without progress. "
+                            "Different tool, different arguments, or answer with what you have.")})
+                        self.invalidate_cache()
+                        continue
                     self._set_status(False)
                     self.invalidate_cache()
                     continue
 
-                # intent.kind == "answer"
                 if intent.calls:
                     self.history.append({"role": "assistant", "content": response})
                     for call in intent.calls:
                         result = await self._execute_tool(call.name, call.args)
-                        self.history.append({"role": "assistant", "content": f"{call.name} -> {result}"})
+                        self._record_tool_result(call.name, result)
                 clean_response = (intent.answer or "").strip()
                 if intent.source == "prose":
                     clean_response = strip_ptc(clean_response, set(specs))
                 if not clean_response.strip():
-                    self._empty_count = getattr(self, "_empty_count", 0) + 1
-                    if self._empty_count >= 3:
-                        self._empty_count = 0
-                        self.history.append({"role": "user", "content": "[LOOP] Emit a ```python block or a final answer now."})
+                    self._empty_total = getattr(self, "_empty_total", 0) + 1
+                    if self._empty_total >= 6:
+                        return self._finish(RunStatus.FAILED, "[ERROR] Provider returned no usable turn repeatedly. Halted.")
+                    if response.strip():
+                        self.history.append({"role": "assistant", "content": response})
+                    self.history.append({"role": "user", "content":
+                                         "[LOOP] That message carried no answer. Emit a ```python block, a ::tool line, or a plain final answer."})
                     self.invalidate_cache()
                     continue
                 queued, terminal = await self._verify_or_repair()
@@ -1435,8 +1800,10 @@ class StemAgent:
                     return terminal
                 if queued:
                     continue
-                self.trace.answer(clean_response, streamed=self._streamed_answer(clean_response))
+                self._answer_streamed = self._streamed_answer(clean_response)
+                self.trace.answer(clean_response, streamed=self._answer_streamed)
                 self.history.append({"role": "assistant", "content": clean_response})
+                self._persist_turn("assistant", clean_response)
                 if not self._is_delegated and self._memory_on and len(clean_response) > 20:
                     task = asyncio.create_task(self.memory.add_memory(f"TASK: {task[:250]} => OUTCOME: {clean_response[:250]}", category="lesson", tier="recent", source="auto"))
                     self._background_tasks.add(task)

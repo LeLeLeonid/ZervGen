@@ -1,8 +1,9 @@
 ---
 name: provider
 description: "Choose, configure and switch LLM providers without hardcoding prices"
+when_not: "the provider and key are already working"
 tags: [provider, providers, model, models, llm, openrouter, anthropic, openai, gemini, ollama, lmstudio, api-key, cost, pricing]
-tools: ["read_file", "write_file", "shell", "response"]
+tools: ["read", "write", "shell", "response"]
 contract:
   pre: {}
   post: {}
@@ -21,7 +22,7 @@ Providers live in `src/providers/`. Settings live in `config.json` (`provider`, 
 ## Inspect
 
 ```python
-config = await read_file("config.json")
+config = await read("config.json")
 ```
 
 Relevant keys:
@@ -41,7 +42,7 @@ If the catalog has no entry, the model is treated as free-local. That is a fallb
 ## Add a provider
 
 ```python
-await write_file(".zervgen/.env", content="DEEPSEEK_API_KEY=sk-...\n")
+await write(".zervgen/.env", content="DEEPSEEK_API_KEY=sk-...\n")
 ```
 
 ```json

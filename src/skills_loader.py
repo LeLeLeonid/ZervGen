@@ -1,5 +1,5 @@
+import os
 import re
-import threading
 import logging
 import time
 import yaml
@@ -23,11 +23,19 @@ MAX_DEPTH = 6
 SKIP_DIRS = {"node_modules", "__pycache__", "site-packages", ".git"}
 TOOL_ALIASES = {
     "terminal": "shell",
-    "web_extract": "fetch_url",
-    "browser_exec": "shell",
-    "delegate_task": "delegate_to",
-    "read": "read_file",
-    "write": "write_file",
+    "web_extract": "fetch",
+    "sh": "shell",
+    "delegate_task": "delegate",
+    "read_file": "read",
+    "write_file": "write",
+    "append_file": "append",
+    "edit_file": "edit",
+    "list_files": "ls",
+    "glob_files": "glob",
+    "grep_files": "grep",
+    "search_memory": "recall",
+    "add_memory": "remember",
+    "load_skill": "skill",
 }
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 
@@ -81,9 +89,11 @@ def _contract(raw: Any) -> Dict[str, Any]:
 def _parse_frontmatter(text: str) -> Optional[dict]:
     if not text.startswith("---"):
         return None
+    match = re.search(r"^---\s*$", text[3:], re.MULTILINE)
+    if not match:
+        return None
     try:
-        end = text.index("---", 3)
-        raw = yaml.safe_load(text[3:end]) or {}
+        raw = yaml.safe_load(text[3:3 + match.start()]) or {}
     except Exception:
         return None
     if not isinstance(raw, dict) or not raw.get("name") or not raw.get("description"):
@@ -92,6 +102,8 @@ def _parse_frontmatter(text: str) -> Optional[dict]:
     fm = dict(raw)
     fm["tags"] = _as_list(flat.get("tags") or flat.get("keywords"))
     fm["related"] = _as_list(flat.get("related_skills") or flat.get("related"))
+    when_not = flat.get("when_not") or flat.get("when-not") or ""
+    fm["when_not"] = " ".join(str(when_not).split()) if when_not else ""
     fm["category"] = str(flat.get("category") or "").strip().lower()
     fm["version"] = str(flat.get("version") or "").strip()
     fm["license"] = str(flat.get("license") or "").strip()
@@ -117,6 +129,7 @@ SKILL_FIELDS = {
     "name", "description", "tags", "keywords", "tools", "allowed-tools",
     "contract", "procedure", "dependencies", "verification", "version",
     "license", "related", "related_skills", "category", "metadata", "meta",
+    "when_not", "when-not",
 }
 
 
@@ -183,16 +196,21 @@ def _iter_skill_files(root: Path):
 
 def list_resources(path: Path) -> List[str]:
     base = Path(path).parent
+    root = base.resolve()
     found = []
     for folder in SUPPORT_DIRS:
         area = base / folder
         if not area.is_dir():
             continue
         for item in sorted(area.rglob("*")):
-            if any(part in SKIP_DIRS or part.startswith(".") for part in item.parts):
+            try:
+                relative = item.resolve().relative_to(root)
+            except (OSError, ValueError):
+                continue
+            if any(part in SKIP_DIRS or part.startswith(".") for part in relative.parts):
                 continue
             if item.is_file() and not item.is_symlink():
-                found.append(str(item.relative_to(base)))
+                found.append(str(relative))
     return found[:60]
 
 
@@ -236,7 +254,8 @@ def rebuild_catalog(force: bool = False) -> dict:
                 collisions += 1
                 continue
             tags = list(fm["tags"])
-            if "favorite" in old.get(name, {}).get("tags", []) and "favorite" not in tags:
+            previous = (old.get("skills") or {}).get(name) or {}
+            if "favorite" in (previous.get("tags") or []) and "favorite" not in tags:
                 tags.append("favorite")
             catalog[name] = {
                 "path": str(md),
@@ -248,30 +267,52 @@ def rebuild_catalog(force: bool = False) -> dict:
             }
     if collisions:
         logger.info("Skill catalog: %d duplicate name(s) ignored", collisions)
-    CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CATALOG_PATH.write_text(
-        json.dumps({"_stamp": stamp, "_built": time.time(), "skills": catalog}, indent=2)
-    )
+    _write_catalog({"_stamp": stamp, "_built": time.time(), "skills": catalog})
     return catalog
+
+
+def _write_catalog(payload: dict) -> None:
+    """Best-effort atomic catalog write; never fatal, never leaves a half file."""
+    try:
+        CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temp = CATALOG_PATH.with_suffix(".tmp")
+        temp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(temp, CATALOG_PATH)
+    except OSError as exc:
+        logger.debug("Skill catalog not persisted: %s", exc)
 
 
 class SkillEngine:
 
     @staticmethod
-    def validate_pre(skill: Any, args: Dict[str, Any]) -> Optional[str]:
-        missing = [k for k, v in skill.pre.items() if k not in args or not args[k]]
-        return f"PRE-FAIL: Missing {missing}" if missing else None
+    def validate_pre(skill: Any, task: str = "", active_tools: Optional[set] = None) -> Optional[str]:
+        """Check the requirements a skill declares it cannot run without."""
+        pre = skill.pre or {}
+        missing = []
+        if pre.get("tools") and active_tools is not None:
+            missing += [f"tool {name}" for name in pre["tools"] if name not in active_tools]
+        if pre.get("files"):
+            missing += [f"file {path}" for path in pre["files"] if not Path(path).exists()]
+        return f"PRE-FAIL: missing {', '.join(missing)}" if missing else None
 
     @staticmethod
     def validate_post(skill: Any, result: Any) -> Optional[str]:
-        if "required_keys" in skill.post:
-            keys = skill.post["required_keys"]
-            if isinstance(result, list) and result:
-                if not all(k in result[0] for k in keys):
-                    return f"POST-FAIL: Missing keys {keys}"
-            elif isinstance(result, dict):
-                if not all(k in result for k in keys):
-                    return f"POST-FAIL: Missing keys {keys}"
+        """Check the output shape a skill declares it must return."""
+        if "required_keys" not in (skill.post or {}):
+            return None
+        keys = skill.post["required_keys"]
+        data = result
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except (json.JSONDecodeError, TypeError):
+                return "POST-FAIL: result is prose, expected an object with " + ", ".join(keys)
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if isinstance(data, dict):
+            missing = [k for k in keys if k not in data]
+            if missing:
+                return f"POST-FAIL: missing keys {missing}"
         return None
 
     @staticmethod
@@ -314,13 +355,14 @@ GRADE: [1-5]"""
 class SkillDef:
     name: str
     description: str = ""
+    when_not: str = ""
     tags: List[str] = field(default_factory=list)
     tools: List[str] = field(default_factory=list)
     pre: Dict[str, Any] = field(default_factory=dict)
     post: Dict[str, Any] = field(default_factory=dict)
     procedure: List[str] = field(default_factory=list)
     dependencies: List[str] = field(default_factory=list)
-    verification: str = "checklist"  # "checklist" or "heavy"
+    verification: str = "checklist"
     body: str = ""
     path: str = ""
     files: List[str] = field(default_factory=list)
@@ -349,6 +391,14 @@ class SkillDef:
                     return True
         return False
 
+    def suppressed(self, user_input: str) -> bool:
+        """True when the request hits this skill's explicit negative trigger."""
+        if not self.when_not:
+            return False
+        words = set(re.findall(r"[a-z0-9]+", (user_input or "").lower()))
+        hits = set(re.findall(r"[a-z0-9]+", self.when_not.lower())) & words
+        return len(hits) >= 2
+
     @property
     def is_favorite(self) -> bool:
         return "favorite" in self.tags or not self.external
@@ -376,6 +426,7 @@ class SkillRegistry:
                 self.skills[name] = SkillDef(
                     name=name,
                     description=meta["description"],
+                    when_not=str(meta.get("when_not") or ""),
                     tags=meta["tags"],
                     body="",
                     path=meta["path"],
@@ -388,8 +439,6 @@ class SkillRegistry:
     def _load_all(self):
         for md_file in sorted(SKILLS_DIR.rglob("*.md")):
             relative = md_file.relative_to(SKILLS_DIR)
-            if AGENTS_DIR in md_file.parents:
-                continue
             if md_file.name != SKILL_FILE and len(relative.parts) != 2:
                 continue
             self._load_file(md_file)
@@ -407,6 +456,7 @@ class SkillRegistry:
             self.skills[fm["name"]] = SkillDef(
                 name=fm["name"],
                 description=fm["description"],
+                when_not=fm.get("when_not", ""),
                 tags=fm["tags"],
                 tools=fm["tools"],
                 pre=contract["pre"],
@@ -524,6 +574,8 @@ class SkillRegistry:
             entry = f"  - {skill.name}"
             if desc_chars and skill.description:
                 entry += ": " + skill.description[:desc_chars]
+            if desc_chars and skill.when_not:
+                entry += f" (not when: {skill.when_not[:desc_chars]})"
             if skill.name in matched:
                 entry += "  [match]"
             lines.append(entry)
@@ -538,11 +590,11 @@ class SkillRegistry:
         if not pool:
             return ""
         head = ("--- SKILL INDEX ---\n"
-                "Load a skill with load_skill(name) when its description matches the task.")
+                "Load a skill with skill(name) when its description matches the task.")
         budget = max(400, int(budget_chars))
         shown = pool[:max(1, int(max_skills))]
         omitted = len(pool) - len(shown)
-        tail = f"\n({omitted} more skills omitted; use find_skill(tags))" if omitted else ""
+        tail = f"\n({omitted} more skills omitted; use find(tags))" if omitted else ""
         if matched:
             tail += "\n[match] = relevant to this request; load it before acting."
         for width in (desc_chars, 40, 0):
@@ -567,7 +619,14 @@ class SkillRegistry:
                 skill.body = text.split("---", 2)[2].strip() if text.startswith("---") else text
             except Exception as e:
                 return f"Error: cannot read {skill.path}: {e}"
-        return skill.body or "(empty)"
+        body = skill.body or "(empty)"
+        head = []
+        if skill.dependencies:
+            head.append("Depends on: " + ", ".join(skill.dependencies)
+                        + ". Load each with skill(name) before using this one.")
+        if skill.procedure:
+            head.append("Procedure:\n" + "\n".join(f"{i}. {step}" for i, step in enumerate(skill.procedure, 1)))
+        return "\n\n".join(head + [body])
 
     def pin(self, name: str) -> str:
         skill = self.skills.get(name)
@@ -577,14 +636,10 @@ class SkillRegistry:
             return f"'{name}' is already a favorite."
         catalog = rebuild_catalog()
         entry = catalog.setdefault(name, {"path": skill.path, "description": skill.description, "tags": []})
-        entry.setdefault("tags", []).append("favorite")
-        CATALOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CATALOG_PATH.write_text(
-            json.dumps(
-                {"_stamp": _root_stamp(_external_roots()), "_built": time.time(), "skills": catalog},
-                indent=2,
-            )
-        )
+        tags = entry.setdefault("tags", [])
+        if "favorite" not in tags:
+            tags.append("favorite")
+        _write_catalog({"_stamp": _root_stamp(_external_roots()), "_built": time.time(), "skills": catalog})
         skill.tags.append("favorite")
         return f"'{name}' pinned as favorite."
 
@@ -665,16 +720,26 @@ def _load_from_path(path: Path) -> Optional[RoleConfig]:
         return None
 
 
+def _role_path(name: str) -> Optional[Path]:
+    name = str(name or "").strip()
+    if not name or len(name) > MAX_NAME or not _NAME_RE.match(name):
+        return None
+    for base in (AGENTS_DIR, SKILLS_DIR):
+        candidate = (base / f"{name}.md").resolve()
+        if base.resolve() not in candidate.parents:
+            continue
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def load_role(name: str) -> Optional[RoleConfig]:
-    agent_path = AGENTS_DIR / f"{name}.md"
-    if agent_path.exists():
-        return _load_from_path(agent_path)
-    path = SKILLS_DIR / f"{name}.md"
-    return _load_from_path(path)
+    path = _role_path(name)
+    return _load_from_path(path) if path else None
 
 
 def role_exists(name: str) -> bool:
-    return (AGENTS_DIR / f"{name}.md").exists() or (SKILLS_DIR / f"{name}.md").exists()
+    return _role_path(name) is not None
 
 
 def get_all_roles() -> Dict[str, RoleConfig]:

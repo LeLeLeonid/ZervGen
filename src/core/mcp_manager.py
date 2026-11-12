@@ -11,7 +11,9 @@ import re
 import shutil
 import tempfile
 import time
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.config import GlobalSettings, MCPServerConfig, load_config
 
@@ -47,6 +49,301 @@ _MAX_TOOL_NAME = 64
 BACKOFF_START = 30.0
 BACKOFF_MAX = 600.0
 DEAD_AFTER = 5
+
+MCP_STORE = Path("mcp.json")
+MCP_HOME_STORE = Path.home() / ".zervgen" / "mcp.json"
+
+
+def store_paths() -> List[Path]:
+    """User file first, project file last; the project wins on a name clash."""
+    return [path for path in (MCP_HOME_STORE, MCP_STORE) if path.exists()]
+
+
+@dataclass(frozen=True)
+class CatalogEntry:
+    """One installable server: transport plus the credentials it needs."""
+
+    name: str
+    description: str
+    command: str = ""
+    args: Tuple[str, ...] = ()
+    url: str = ""
+    env: Tuple[Tuple[str, str], ...] = ()
+
+    @property
+    def kind(self) -> str:
+        return "stdio" if self.command else "http"
+
+    def to_config(self, secrets: Optional[Dict[str, str]] = None) -> MCPServerConfig:
+        """Catalog entry as a config object; secrets stay as ``${VAR}`` refs."""
+        env = {key: f"${{{key}}}" for key, _ in self.env if (secrets or {}).get(key)}
+        return MCPServerConfig(
+            command=self.command,
+            args=list(self.args),
+            url=self.url,
+            env=env,
+            transport=self.kind,
+            enabled=True,
+        )
+
+
+MCP_CATALOG: Dict[str, CatalogEntry] = {
+    entry.name: entry for entry in (
+        CatalogEntry(
+            name="filesystem",
+            description="Read, write and search files under an allowed directory.",
+            command="npx",
+            args=("-y", "@modelcontextprotocol/server-filesystem", "."),
+        ),
+        CatalogEntry(
+            name="git",
+            description="Inspect and operate a git repository: status, log, diff, commit.",
+            command="python",
+            args=("-m", "mcp_server_git"),
+        ),
+        CatalogEntry(
+            name="fetch",
+            description="Fetch a URL and convert it to readable markdown.",
+            command="python",
+            args=("-m", "mcp_server_fetch"),
+        ),
+        CatalogEntry(
+            name="memory",
+            description="Persistent knowledge graph memory across sessions.",
+            command="npx",
+            args=("-y", "@modelcontextprotocol/server-memory"),
+        ),
+        CatalogEntry(
+            name="time",
+            description="Current time and timezone conversion.",
+            command="python",
+            args=("-m", "mcp_server_time"),
+        ),
+        CatalogEntry(
+            name="sequential-thinking",
+            description="Structured step-by-step reasoning scratchpad.",
+            command="npx",
+            args=("-y", "@modelcontextprotocol/server-sequential-thinking"),
+        ),
+        CatalogEntry(
+            name="context7",
+            description="Up-to-date, version-specific library documentation.",
+            url="https://mcp.context7.com/mcp",
+        ),
+        CatalogEntry(
+            name="deepwiki",
+            description="Ask questions about any public GitHub repository.",
+            url="https://mcp.deepwiki.com/mcp",
+        ),
+        CatalogEntry(
+            name="github",
+            description="Issues, pull requests, code search and repository operations.",
+            command="npx",
+            args=("-y", "@modelcontextprotocol/server-github"),
+            env=(("GITHUB_TOKEN", "GitHub personal access token"),),
+        ),
+        CatalogEntry(
+            name="playwright",
+            description="Drive a real browser: navigate, click, fill, screenshot.",
+            command="npx",
+            args=("-y", "@playwright/mcp@latest"),
+        ),
+        CatalogEntry(
+            name="puppeteer",
+            description="Headless Chrome automation and page scraping.",
+            command="npx",
+            args=("-y", "@modelcontextprotocol/server-puppeteer"),
+        ),
+        CatalogEntry(
+            name="everything",
+            description="Reference server exposing every MCP feature; for diagnostics.",
+            command="npx",
+            args=("-y", "@modelcontextprotocol/server-everything"),
+        ),
+    )
+}
+
+
+def catalog_entries() -> List[CatalogEntry]:
+    return sorted(MCP_CATALOG.values(), key=lambda entry: entry.name)
+
+
+def catalog_entry(name: str) -> Optional[CatalogEntry]:
+    return MCP_CATALOG.get((name or "").strip().lower())
+
+
+def search_catalog(query: str = "", limit: int = 20) -> List[Dict[str, Any]]:
+    """Catalog rows whose name contains the query; empty query lists everything."""
+    needle = (query or "").strip().casefold()
+    installed = load_store()
+    rows = [entry for entry in catalog_entries() if needle in entry.name.casefold()]
+    rows.sort(key=lambda entry: entry.name)
+    return [
+        {
+            "name": entry.name,
+            "description": entry.description,
+            "transport": entry.kind,
+            "target": entry.url or f"{entry.command} {' '.join(entry.args)}".strip(),
+            "env": [key for key, _ in entry.env],
+            "installed": entry.name in installed,
+        }
+        for entry in rows[:max(1, int(limit))]
+    ]
+
+
+def _read_store(path: Path) -> Dict[str, Dict[str, Any]]:
+    """The ``mcpServers`` table of one file, or {} when it is missing or broken."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    if not isinstance(servers, dict):
+        return {}
+    return {str(name): cfg for name, cfg in servers.items() if isinstance(cfg, dict)}
+
+
+def project_store() -> Dict[str, Dict[str, Any]]:
+    """Only the project ``mcp.json``; this is what writes mutate."""
+    return _read_store(MCP_STORE)
+
+
+def load_store() -> Dict[str, Dict[str, Any]]:
+    """Merged ``mcpServers`` from the user file and the project file."""
+    merged: Dict[str, Dict[str, Any]] = {}
+    for path in store_paths():
+        merged.update(_read_store(path))
+    return merged
+
+
+def save_store(servers: Dict[str, Dict[str, Any]]) -> None:
+    """Write the project ``mcp.json`` atomically, with no resolved secret."""
+    MCP_STORE.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"mcpServers": {name: cfg for name, cfg in sorted(servers.items())}}
+    tmp = MCP_STORE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, MCP_STORE)
+
+
+def ensure_store(defaults: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Create the project ``mcp.json`` on first run; stdio needs its command."""
+    if MCP_STORE.exists():
+        return load_store()
+    configured = _read_store(MCP_HOME_STORE)
+    seed: Dict[str, Dict[str, Any]] = {}
+    for name, cfg in (defaults or {}).items():
+        if name in configured:
+            continue
+        data = cfg.model_dump() if hasattr(cfg, "model_dump") else dict(cfg)
+        entry = _to_store_entry(data)
+        if entry.get("type") == "stdio":
+            entry["enabled"] = bool(shutil.which(str(entry.get("command") or "")))
+        else:
+            entry["enabled"] = True
+            entry["lazy"] = True
+        seed[name] = entry
+    save_store(seed)
+    return load_store()
+
+
+def _to_store_entry(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Config dict → mcp.json entry, dropping defaults and resolved secrets."""
+    entry: Dict[str, Any] = {}
+    if cfg.get("url"):
+        entry["type"] = "http" if (cfg.get("transport") or "auto") in ("auto", "http", "streamable-http") else cfg["transport"]
+        entry["url"] = cfg["url"]
+    else:
+        entry["type"] = "stdio"
+        entry["command"] = cfg.get("command", "")
+        if cfg.get("args"):
+            entry["args"] = list(cfg["args"])
+    for key in ("env", "headers"):
+        values = {k: v for k, v in (cfg.get(key) or {}).items() if "${" in str(v)}
+        if values:
+            entry[key] = values
+    if cfg.get("enabled"):
+        entry["enabled"] = True
+    if cfg.get("lazy"):
+        entry["lazy"] = True
+    if float(cfg.get("timeout") or 0) not in (0.0, 300.0):
+        entry["timeout"] = cfg["timeout"]
+    if float(cfg.get("connect_timeout") or 0) not in (0.0, 60.0):
+        entry["connect_timeout"] = cfg["connect_timeout"]
+    for key in ("tools_include", "tools_exclude"):
+        if cfg.get(key):
+            entry[key] = list(cfg[key])
+    return entry
+
+
+def _from_store_entry(name: str, cfg: Dict[str, Any]) -> MCPServerConfig:
+    """mcp.json entry → config object; ``type`` is the transport hint."""
+    return MCPServerConfig(
+        command=str(cfg.get("command") or ""),
+        args=[str(a) for a in (cfg.get("args") or [])],
+        url=str(cfg.get("url") or ""),
+        env={str(k): str(v) for k, v in (cfg.get("env") or {}).items()},
+        headers={str(k): str(v) for k, v in (cfg.get("headers") or {}).items()},
+        transport=str(cfg.get("type") or "auto"),
+        enabled=bool(cfg.get("enabled", False)),
+        lazy=bool(cfg.get("lazy", False)),
+        timeout=float(cfg.get("timeout", 300.0)),
+        connect_timeout=float(cfg.get("connect_timeout", 60.0)),
+        tools_include=[str(p) for p in (cfg.get("tools_include") or [])],
+        tools_exclude=[str(p) for p in (cfg.get("tools_exclude") or [])],
+    )
+
+
+def store_configs() -> Dict[str, MCPServerConfig]:
+    """Every server in ``mcp.json``, keyed by name."""
+    return {name: _from_store_entry(name, cfg) for name, cfg in load_store().items()}
+
+
+def install_from_catalog(name: str, secrets: Optional[Dict[str, str]] = None,
+                         enable: bool = True) -> str:
+    """Install one catalog entry into ``mcp.json``; secrets go to the env file."""
+    entry = catalog_entry(name)
+    if entry is None:
+        near = ", ".join(e.name for e in search_catalog(name, limit=3))
+        return f"Error: '{name}' is not in the MCP catalog." + (f" Closest: {near}." if near else "")
+    from src.config import save_env_var
+
+    secrets = {k: v for k, v in (secrets or {}).items() if v}
+    missing = [key for key, _ in entry.env if not secrets.get(key)]
+    if missing:
+        return (f"Error: '{entry.name}' needs {', '.join(missing)}. "
+                f"Call mcp_install(name='{entry.name}', env={{'{missing[0]}': '...'}}).")
+    written = [key for key, value in secrets.items() if save_env_var(key, value)]
+    store = project_store()
+    store[entry.name] = _to_store_entry(entry.to_config(secrets).model_dump())
+    if not enable:
+        store[entry.name]["enabled"] = False
+    save_store(store)
+    note = f"; secrets stored in .env: {', '.join(written)}" if written else ""
+    return f"MCP server '{entry.name}' installed ({entry.kind}){note}."
+
+
+def uninstall_from_catalog(name: str) -> str:
+    """Remove one server from ``mcp.json`` and ``config.json``; env vars stay."""
+    store = project_store()
+    removed = []
+    if name in store:
+        store.pop(name)
+        save_store(store)
+        removed.append(str(MCP_STORE))
+    config = load_config()
+    servers = dict(getattr(config, "mcp_servers", {}) or {})
+    if name in servers:
+        servers.pop(name)
+        config.mcp_servers = servers
+        config.save()
+        removed.append("config.json")
+    if not removed:
+        return f"Error: '{name}' is not installed."
+    return f"MCP server '{name}' removed from {', '.join(removed)}."
 
 
 def _unwrap(exc: BaseException) -> BaseException:
@@ -411,6 +708,18 @@ class MCPManager:
             task = server._bg_task
             if task and not task.done():
                 task.cancel()
+
+    def reload_from_store(self) -> None:
+        """Rebuild the server table from ``mcp.json`` after an install or removal."""
+        from src.config import CONFIG_PATH, _merge_mcp_servers
+
+        try:
+            raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            configured = raw.get("mcp_servers") or {}
+        except (OSError, json.JSONDecodeError):
+            configured = {}
+        self.settings.mcp_servers = _merge_mcp_servers(configured)
+        self.reload()
 
     def list_servers(self) -> List[str]:
         return list(self.servers.keys())

@@ -1,6 +1,7 @@
 ---
 name: skill-creator
 description: "Create and modify ZervGen skills/agents with minimal frontmatter"
+when_not: "editing an existing skill body"
 tags: [skill, meta, skill-creator, template, agent]
 contract:
   pre: {}
@@ -10,7 +11,7 @@ procedure:
   - Generate YAML frontmatter + Markdown body
   - Write to correct directory
   - Verify syntax & reload index
-dependencies: [write_file, list_files, skill_index.reload]
+dependencies: [write, ls]
 verification: checklist
 ---
 # Skill Creator
@@ -23,21 +24,21 @@ Required, enforced by `validate_skill` on every load — a skill that fails is l
 
 - `name` — must equal the file stem (or the directory name for `SKILL.md`), lowercase `[a-z0-9._-]`, max 64 chars.
 - `description` — one line, max 1024 chars. This is what the index shows; write it as a trigger.
-- `tags` — non-empty list. These drive `match_trigger`; include the words a user would actually type.
+- `tags` — non-empty ls. These drive `match_trigger`; include the words a user would actually type.
 
 Optional, with defaults filled in by the loader:
 
-- `tools` — list of tool names this skill needs. Use `["all"]` only for orchestrator roles.
+- `tools` — ls of tool names this skill needs. Use `["all"]` only for orchestrator roles.
 - `contract.pre` / `contract.post` — mappings. `post` keys are checked against the result.
-- `procedure` — ordered list. The critic grades against it when `critic_enabled`.
-- `dependencies` — list of tools or skills that must load first.
+- `procedure` — ordered ls. The critic grades against it when `critic_enabled`.
+- `dependencies` — tools or skills that must be available first; `skill(name)` lists them before the body.
 - `verification` — `checklist` (default) or `heavy`.
 - `related`, `version`, `license`, `category`, `metadata`.
 
 Unknown top-level fields are rejected. Do not invent keys.
 
 ## Directory Map
-- `src/skills/AGENTS/` — Full agents. Requires `tools: [...]`. Spawned via `delegate_to()`.
+- `src/skills/AGENTS/` — Full agents. Requires `tools: [...]`. Spawned via `delegate()`.
 - `src/skills/UTILITIES/` — Context hints, routing triggers, PTC patterns.
 - `src/skills/INTEGRATION/` — External APIs, webhooks, MCP bridges.
 
@@ -45,17 +46,17 @@ One skill per file. A directory with a `SKILL.md` (plus optional `references/`, 
 
 ## How to Create a Skill
 
-Use `write_file()` to create the skill file:
+Use `write()` to create the skill file:
 
 ```python
-# Create a new agent (has tools, spawned via delegate_to)
-result = await write_file(
+# Create a new agent (has tools, spawned via delegate)
+result = await write(
     path="src/skills/AGENTS/my_agent.md",
     content='''---
 name: my_agent
 description: "Short description of what this agent does"
 tags: [agent, domain]
-tools: ["read_file", "write_file", "shell", "response"]
+tools: ["read", "write", "shell", "response"]
 ---
 # My Agent
 
@@ -73,7 +74,7 @@ return await response(text=result)
 
 ```python
 # Create a utility skill (no tools, just context hints)
-result = await write_file(
+result = await write(
     path="src/skills/UTILITIES/my_skill.md",
     content='''---
 name: my_skill
@@ -94,5 +95,5 @@ return await response(text=result)
 - `name` matches filename (lowercase, hyphens)
 - Markdown body contains triggers, steps, constraints
 - Call `skill_index.reload()` after writing
-- Test agents: `delegate_to(agent_name="name", task="test")`
-- Test utilities: `find_skill(tags=["tag"])`
+- Test agents: `delegate(agent_name="name", task="test")`
+- Test utilities: `find(tags=["tag"])`

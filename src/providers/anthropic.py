@@ -1,13 +1,16 @@
+import base64
 import json
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
 from src.config import AnthropicSettings
 from src.core.provider import (
+    is_provider_fault,
     AIProvider,
     ProviderError,
     ProviderMeta,
     get_http_client,
+    load_image,
     normalize_messages,
     raise_for_status,
     split_system,
@@ -175,8 +178,9 @@ class Provider(AIProvider):
                     self._succeed()
                     return result
             result = await self._non_stream(self._payload(history, system_prompt, False))
-        except Exception:
-            self._fail()
+        except Exception as exc:
+            if is_provider_fault(exc):
+                self._fail()
             raise
         self._succeed()
         return result
@@ -187,5 +191,21 @@ class Provider(AIProvider):
     async def generate_audio(self, text: str) -> bytes:
         raise NotImplementedError("Anthropic does not support audio generation")
 
+    @async_retry(retries=3, delays=[2, 5, 10])
     async def analyze_image(self, prompt: str, image_path_or_url: str) -> str:
-        raise NotImplementedError("Anthropic vision not implemented")
+        raw, media_type = await load_image(image_path_or_url)
+        payload = {
+            "model": self.model,
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": media_type,
+                                             "data": base64.b64encode(raw).decode("ascii")}},
+                {"type": "text", "text": prompt},
+            ]}],
+        }
+        response = await get_http_client().post(self.base_url, headers=self.headers, json=payload)
+        raise_for_status(response, self.name)
+        data = response.json()
+        if data.get("type") == "error":
+            raise ProviderError(f"{self.name} error: {data.get('error')}", retryable=False)
+        return self._content(data.get("content") or []) or "No analysis returned."

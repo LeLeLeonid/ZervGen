@@ -1,15 +1,17 @@
+import base64
 import json
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
-import httpx
 
 from src.config import GeminiSettings
 from src.core.provider import (
+    is_provider_fault,
     AIProvider,
     ProviderError,
     ProviderMeta,
     get_http_client,
+    load_image,
     normalize_messages,
     raise_for_status,
     split_system,
@@ -183,23 +185,27 @@ class Provider(AIProvider):
             raise ProviderError(f"{self.name} streamed empty content", retryable=True)
         return full
 
-    @async_retry()
+    @async_retry(retries=5, delays=[2, 5, 10, 25, 60])
     async def generate_text(self, history: List[Dict], system_prompt: str, on_token: Optional[Callable[[str], None]] = None) -> str:
         self._preflight()
         try:
             if on_token:
+                relay, state = self._guard_stream(on_token)
                 try:
-                    result = await self._stream(self._payload(history, system_prompt, True), on_token)
+                    result = await self._stream(self._payload(history, system_prompt, True), relay)
                 except ProviderError as exc:
-                    if exc.status_code is not None or exc.stream_started:
+                    if state["emitted"]:
+                        exc.stream_started = True
+                    if exc.status_code is not None or exc.stream_started or state["emitted"]:
                         raise
                     logger.debug("%s stream failed, falling back: %s", self.name, exc)
                 else:
                     self._succeed()
                     return result
             result = await self._non_stream(self._payload(history, system_prompt, False))
-        except Exception:
-            self._fail()
+        except Exception as exc:
+            if is_provider_fault(exc):
+                self._fail()
             raise
         self._succeed()
         return result
@@ -210,5 +216,16 @@ class Provider(AIProvider):
     async def generate_audio(self, text: str) -> bytes:
         raise NotImplementedError("Gemini does not support direct audio generation")
 
+    @async_retry(retries=3, delays=[2, 5, 10])
     async def analyze_image(self, prompt: str, image_url: str) -> str:
-        raise NotImplementedError("Gemini vision not implemented")
+        raw, media_type = await load_image(image_url)
+        payload = {"contents": [{"role": "user", "parts": [
+            {"inlineData": {"mimeType": media_type,
+                            "data": base64.b64encode(raw).decode("ascii")}},
+            {"text": prompt},
+        ]}]}
+        response = await get_http_client().post(self._endpoint("generateContent", False), json=payload)
+        raise_for_status(response, self.name)
+        data = response.json()
+        self._track_usage(data)
+        return self._content(data)

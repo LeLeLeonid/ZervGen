@@ -1,8 +1,9 @@
 ---
 name: testing
 description: "Run tests, read failures, and verify a change before claiming it works"
+when_not: "no test command exists for the project"
 tags: [test, tests, pytest, testing, verify, verification, failure, failing, regression, coverage, check, validate]
-tools: ["shell", "read_file", "write_file", "edit_file", "grep_files", "glob_files", "list_files", "response"]
+tools: ["shell", "read", "write", "edit", "grep", "glob", "ls", "response"]
 contract:
   pre: {}
   post: {}

@@ -15,9 +15,9 @@ import secrets
 import warnings
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List
+from typing import Any, Dict, List, Union, get_args, get_origin
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 from types import MappingProxyType
 import aiofiles
 import httpx
@@ -31,6 +31,52 @@ TEMP_DIR.mkdir(exist_ok=True)
 console = Console()
 
 _ALLOWED_ROOTS: List[Path] = [Path.cwd().resolve()]
+
+TOOL_NAMES = {
+    "read_file": "read",
+    "write_file": "write",
+    "append_file": "append",
+    "edit_file": "edit",
+    "list_files": "ls",
+    "glob_files": "glob",
+    "grep_files": "grep",
+    "get_code_skeleton": "outline",
+    "get_weather": "weather",
+    "web_search": "web",
+    "fetch_url": "fetch",
+    "search_memory": "recall",
+    "search_tgs": "graph",
+    "add_memory": "remember",
+    "remember_relation": "relate",
+    "promote_memory": "promote",
+    "manage_todo": "todo",
+    "take_screenshot": "screenshot",
+    "analyze_screen": "vision",
+    "mouse_click": "click",
+    "type_text": "keys",
+    "generate_image": "image",
+    "generate_uuid": "uuid",
+    "generate_random_string": "random",
+    "hash_string": "hash",
+    "format_json": "pretty",
+    "delegate_to": "delegate",
+    "load_skill": "skill",
+    "list_skills": "skills",
+    "find_skill": "find",
+    "install_skill": "skill_install",
+    "search_skill_hub": "skill_hub",
+    "add_favorite": "favorite",
+    "set_external_skills": "skill_external",
+    "add_mcp_server": "mcp_add",
+    "install_mcp_server": "mcp_install",
+    "uninstall_mcp_server": "mcp_remove",
+    "list_mcp_servers": "mcps",
+    "search_mcp_hub": "mcp_search",
+    "mcp_execute": "mcp",
+    "scan_tools": "tools",
+}
+
+LEGACY_TOOLS = {legacy: public for legacy, public in TOOL_NAMES.items() if legacy != public}
 
 current_agent: ContextVar[Any] = ContextVar("zervgen_agent", default=None)
 
@@ -113,19 +159,19 @@ def _atomic_write(path: Path, content: str) -> None:
             except OSError: pass
         raise
 
-# ── DELEGATION ──────────────────────────────────────────────────────────────
 
-async def delegate_to(agent_name: str = "", task: str = "", context: str = "", agent_id: str = "", agents: str = "") -> str:
+async def delegate_to(agent_name: str = "", task: str = "", context: str = "", agent_id: str = "",
+                      agents: str = "", mode: str = "", memory: str = "") -> str:
     """Hand a task to a role agent through the live orchestrator."""
     orchestrator = _resolve_agent()
     if orchestrator is not None and hasattr(orchestrator, "_handle_delegation"):
         return await orchestrator._handle_delegation({
             "agent_name": agent_name, "agent_id": agent_id, "task": task,
-            "context": context, "agents": agents,
+            "context": context, "agents": agents, "mode": mode,
+            "memory": memory,
         })
     return "Error: delegation requires an active orchestrator with _handle_delegation."
 
-# ─── WEB ─────────────────────────────────────────────────────────────────────
 
 async def web_search(query: str, limit: int = 5, region: str = "wt-wt", recency: str = "", **kwargs) -> str:
     if not query or not isinstance(query, str):
@@ -135,26 +181,57 @@ async def web_search(query: str, limit: int = 5, region: str = "wt-wt", recency:
     except (ValueError, TypeError):
         limit = 5
     try:
-        from ddgs import DDGS
-        kw = {"max_results": limit, "region": region or "wt-wt"}
-        with DDGS() as ddgs:
-            try:
-                results = list(ddgs.text(query.strip(), timelimit=recency, **kw)) if recency else list(ddgs.text(query.strip(), **kw))
-            except TypeError:
-                results = list(ddgs.text(query.strip(), **kw))
-        if not results:
-            return f"Error: No results for '{query}'."
-        lines = []
-        for index, item in enumerate(results, 1):
-            title = (item.get("title") or "").strip() or "No Title"
-            url = item.get("url") or item.get("href") or item.get("link") or ""
-            snippet = (item.get("body") or item.get("snippet") or "").strip()[:200]
-            lines.append(f"{index}. {title}\n   {url}\n   {snippet}")
-        return "\n".join(lines)
-    except ImportError:
-        return "Error: ddgs not installed. pip install duckduckgo-search"
-    except Exception as e:
-        return f"Error: Search error: {e}"
+        hits = await asyncio.wait_for(asyncio.to_thread(_ddgs_search, query.strip(), limit, region, recency), timeout=12.0)
+    except asyncio.TimeoutError:
+        hits = []
+    except Exception:
+        hits = []
+    if not hits:
+        try:
+            hits = await asyncio.wait_for(_ddg_lite(query.strip(), limit), timeout=12.0)
+        except Exception:
+            hits = []
+    if not hits:
+        return f"Error: No results for '{query}'."
+    lines = []
+    for index, item in enumerate(hits[:limit], 1):
+        lines.append(f"{index}. {item['title']}\n   {item['url']}\n   {item['snippet']}")
+    return "\n".join(lines)
+
+
+def _ddgs_search(query: str, limit: int, region: str, recency: str) -> List[Dict[str, str]]:
+    """ddgs metasearch; an empty list means every backend refused."""
+    from ddgs import DDGS
+    kw = {"max_results": limit, "region": region or "wt-wt"}
+    with DDGS() as ddgs:
+        try:
+            raw = list(ddgs.text(query, timelimit=recency, **kw)) if recency else list(ddgs.text(query, **kw))
+        except TypeError:
+            raw = list(ddgs.text(query, **kw))
+    return [{"title": (r.get("title") or "").strip() or "No Title",
+             "url": r.get("url") or r.get("href") or r.get("link") or "",
+             "snippet": (r.get("body") or r.get("snippet") or "").strip()[:200]} for r in raw]
+
+
+async def _ddg_lite(query: str, limit: int) -> List[Dict[str, str]]:
+    """Fallback: DuckDuckGo's no-JS endpoint, which the metasearch backends often miss."""
+    from src.core.provider import get_http_client
+    client = get_http_client()
+    resp = await client.get("https://lite.duckduckgo.com/lite/", params={"q": query}, timeout=12.0,
+                            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"})
+    if resp.status_code != 200:
+        return []
+    soup = BeautifulSoup(resp.text, "html.parser")
+    links = soup.select("a.result-link")
+    snippets = soup.select("td.result-snippet")
+    hits = []
+    for index, link in enumerate(links[:limit]):
+        href = link.get("href") or ""
+        if "uddg=" in href:
+            href = unquote(href.split("uddg=", 1)[1].split("&", 1)[0])
+        snippet = snippets[index].get_text(" ", strip=True)[:200] if index < len(snippets) else ""
+        hits.append({"title": link.get_text(" ", strip=True) or "No Title", "url": href, "snippet": snippet})
+    return hits
 
 
 async def fetch_url(url: str, parse_html: bool = True, max_chars: int = 8000, timeout: float = 30.0, **kwargs) -> str:
@@ -191,7 +268,8 @@ async def fetch_url(url: str, parse_html: bool = True, max_chars: int = 8000, ti
         else:
             text = raw
         text = _clip(text, max_chars)
-        return {"url": url, "title": title, "text": text or "No readable content."}
+        return json.dumps({"url": url, "title": title, "text": text or "No readable content."},
+                          ensure_ascii=False)
     except httpx.TimeoutException:
         return f"Error: Request timed out for {url}"
     except Exception as e:
@@ -246,7 +324,6 @@ async def get_weather(location: str, forecast: bool = False) -> str:
     return "\n".join(lines)
 
 
-# ─── SHELL ───────────────────────────────────────────────────────────────────
 
 @dataclass
 class ShellResult:
@@ -321,7 +398,49 @@ async def shell(command: str, timeout: int = 60) -> str:
     return (await shell_exec(command, timeout)).to_text()
 
 
-# ─── FILESYSTEM ──────────────────────────────────────────────────────────────
+_BG: Dict[str, Dict[str, Any]] = {}
+
+
+async def process(action: str, id: str = "", command: str = "", lines: int = 40) -> str:
+    """List, start, read or kill background commands: action=list|start|read|kill."""
+    action = (action or "list").strip().lower()
+    if action == "start":
+        if not command.strip():
+            return "Error: process(start) needs a command."
+        reason = shell_block_reason(command)
+        if reason:
+            return f"Blocked: {reason}"
+        proc = await asyncio.create_subprocess_shell(
+            command.strip(), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True)
+        pid = f"p{len(_BG) + 1}"
+        buffer: List[str] = []
+
+        async def _drain():
+            async for raw in proc.stdout:
+                buffer.append(raw.decode("utf-8", "replace"))
+                del buffer[:-2000]
+        task = asyncio.create_task(_drain())
+        _BG[pid] = {"proc": proc, "buf": buffer, "task": task, "cmd": command.strip()}
+        return f"Started {pid} (pid {proc.pid}): {command.strip()}"
+    entry = _BG.get(id)
+    if action in ("read", "kill") and not entry:
+        return f"Error: no background process '{id}'. Known: {', '.join(_BG) or 'none'}"
+    if action == "read":
+        alive = entry["proc"].returncode is None
+        tail = "".join(entry["buf"]).splitlines()[-max(1, int(lines)):]
+        state = "running" if alive else f"exited {entry['proc'].returncode}"
+        return f"{id} [{state}]\n" + "\n".join(tail)
+    if action == "kill":
+        entry["proc"].kill()
+        await entry["proc"].wait()
+        entry["task"].cancel()
+        return f"Killed {id}"
+    rows = [f"{k} [{'running' if v['proc'].returncode is None else 'exited ' + str(v['proc'].returncode)}] {v['cmd']}"
+            for k, v in _BG.items()]
+    return "\n".join(rows) or "No background processes."
+
+
 
 async def list_files(path: str = ".", recursive: bool = False, exclude_cache: bool = True, ignore_dir: bool = True) -> str:
     """List a directory, optionally recursive, confined to allowed roots."""
@@ -351,7 +470,44 @@ async def list_files(path: str = ".", recursive: bool = False, exclude_cache: bo
     return "\n".join(items) if items else f"(empty directory: {path})"
 
 
+_READ_PATHS: set[str] = set()
+
+
+def _mark_read(path: str) -> None:
+    _READ_PATHS.add(path)
+    try:
+        _READ_PATHS.add(str(Path(path).resolve()))
+    except OSError:
+        pass
+    _mark_touched(path)
+
+
+def _mark_touched(path: str) -> None:
+    """Remember the directory so its own rule file can join the prompt."""
+    agent = _resolve_agent()
+    if agent is None:
+        return
+    parent = str(Path(path).parent)
+    dirs = getattr(agent, "_touched_dirs", None)
+    if dirs is None:
+        dirs = []
+        agent._touched_dirs = dirs
+    if parent not in dirs:
+        dirs.append(parent)
+        del dirs[:-5]
+
+
+def _was_read(path: str) -> bool:
+    if path in _READ_PATHS:
+        return True
+    try:
+        return str(Path(path).resolve()) in _READ_PATHS
+    except OSError:
+        return False
+
+
 async def read_file(path: str, offset: int = 0, max_chars: int = 8000) -> str:
+    """Read a file from line `offset` (1-based). The tail names the next line to read."""
     if not _is_safe_path(path):
         return f"Error: Access denied: {path}"
     target = Path(path)
@@ -360,20 +516,39 @@ async def read_file(path: str, offset: int = 0, max_chars: int = 8000) -> str:
     if not target.is_file():
         return f"Error: Not a file: {path}"
     try:
-        # errors='replace' swaps bad bytes with  instead of crashing
         text = target.read_text(encoding='utf-8', errors='replace')
     except PermissionError:
         return f"Error: Permission denied: {path}"
     except Exception as e:
         return f"Error: {e}"
-    if offset:
-        text = text[offset:]
-    return _clip(text, max_chars)
+    lines = text.splitlines(keepends=True)
+    total = len(lines)
+    start = max(1, int(offset or 1))
+    if start > total and total:
+        return f"Error: offset {start} is past end of file ({total} lines)."
+    chunk, used = [], 0
+    index = start - 1
+    while index < total:
+        line = lines[index]
+        if used + len(line) > max_chars and chunk:
+            break
+        chunk.append(line)
+        used += len(line)
+        index += 1
+    body = "".join(chunk)
+    _mark_read(path)
+    tail = f"\n[lines {start}-{index} of {total}" + (f" | next_offset={index + 1}" if index < total else " | end of file") + "]"
+    if index < total and len(body) > max_chars:
+        body = body[:max_chars]
+        tail = f"\n[lines {start}-{index} of {total} | next_offset={index} | line too long, re-read with a larger max_chars]"
+    return body + tail
 
 
 async def write_file(path: str, content: str = "") -> str:
     if not path or not isinstance(path, str) or not _is_safe_path(path):
         return "Error: Invalid path or access denied."
+    if Path(path).exists() and not _was_read(path):
+        return f"Error: {path} exists and was not read this session. read it first, or use edit."
     try:
         _atomic_write(Path(path), content)
         return f"Written to {path}"
@@ -442,19 +617,19 @@ async def grep_files(pattern: str, path: str = ".", file_type: str = "", use_reg
     try:
         search_pattern = re.compile(pattern) if use_regex else re.compile(re.escape(pattern))
         matches = []
-        for file_path in base.rglob(f"*{file_type}" if file_type else "*"):
+        candidates = [base] if base.is_file() else base.rglob(f"*{file_type}" if file_type else "*")
+        for file_path in candidates:
             if _is_link(file_path) or not _is_safe_path(str(file_path)):
                 continue
             if file_path.is_file() and file_path.stat().st_size <= 1_000_000:
                 try:
-                    content = file_path.read_text(encoding='utf-8', errors='ignore')
+                    data = file_path.read_bytes()
+                    if b"\0" in data[:8192]:
+                        continue
+                    content = data.decode("utf-8", errors="ignore")
                     for i, line in enumerate(content.split('\n'), 1):
-                        if use_regex:
-                            if search_pattern.search(line):
-                                matches.append(f"{file_path}:{i}: {line.strip()}")
-                        else:
-                            if pattern in line:
-                                matches.append(f"{file_path}:{i}: {line.strip()}")
+                        if search_pattern.search(line):
+                            matches.append(f"{file_path}:{i}: {line.strip()}")
                 except Exception:
                     pass
         if not matches:
@@ -500,7 +675,6 @@ async def get_code_skeleton(file_path: str) -> str:
     return "\n".join(output + ["\n"] + lines)
 
 
-# ─── VISION ──────────────────────────────────────────────────────────────────
 
 async def generate_image(prompt: str, width: int = None, height: int = None, model: str = "flux", seed: int = None) -> str:
     config = load_config()
@@ -576,9 +750,12 @@ async def download_and_open_image(url: str, token: str = "") -> str:
 
 
 async def take_screenshot(filename: str = "screen.png") -> str:
+    path = (TEMP_DIR / Path(str(filename or "screen.png")).name).resolve()
+    if not _is_safe_path(str(path)):
+        return "Error: Access denied (screenshot path outside allowed roots)."
     try:
         import mss
-        path = TEMP_DIR / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
         with mss.mss() as sct:
             sct.shot(mon=-1, output=str(path))
         return str(path)
@@ -587,21 +764,28 @@ async def take_screenshot(filename: str = "screen.png") -> str:
 
 
 async def analyze_screen(question: str) -> str:
+    path_str = await take_screenshot("vision_buffer.png")
+    if path_str.startswith("Screenshot Error"):
+        return path_str
     try:
         import pyautogui
-        path_str = await take_screenshot("vision_buffer.png")
-        from src.core.provider import get_provider
-        config = load_config()
-        provider = get_provider(config.provider, config)
-        if not hasattr(provider, 'analyze_image'):
-            return "Error: Current provider does not support Vision."
         width, height = pyautogui.size()
-        return f"Screen Analysis: {await provider.analyze_image(f'{question}. Screen: {width}x{height}.', path_str)}"
+    except Exception:
+        width, height = 0, 0
+    config = load_config()
+    try:
+        from src.core.provider import get_provider
+        provider = get_provider(config.provider, config)
+        analysis = await provider.analyze_image(f"{question}. Screen: {width}x{height}.", path_str)
+        return f"Screen Analysis: {analysis}"
+    except NotImplementedError:
+        return (f"Screenshot saved to {path_str}. The active provider "
+                f"('{config.provider}') has no vision support — switch to anthropic, openai, "
+                "gemini or openrouter to analyze it.")
     except Exception as e:
-        return f"Vision Error: {e}"
+        return f"Vision Error: {e} (screenshot saved to {path_str})"
 
 
-# ─── AUTOMATION ─────────────────────────────────────────────────────
 
 async def mouse_click(x: int, y: int) -> str:
     try:
@@ -621,7 +805,6 @@ async def type_text(text: str) -> str:
         return f"Type Error: {e}"
 
 
-# ─── SKILLS ──────────────────────────────────────────────────────────────────
 
 async def find_skill(tags) -> str:
     from src.skills_loader import skill_index
@@ -715,7 +898,6 @@ async def add_favorite(skill_name: str) -> str:
     return skill_index.pin(skill_name)
 
 
-# ─── SKILL HUB ────────────────────────────────────────────────────────────────
 
 SKILL_HUB_URL = "https://skills.sh/api/search"
 SKILL_RAW_URL = "https://raw.githubusercontent.com/{source}/HEAD/{path}"
@@ -795,7 +977,6 @@ async def install_skill(skill_id: str, enable: bool = False) -> str:
     return f"Skill '{name}' {shown}: {target / 'SKILL.md'}"
 
 
-# ─── MEMORY ──────────────────────────────────────────────────────────────────
 
 async def add_memory(content: str, category: str = "general", tier: str = "now") -> str:
     from src.core.memory import memory_core
@@ -807,6 +988,12 @@ async def promote_memory(memory_id: str, new_tier: str = "recent") -> str:
     return memory_core.promote_memory(memory_id, new_tier)
 
 
+async def remember_relation(src: str, rel: str, dst: str) -> str:
+    """Store a named relation between two things, so graph() can trace it."""
+    from src.core.memory import memory_core
+    return memory_core.remember_relation(src, rel, dst)
+
+
 async def search_memory(query: str, limit: int = 5) -> str:
     from src.core.memory import memory_core
     try:
@@ -814,7 +1001,9 @@ async def search_memory(query: str, limit: int = 5) -> str:
     except (ValueError, TypeError):
         limit = 5
     results = memory_core.search_memory(query, limit)
-    return results if results else []
+    if not results:
+        return "No matching memories."
+    return json.dumps(results, ensure_ascii=False, default=str)
 
 
 async def search_tgs(query: str, limit: int = 3, **kwargs) -> str:
@@ -827,7 +1016,6 @@ async def search_tgs(query: str, limit: int = 3, **kwargs) -> str:
     return memory_core.search_tgs(query, limit=limit)
 
 
-# ─── TODO ────────────────────────────────────────────────────────────────────
 
 async def manage_todo(action: str, task: str = "", todo_id: str = "") -> str:
     todo_file = Path("tmp/todos.json")
@@ -860,7 +1048,6 @@ async def manage_todo(action: str, task: str = "", todo_id: str = "") -> str:
     return "Usage: manage_todo(action='add|list|done|remove|clear', task='...', todo_id='...')"
 
 
-# ─── RESPONSE ────────────────────────────────────────────────────────────────
 
 async def response(text: str = None) -> str:
     """Finish the run with the final user-facing answer."""
@@ -874,11 +1061,10 @@ async def response(text: str = None) -> str:
     return text if text is not None else ""
 
 
-# ─── UTILITIES ───────────────────────────────────────────────────────────────
 
 async def calc(expression: str) -> str:
     try:
-        from simpleeval import simple_eval  # type: ignore[import-untyped]
+        from simpleeval import simple_eval
         return str(simple_eval(expression, names={}))
     except Exception as e:
         return f"Error: {e}"
@@ -922,7 +1108,6 @@ async def base64_decode(encoded: str) -> str:
         return f"Error: {e}"
 
 
-# ─── MCP ──────────────────────────────────────────────────────────────────────
 
 async def add_mcp_server(
     name: str = "",
@@ -961,7 +1146,8 @@ async def add_mcp_server(
     stored_headers = {key: f"${{{key}}}" for key in header_dict}
     written = [key for key, value in {**env_dict, **header_dict}.items() if save_env_var(key, value)]
     config = load_config()
-    config.mcp_servers[name] = MCPServerConfig(
+    servers = dict(config.mcp_servers)
+    servers[name] = MCPServerConfig(
         command=command,
         args=args_list,
         env=stored_env,
@@ -970,12 +1156,51 @@ async def add_mcp_server(
         transport=transport or "auto",
         enabled=True,
     )
+    config.mcp_servers = servers
     config.save()
     MCPManager(config)
     kind = config.mcp_servers[name].kind
     target = url if url else f"{command} {' '.join(args_list)}".strip()
     note = f"; secrets in .env: {', '.join(written)}" if written else ""
     return f"MCP server '{name}' added ({kind}: {target}){note}."
+
+
+async def search_mcp_hub(query: str = "", limit: int = 20) -> str:
+    """Search the built-in MCP catalog for installable servers."""
+    from src.core.mcp_manager import search_catalog
+    rows = search_catalog(query, limit=limit)
+    if not rows:
+        return f"No MCP server matches '{query}'."
+    lines = []
+    for row in rows:
+        mark = "[installed]" if row["installed"] else ""
+        needs = f" env: {', '.join(row['env'])}" if row["env"] else ""
+        lines.append(f"- {row['name']} ({row['transport']}) {mark}{needs}: {row['description']}")
+    return "MCP catalog:\n" + "\n".join(lines)
+
+
+async def install_mcp_server(name: str, env: str = "{}") -> str:
+    """Install a catalog MCP server into ~/.zervgen/mcp.json, storing secrets in .env."""
+    from src.core.mcp_manager import MCPManager, install_from_catalog
+    try:
+        secrets = json.loads(env) if isinstance(env, str) else dict(env or {})
+    except json.JSONDecodeError:
+        return "Error: env must be a JSON object."
+    result = install_from_catalog(name, secrets)
+    if result.startswith("Error:"):
+        return result
+    MCPManager().reload_from_store()
+    return result
+
+
+async def uninstall_mcp_server(name: str) -> str:
+    """Remove a server from ~/.zervgen/mcp.json."""
+    from src.core.mcp_manager import MCPManager, uninstall_from_catalog
+    result = uninstall_from_catalog(name)
+    if result.startswith("Error:"):
+        return result
+    MCPManager().reload_from_store()
+    return result
 
 
 async def list_mcp_servers() -> dict:
@@ -1023,6 +1248,9 @@ async def mcp_execute(server: str, tool: str = "", arguments: str = "{}", args: 
     if args is not None and arguments == "{}":
         arguments = args
     if tool in ("", "list"):
+        if not await mgr.ensure_server(server):
+            srv = mgr.servers.get(server)
+            return f"Error: server '{server}' unavailable: {srv._last_error if srv else 'not configured'}"
         srv = mgr.servers.get(server)
         if not srv:
             return f"Error: server '{server}' not found."
@@ -1053,31 +1281,32 @@ async def mcp_execute(server: str, tool: str = "", arguments: str = "{}", args: 
     return await mgr.execute_tool(tool_name=tool, arguments=args_dict, server=server)
 
 
-# ─── DISCOVERY ───────────────────────────────────────────────────────────────
 
 async def scan_tools(name: str = "") -> str:
     """List active tools, or show one tool's full signature and arguments."""
     agent = _resolve_agent()
     tools = dict(getattr(agent, "tools", None) or TOOL_REGISTRY)
     if name:
-        func = tools.get(name)
+        public = TOOL_NAMES.get(name, name)
+        func = tools.get(public)
         if func is None:
             return f"Error: tool '{name}' is not active."
-        return f"- {name}{_signature_text(func)}: {' '.join((inspect.getdoc(func) or '').split())}"
+        return f"- {public}{_signature_text(func)}: {' '.join((inspect.getdoc(func) or '').split())}"
     return "Available tools:\n" + "\n".join(
         f"- {key}{_signature_text(func)}: {' '.join((inspect.getdoc(func) or '').split())[:120]}"
         for key, func in tools.items()
     )
 
 
-# ─── REGISTRY ────────────────────────────────────────────────────────────────
 
 def _generate_registry():
     current_module = sys.modules[__name__]
     registry = {}
     for name, func in inspect.getmembers(current_module, inspect.isfunction):
-        if not name.startswith("_") and func.__module__ == __name__ and name not in ('_generate_registry', 'get_tools_schema', 'download_and_open_image', 'reload_allowed_roots', 'shell_exec'):
-            registry[name] = func
+        if not name.startswith("_") and func.__module__ == __name__ and name not in (
+                '_generate_registry', 'get_tools_schema', 'render_tool_index',
+                'download_and_open_image', 'reload_allowed_roots', 'shell_exec'):
+            registry[TOOL_NAMES.get(name, name)] = func
     return registry
 
 
@@ -1095,10 +1324,21 @@ def _native_tool_schemas(tools: dict) -> List[Dict[str, Any]]:
         for param in sig.parameters.values():
             if param.kind in (param.VAR_KEYWORD, param.VAR_POSITIONAL):
                 continue
-            meta: Dict[str, Any] = {"type": kinds.get(param.annotation, "string")}
-            if param.default is not param.empty:
-                meta["default"] = param.default
+            annotation = param.annotation
+            origin = get_origin(annotation)
+            args = get_args(annotation)
+            if origin is Union:
+                annotation = next((a for a in args if a is not type(None)), str)
+                origin = get_origin(annotation)
+            if origin is list:
+                meta: Dict[str, Any] = {"type": "array", "items": {"type": "string"}}
+            elif origin is dict:
+                meta = {"type": "object"}
             else:
+                meta = {"type": kinds.get(annotation, "string")}
+            if param.default is not param.empty and param.default is not None:
+                meta["default"] = param.default
+            elif param.default is param.empty:
                 required.append(param.name)
             properties[param.name] = meta
         params: Dict[str, Any] = {"type": "object", "properties": properties}
@@ -1151,14 +1391,14 @@ def _schema_doc(name: str, schema: Dict[str, Any], spec: Any) -> str:
 
 
 def _clip_doc(doc: str, budget: int) -> str:
-    """Cut the prose head but never the parameter notes that follow the bar."""
+    """Shorten to ``budget`` on a word boundary, keeping a trailing param note."""
     if len(doc) <= budget:
         return doc
     head, bar, tail = doc.rpartition(" | ")
     keep = budget - len(tail) - 3
     if bar and keep > 40:
-        return f"{head[:keep].rstrip()} | {tail}"
-    return doc[:budget].rstrip()
+        return f"{head[:keep].rsplit(' ', 1)[0].rstrip()}… | {tail}"
+    return doc[:budget].rsplit(" ", 1)[0].rstrip() + "…"
 
 
 def _signature_text(func: Any, limit: int = 90) -> str:
@@ -1178,17 +1418,54 @@ def _signature_text(func: Any, limit: int = 90) -> str:
     return str(bare)
 
 
-def get_tools_schema(tools: dict = None, compact: bool = False) -> str:
-    """Render every tool as one line: name, real signature, short purpose."""
+def get_tools_schema(tools: dict = None, compact: bool = False, doc_chars: int = 0) -> str:
+    """Render each tool as one line; ``doc_chars`` caps the purpose text."""
     source = tools if tools is not None else TOOL_REGISTRY
     lines = []
     for name, func in source.items():
         params = _signature_text(func)
         doc = " ".join((inspect.getdoc(func) or "").split())
-        if compact:
-            doc = _clip_doc(doc, 240)
+        limit = doc_chars or (240 if compact else 0)
+        if limit:
+            doc = _clip_doc(doc, limit)
         lines.append(f"- {name}{params}" + (f": {doc}" if doc else ""))
     return "\n".join(lines)
+
+
+def _bare_signature(func: Any) -> str:
+    """Signature without annotations, for the prompt index."""
+    try:
+        sig = inspect.signature(func)
+    except (ValueError, TypeError):
+        return "(...)"
+    return str(inspect.Signature(
+        [p.replace(annotation=inspect.Parameter.empty) for p in sig.parameters.values()
+         if p.kind not in (p.VAR_KEYWORD, p.VAR_POSITIONAL)],
+        return_annotation=inspect.Signature.empty,
+    ))
+
+
+def render_tool_index(tools: dict, budget_chars: int = 2600) -> str:
+    """Tool index that degrades to fit: docs, then signatures, then names."""
+    entries = sorted(((name, _bare_signature(func), " ".join((inspect.getdoc(func) or "").split()))
+                      for name, func in tools.items()), key=lambda entry: entry[0])
+    for doc_chars, with_sig in ((70, True), (40, True), (0, True), (0, False)):
+        lines = []
+        for name, sig, doc in entries:
+            head = f"- {name}{sig if with_sig else ''}"
+            lines.append(head + (f": {_clip_doc(doc, doc_chars)}" if doc_chars and doc else ""))
+        text = "\n".join(lines)
+        if len(text) <= budget_chars:
+            return text
+    kept, total = [], 0
+    for name, _sig, _doc in entries:
+        if total + len(name) + 3 > budget_chars:
+            break
+        kept.append(f"- {name}")
+        total += len(name) + 3
+    omitted = len(entries) - len(kept)
+    tail = f"\n({omitted} more tools omitted; tools() lists them)"
+    return "\n".join(kept) + tail if kept else ""
 
 
 TOOL_REGISTRY = MappingProxyType(_generate_registry())

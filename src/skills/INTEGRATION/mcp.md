@@ -1,8 +1,9 @@
 ---
 name: mcp
 description: "Connect, inspect and call Model Context Protocol servers"
+when_not: "a built-in tool already does the job"
 tags: [mcp, model-context-protocol, server, servers, tools, integration, connect, context7]
-tools: ["add_mcp_server", "list_mcp_servers", "mcp_execute", "scan_tools", "response"]
+tools: ["mcp_add", "mcps", "mcp", "tools", "response"]
 contract:
   pre: {}
   post: {}
@@ -21,7 +22,7 @@ An MCP server exposes extra tools. Tool names are namespaced `mcp__<server>__<to
 ## Inspect
 
 ```python
-await list_mcp_servers()
+await mcps()
 ```
 
 Server states: `idle` (configured, not started), `starting`, `ready`, `degraded` (last-known tools cached, transport failing), `dead` (backoff exhausted). A degraded server still lists cached tool names but will fail on call.
@@ -29,15 +30,15 @@ Server states: `idle` (configured, not started), `starting`, `ready`, `degraded`
 ## Discover tool arguments
 
 ```python
-await scan_tools("search")
+await tools("search")
 ```
 
-`scan_tools` returns the full schema for matching tools. MCP argument names are defined by the server, not by ZervGen. Never guess them: scan first.
+`tools` returns the full schema for matching tools. MCP argument names are defined by the server, not by ZervGen. Never guess them: scan first.
 
 ## Call
 
 ```python
-await mcp_execute(server="internal", tool="manage_todo", arguments={"action": "list"})
+await mcp(server="internal", tool="todo", arguments={"action": "ls"})
 ```
 
 - `arguments` is a mapping or a JSON string. One tool at a time: a batch call that half-fails tells you nothing about which half.
@@ -46,7 +47,7 @@ await mcp_execute(server="internal", tool="manage_todo", arguments={"action": "l
 ## Install
 
 ```python
-await add_mcp_server(
+await mcp_add(
     name="context7",
     command="npx",
     args='["-y", "@upstash/context7-mcp"]',
@@ -61,11 +62,11 @@ await add_mcp_server(
 
 ## Troubleshoot in order
 
-1. `list_mcp_servers` — is the state `ready`?
-2. `scan_tools` — does the tool name exist at all?
+1. `mcps` — is the state `ready`?
+2. `tools` — does the tool name exist at all?
 3. The error text — `not found` is a naming problem, `timed out` is a transport problem.
 4. Only then reinstall.
 
 ## Context7
 
-Context7 serves current library documentation, so answers about an API's exact signature do not come from the model's memory. It is an ordinary MCP server: install it, then `mcp_execute(server="context7", tool="get-library-docs", arguments={...})`. Nothing about it is special-cased in ZervGen.
+Context7 serves current library documentation, so answers about an API's exact signature do not come from the model's memory. It is an ordinary MCP server: install it, then `mcp(server="context7", tool="get-library-docs", arguments={...})`. Nothing about it is special-cased in ZervGen.

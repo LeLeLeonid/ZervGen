@@ -1,6 +1,7 @@
 ---
 name: llm-wiki
 description: "Build and maintain a persistent interlinked knowledge wiki (Karpathy-style)"
+when_not: "the fact belongs in a single memory entry"
 tags: [wiki, knowledge, rag, notes, research, persistent, interlinked]
 ---
 # LLM Wiki

@@ -49,3 +49,12 @@ def test_prune_toxic_keeps_healthy_facts(tmp_path, monkeypatch):
         memory.record_outcome("alpha beta gamma", success=True)
     assert memory.prune_toxic(threshold_hits=5, success_rate=0.5) == 0
     assert len(memory._kg.get_facts()) == 1
+
+
+def test_knowledge_graph_save_is_atomic(tmp_path):
+    kg = memory_module.KnowledgeGraph(tmp_path / "kg.json")
+    kg.add_fact({"id": "1", "content": "alpha"})
+    kg.save()
+    assert not (tmp_path / "kg.tmp").exists()
+    reloaded = memory_module.KnowledgeGraph(tmp_path / "kg.json")
+    assert [f["content"] for f in reloaded.get_facts()] == ["alpha"]

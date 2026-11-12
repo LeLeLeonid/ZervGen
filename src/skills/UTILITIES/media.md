@@ -1,8 +1,9 @@
 ---
 name: media
 description: "Generate images, take and analyze screenshots, drive the desktop"
+when_not: "the user asked for text output"
 tags: [image, images, picture, draw, illustration, screenshot, screen, vision, desktop, click, type, automation]
-tools: ["generate_image", "take_screenshot", "analyze_screen", "mouse_click", "type_text", "response"]
+tools: ["image", "screenshot", "vision", "click", "keys", "response"]
 contract:
   pre: {}
   post: {}
@@ -18,7 +19,7 @@ verification: checklist
 ## Images
 
 ```python
-path = await generate_image(prompt="isometric server room, teal light", width=1024, height=768)
+path = await image(prompt="isometric server room, teal light", width=1024, height=768)
 ```
 
 - Returns a local path on success. Anything starting with `Error:` or `Image gen failed` is a failure, not a path.
@@ -28,19 +29,19 @@ path = await generate_image(prompt="isometric server room, teal light", width=10
 ## Screen
 
 ```python
-path = await take_screenshot(filename="screen.png")
-answer = await analyze_screen(question="What error dialog is open?")
+path = await screenshot(filename="screen.png")
+answer = await vision(question="What error dialog is open?")
 ```
 
-- `take_screenshot` captures every monitor into one image.
-- `analyze_screen` needs a vision-capable provider. If it answers `Error: Current provider does not support Vision.`, say so instead of guessing at the screen.
+- `screenshot` captures every monitor into one image.
+- `vision` needs a vision-capable provider. If it answers `Error: Current provider does not support Vision.`, say so instead of guessing at the screen.
 - Name the file after the task, not `screen2.png`.
 
 ## Desktop automation
 
 ```python
-await mouse_click(x=640, y=480)
-await type_text("hello")
+await click(x=640, y=480)
+await keys("hello")
 ```
 
 These are BUILD-only and require explicit user intent. Click coordinates are absolute screen pixels. Confirm the target is visible in a screenshot taken immediately before acting; a stale coordinate lands somewhere unexpected.
@@ -48,5 +49,5 @@ These are BUILD-only and require explicit user intent. Click coordinates are abs
 ## Rules
 
 - Never claim an image or screenshot exists without a real path from the tool.
-- Prefer `analyze_screen` over describing a screenshot from memory.
+- Prefer `vision` over describing a screenshot from memory.
 - One capture per question. Re-capturing the same screen wastes the budget.
