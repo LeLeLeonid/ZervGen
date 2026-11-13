@@ -2,10 +2,10 @@
 
 **Agent harness — one loop, four modes, tools as Python, skills as Markdown.**
 
-[![Version](https://img.shields.io/badge/Version-1.6.5-purple?style=for-the-badge)](https://github.com/LeLeLeonid/ZervGen)
+[![Version](https://img.shields.io/badge/Version-1.6.5a-purple?style=for-the-badge)](https://github.com/LeLeLeonid/ZervGen)
 [![License](https://img.shields.io/badge/License-MIT-000000?style=for-the-badge)](LICENSE)
 
-ZervGen runs a supervisor loop that decomposes tasks and spawns specialized agents (coder, researcher, architect) working in parallel — with persistent memory, tool execution, model tiers, and MCP integration.
+ZervGen runs a supervisor loop that decomposes tasks and spawns specialized agents (coder, researcher, architect, etc.) working in parallel with persistent memory, tool execution, model tiers, and MCP integration.
 
 ## Install
 

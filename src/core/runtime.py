@@ -3,6 +3,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import asyncio
+import fnmatch
 import inspect
 import json
 import re
@@ -237,9 +238,10 @@ class Session:
     """Append-only JSONL conversation tree."""
 
     def __init__(self, session_id: Optional[str] = None, root: Optional[Path] = None,
-                 seed: Optional[List[Dict[str, Any]]] = None):
-        """Create or reopen a session file."""
-        self.id = session_id or uuid.uuid4().hex[:12]
+                 seed: Optional[List[Dict[str, Any]]] = None, persist: bool = True):
+        """Create or reopen a session file; persist=False keeps it in memory."""
+        self.id = session_id or f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        self.persist = persist
         self.root = Path(root) if root else Path("tmp/memory/sessions")
         self.root.mkdir(parents=True, exist_ok=True)
         self.path = self.root / f"{self.id}.jsonl"
@@ -287,8 +289,9 @@ class Session:
         }
         self._entries[entry_id] = entry
         self._leaf = entry_id
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        if self.persist:
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
         return entry_id
 
     def active_branch(self) -> List[Dict[str, Any]]:
@@ -341,6 +344,10 @@ class Session:
         list.clear(self.messages)
         list.extend(self.messages, self.active_branch())
         return True
+
+
+class InputPending(Exception):
+    """Raised when a mid-run message rings the doorbell and a turn must re-prompt."""
 
 
 class RunCoordinator:
@@ -396,11 +403,16 @@ class PermissionPolicy:
                   "mcp_add", "mcp", "set_mode"}
     SCOPE_KEYS = ("path", "file_path", "directory", "target", "filename", "cwd")
 
-    def __init__(self, permission_mode: str = "ASK", mode: str = "BUILD", roots: Optional[List[str]] = None):
-        """Bind mode, permission level and allowed roots."""
+    def __init__(self, permission_mode: str = "ASK", mode: str = "BUILD", roots: Optional[List[str]] = None,
+                 allow_rules: Optional[List[str]] = None, deny_rules: Optional[List[str]] = None):
+        """Bind mode, permission level, allowed roots and explicit allow/deny globs."""
         self.permission_mode = (permission_mode or "ASK").upper()
+        if self.permission_mode == "AUTO":
+            self.permission_mode = "YOLO"
         self.mode = (mode or "BUILD").upper()
         self.roots = [Path(r).resolve() for r in (roots or [])]
+        self.allow_rules = list(allow_rules or [])
+        self.deny_rules = list(deny_rules or [])
 
     def is_mcp(self, tool_name: str) -> bool:
         return tool_name.startswith("mcp_") or tool_name.startswith("mcp__")
@@ -458,10 +470,32 @@ class PermissionPolicy:
         """Absolute paths a shell command names, quoted segments included."""
         return re.findall(r"(?:^|[\s'\"=:])((?:~|/)[^\s'\";|&)]*)", str(command or ""))
 
+    def _rule_match(self, rules: List[str], tool_name: str, args: Dict[str, Any]) -> bool:
+        """A rule matches on `tool_name` and/or `path=` glob, comma-joined."""
+        if not rules:
+            return False
+        for rule in rules:
+            for part in str(rule).split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                if part.startswith("path:"):
+                    pat = part[5:]
+                    for v in self._scoped_values(args):
+                        if fnmatch.fnmatch(v, pat) or fnmatch.fnmatch(Path(v).name, pat):
+                            return True
+                elif fnmatch.fnmatch(tool_name, part):
+                    return True
+        return False
+
     def decide(self, tool_name: str, args: Dict[str, Any]) -> str:
         """Resolve a tool call to allow, ask or deny."""
         if tool_name in self.ALWAYS_DENY:
             return "deny"
+        if self._rule_match(self.deny_rules, tool_name, args):
+            return "deny"
+        if self._rule_match(self.allow_rules, tool_name, args):
+            return "allow"
         if self.mode in ("ASK", "CALL") and (tool_name in self.BUILD_ONLY or self.is_mcp(tool_name)):
             return "deny"
         if self.check_scope(args):
@@ -470,7 +504,7 @@ class PermissionPolicy:
             self._outside(path) for path in self._shell_paths(args.get("command", "")))
         if scoped_outer:
             return "deny" if self.permission_mode == "DENY" else "ask"
-        if self.permission_mode == "AUTO":
+        if self.permission_mode == "YOLO":
             return "allow"
         if self.permission_mode == "DENY":
             return "deny" if self.is_risky(tool_name) else "allow"
@@ -493,12 +527,7 @@ class ToolRuntime:
                  timeout: float = 60.0, agent: str = "agent",
                  on_event: Optional[Any] = None, on_log: Optional[Any] = None,
                  on_permission: Optional[Any] = None, spill_dir: Optional[Path] = None):
-        """Bind tools, policy and reporting hooks.
-
-        ``on_event`` is the single reporting path. ``on_log`` is kept for
-        backwards compatibility with external callers; the runtime no longer
-        calls it, because it produced a second line for every tool call.
-        """
+        """Bind tools, policy and reporting hooks."""
         self.tools = tools
         self.policy = policy
         self.run = run

@@ -891,11 +891,85 @@ async def set_external_skills(enabled: bool) -> str:
     skill_index.reload()
     return f"External skills {'enabled' if enabled else 'disabled'}."
 
+
+async def set_tier(name: str = "") -> str:
+    """Activate a model tier (COOL/APEX/NOOB) or 'none' for default models."""
+    from src.config import set_config_value
+    from src.core.provider import get_provider
+    agent = _resolve_agent()
+    root = getattr(agent, "orchestrator", None) or agent
+    settings = getattr(root, "settings", None)
+    if settings is None:
+        return "Error: no active settings."
+    target = (name or "none").strip()
+    if target.upper() in ("NONE", "OFF", "DEFAULT", "CLEAR"):
+        target = "None"
+    else:
+        tiers = dict(getattr(settings, "model_tiers", None) or {})
+        match = next((k for k in tiers if k.upper() == target.upper()), None)
+        if match is None:
+            return f"Error: unknown tier '{name}'. Available: {', '.join(tiers)} or 'none'."
+        target = match
+    set_config_value(settings, "active_model_tier", target)
+    settings.save()
+    try:
+        root.provider = get_provider(getattr(settings, "provider", "pollinations"), settings)
+        root.invalidate_cache()
+    except Exception as e:
+        return f"Tier set to {target}, but provider rebuild failed: {e}"
+    return f"Tier set to {target}."
+
+
+async def set_config(path: str, value: str = "") -> str:
+    """Set one dotted setting, e.g. model_tiers.COOL.openai gpt-5.2."""
+    from src.config import set_config_value
+    from src.core.provider import get_provider
+    agent = _resolve_agent()
+    root = getattr(agent, "orchestrator", None) or agent
+    settings = getattr(root, "settings", None)
+    if settings is None:
+        return "Error: no active settings."
+    try:
+        result = set_config_value(settings, path, value)
+    except Exception as e:
+        return f"Error: {e}"
+    settings.save()
+    try:
+        root.provider = get_provider(getattr(settings, "provider", "pollinations"), settings)
+        root.invalidate_cache()
+    except Exception:
+        pass
+    return result
+
 async def add_favorite(skill_name: str) -> str:
     """Add the favorite tag to an external skill."""
     from src.skills_loader import skill_index
 
     return skill_index.pin(skill_name)
+
+
+async def rename_session(title: str) -> str:
+    """Rename the active session's title."""
+    from src.core.memory import memory_core
+    agent = _resolve_agent()
+    root = getattr(agent, "orchestrator", None) or agent
+    sid = getattr(root, "_active_session_id", None)
+    if not sid:
+        return "Error: no active session."
+    memory_core._session_db.set_session_title(sid, title.strip()[:100])
+    return f"Session renamed to: {title.strip()[:100]}"
+
+
+async def rename_session(title: str) -> str:
+    """Rename the active session's title."""
+    from src.core.memory import memory_core
+    agent = _resolve_agent()
+    root = getattr(agent, "orchestrator", None) or agent
+    sid = getattr(root, "_active_session_id", None)
+    if not sid:
+        return "Error: no active session."
+    memory_core._session_db.set_session_title(sid, title.strip()[:100])
+    return f"Session renamed to: {title.strip()[:100]}"
 
 
 
@@ -1007,7 +1081,7 @@ async def search_memory(query: str, limit: int = 5) -> str:
 
 
 async def search_tgs(query: str, limit: int = 3, **kwargs) -> str:
-    """Retrieve graph-enhanced, multi-hop context. Use for complex queries requiring relationship tracing, verification, or architecture understanding."""
+    """Retrieve graph-enhanced, multi-hop memory context."""
     from src.core.memory import memory_core
     try:
         limit = max(1, min(int(limit) if isinstance(limit, (int, float, str)) else 3, 5))
@@ -1059,7 +1133,6 @@ async def response(text: str = None) -> str:
         agent._response_value = text if text is not None else ""
         return agent._response_value
     return text if text is not None else ""
-
 
 
 async def calc(expression: str) -> str:
@@ -1119,11 +1192,7 @@ async def add_mcp_server(
     transport: str = "auto",
     default: bool = False,
 ) -> str:
-    """Add a local (command) or remote (url) MCP server, enabled at once.
-
-    Env values and header values are written to `.zervgen/.env`; the config file
-    keeps only `${VAR}` references so no secret lands in tracked JSON.
-    """
+    """Add a local (command) or remote (url) MCP server, enabled at once; secrets go to .env as ${VAR}."""
     if not name:
         return "Error: name is required."
     if not command and not url:

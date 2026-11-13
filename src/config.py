@@ -185,9 +185,8 @@ CONTEXT_MAX_CHARS = 3_000
 ZG_PROTOCOL = """
 Answer in plain text when the task is done; that ends the turn.
 Call a tool when you need something you do not have:
-1. One call per line: `::read {"path": "src/cli.py"}` or `::shell("pytest -q")`
-2. Fenced python when you need control flow:
-   `files = [await read(f) for f in await glob("src/**/*.py")]`
+1. One call per line, like a function: `::read("src/cli.py", 0, 4000)`, `::shell("pytest -q")`. Args bind positionally to the signature; `::name {"k": v}` (JSON) is the fallback when you must name them. Keep a JSON call on one line with valid JSON only — no raw newlines, no heredocs inside a string.
+2. Fenced python when you need control flow or a multi-line shell command (a heredoc, a pipeline across lines, a loop): `result = await shell("cd tmp/x && .venv/bin/python - <<'EOF'\nimport os\nEOF")` — the heredoc lives inside a Python string here, which parses.
 3. Native tool calls when your provider offers them.
 XML and JSON call shapes still parse; prefer the two above.
 Read before you overwrite: write(path) refuses a file that exists and was not read this session. edit(path, find, replace) changes a slice and needs no full read.
@@ -319,10 +318,10 @@ class AnthropicSettings(ProviderSettings):
 
 DEFAULT_MCP_SERVERS = {
     "filesystem": MCPServerConfig(command="npx", args=["-y", "@modelcontextprotocol/server-filesystem", "."], enabled=True),
-    "git": MCPServerConfig(command="python", args=["-m", "mcp_server_git"], enabled=True),
-    "fetch": MCPServerConfig(command="python", args=["-m", "mcp_server_fetch"], enabled=True),
+    "git": MCPServerConfig(command="uvx", args=["mcp-server-git"], enabled=True),
+    "fetch": MCPServerConfig(command="uvx", args=["mcp-server-fetch"], enabled=True),
     "memory": MCPServerConfig(command="npx", args=["-y", "@modelcontextprotocol/server-memory"], enabled=True),
-    "time": MCPServerConfig(command="python", args=["-m", "mcp_server_time"], enabled=True),
+    "time": MCPServerConfig(command="uvx", args=["mcp-server-time"], enabled=True),
     "sequential-thinking": MCPServerConfig(command="npx", args=["-y", "@modelcontextprotocol/server-sequential-thinking"], enabled=True),
     "context7": MCPServerConfig(url="https://mcp.context7.com/mcp", transport="http", enabled=True, lazy=True),
     "deepwiki": MCPServerConfig(url="https://mcp.deepwiki.com/mcp", transport="http", enabled=True, lazy=True),
@@ -355,6 +354,8 @@ class GlobalSettings(BaseModel):
     provider_models: Dict[str, str] = Field(default_factory=dict)
     mode: str = "BUILD"
     permission_mode: str = "ASK"
+    permission_allow_rules: List[str] = Field(default_factory=list)
+    permission_deny_rules: List[str] = Field(default_factory=list)
     memory_enabled: bool = True
     dream_enabled: bool = False
     dream_interval: int = 300
@@ -404,7 +405,10 @@ class GlobalSettings(BaseModel):
     fallback_providers: List[Dict[str, str]] = Field(default_factory=list)
     sensor_lsp_enabled: bool = True
     sensor_lsp_command: str = ""
-    tool_hooks: Dict[str, List[str]] = Field(default_factory=dict)
+    tool_hooks: Dict[str, List[str]] = Field(default_factory=lambda: {
+        "pre_tool_call:shell": ["grep -qiE 'rm[[:space:]]+-rf[[:space:]]+/|rm[[:space:]]+-r[[:space:]]+-f[[:space:]]+/' && { echo 'rm -rf / blocked'; exit 2; } || exit 0"],
+        "pre_tool_call:write_file": ["grep -qE '(api[_-]?key|secret|token|password)[[:space:]]*[:=][[:space:]]*\"[A-Za-z0-9_-]{8,}\"' && { echo 'possible secret in write_file'; exit 2; } || exit 0"],
+    })
     hooks_fail_closed: bool = False
     sensors_enabled: bool = True
     sensor_max_attempts: int = 3
@@ -571,6 +575,12 @@ COMPATIBLE_PRESETS: Dict[str, MCPreset] = {
         "api_key_env": "OMNIROUTER_API_KEY",
         "default_model": "deepseek-v4-1-flash",
     },
+    "omniroute": {
+        "base_url": "http://localhost:20128/v1/chat/completions",
+        "api_key_env": "",
+        "default_model": "auto",
+        "headers": {"x-omniroute-compression": "off"},
+    },
     "clodex": {
         "base_url": "https://clodex.xyz/v1/chat/completions",
         "api_key_env": "CLODEX_API_KEY",
@@ -643,6 +653,47 @@ COMPATIBLE_PRESETS: Dict[str, MCPreset] = {
     },
 }
 
+OMNIROUTE_PORT = 20128
+OMNIROUTE_BASE = f"http://localhost:{OMNIROUTE_PORT}"
+
+
+def omniroute_is_up() -> bool:
+    import urllib.request
+    try:
+        urllib.request.urlopen(f"{OMNIROUTE_BASE}/", timeout=1.5)
+        return True
+    except Exception:
+        return False
+
+
+def launch_omniroute() -> str:
+    """Start the OmniRoute gateway when it is not already serving; returns a status line."""
+    if omniroute_is_up():
+        return f"OmniRoute already running at {OMNIROUTE_BASE}"
+    import subprocess
+    import time
+    if not shutil.which("omniroute"):
+        npm = shutil.which("npm")
+        if not npm:
+            return "npm not found — install Node.js first."
+        try:
+            subprocess.run([npm, "i", "-g", "omniroute"], check=False, timeout=300)
+        except Exception:
+            return "omniroute install failed — run `npm i -g omniroute` manually."
+        if not shutil.which("omniroute"):
+            return "omniroute binary still missing after install."
+    try:
+        subprocess.Popen(["omniroute", "serve"], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except Exception:
+        return "Could not start `omniroute serve`."
+    for _ in range(20):
+        if omniroute_is_up():
+            return f"OmniRoute started — dashboard at {OMNIROUTE_BASE}"
+        time.sleep(0.5)
+    return f"omniroute spawn pending — check {OMNIROUTE_BASE} shortly."
+
+
 def _build_preset_headers(preset: dict, api_key: str = "") -> dict:
     headers = {"Content-Type": "application/json"}
     key = api_key or os.environ.get(preset.get("api_key_env") or "", "")
@@ -667,21 +718,21 @@ def _get_all_presets(settings=None) -> dict:
 
 
 def _merge_mcp_servers(configured: Optional[Dict[str, Any]] = None) -> Dict[str, MCPServerConfig]:
-    """Shipped defaults ← config.json ← ~/.zervgen/mcp.json (last wins)."""
+    """Shipped defaults ← mcp.json ← config.json (config.json wins)."""
     default_servers = {k: MCPServerConfig(**v.model_dump()) for k, v in DEFAULT_MCP_SERVERS.items()}
     merged_servers = dict(default_servers)
-    for name, cfg in (configured or {}).items():
-        if name.lower() == "zervgen" or not isinstance(cfg, dict):
-            continue
-        merged = dict(default_servers.get(name, MCPServerConfig(command="", args=[])).model_dump())
-        merged.update(cfg)
-        merged_servers[name] = MCPServerConfig(**merged)
     try:
         from src.core.mcp_manager import ensure_store, store_configs
         ensure_store(default_servers)
         merged_servers.update(store_configs())
     except Exception:
         pass
+    for name, cfg in (configured or {}).items():
+        if name.lower() == "zervgen" or not isinstance(cfg, dict):
+            continue
+        merged = dict(merged_servers.get(name, MCPServerConfig(command="", args=[])).model_dump())
+        merged.update(cfg)
+        merged_servers[name] = MCPServerConfig(**merged)
     return merged_servers
 
 
@@ -919,9 +970,11 @@ def get_allowed_roots() -> List[str]:
 
 
 def add_allowed_root(path: str) -> str:
-    p = Path(path).resolve()
+    p = Path(path.strip().strip("\"'")).expanduser().resolve()
     if not p.exists():
         return f"Error: Path does not exist: {p}"
+    if not p.is_dir():
+        return f"Error: Not a directory: {p}"
     ALLOWED_ROOTS_PATH.parent.mkdir(parents=True, exist_ok=True)
     existing = get_allowed_roots()
     if str(p) in existing:

@@ -587,12 +587,7 @@ class MemoryCore:
         return results
 
     def record_outcome(self, query: str, success: bool, limit: int = 5) -> None:
-        """Score the facts recalled for a task once its outcome is known.
-
-        Run this after a task finishes: it bumps the hit counter for every fact
-        the task saw, then updates each fact's success rate so `prune_toxic`
-        has real signal to act on instead of defaults.
-        """
+        """Score the facts a task recalled once its outcome is known."""
         if not query.strip():
             return
         for hit in self.search_memory(query, limit=limit):
@@ -1024,12 +1019,7 @@ class PeerCards:
 
 
 class Dreamer:
-    """Idle heartbeat: review past work, learn from failures, tidy memory.
-
-    Each beat is cursor-based, bounded (at most MAX_DIAGNOSES model calls),
-    and silent — it only writes state under ``tmp/state`` and knowledge into
-    the memory tiers. It never touches the user's active session.
-    """
+    """Idle heartbeat: review past work, learn from failures, tidy memory."""
 
     STATE_FILE = Path("tmp/state/dream.json")
     LEDGER_FILE = Path("tmp/state/dream.jsonl")

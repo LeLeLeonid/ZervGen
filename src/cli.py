@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 from rich.console import Console
 from rich.panel import Panel
-from rich.markdown import Markdown
 from rich.prompt import Prompt, IntPrompt
 from rich.align import Align
 from rich.table import Table
@@ -27,7 +26,7 @@ from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.widgets import TextArea
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style as PTStyle
-from prompt_toolkit.completion import Completer, Completion, WordCompleter
+from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
 from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.patch_stdout import patch_stdout
@@ -147,6 +146,39 @@ class _RankedCompleter(Completer):
             yield Completion(value, start_position=-len(raw), display=label, display_meta=meta)
 
 
+class _DynamicCompleter(Completer):
+    def __init__(self, cli):
+        self.cli = cli
+
+    def get_completions(self, document: Document, complete_event: CompleteEvent):
+        text = document.text_before_cursor
+        if "@" in text:
+            prefix = text[text.rfind("@") + 1:]
+            base = Path(prefix).expanduser()
+            directory = base if base.is_dir() else base.parent
+            directory = directory if str(directory) else Path(".")
+            try:
+                entries = sorted(
+                    [p for p in directory.iterdir()],
+                    key=lambda p: (not p.is_dir(), str(p).lower()),
+                )[:80]
+            except OSError:
+                entries = []
+            for p in entries:
+                suffix = "/" if p.is_dir() else ""
+                disp = str(p) + suffix
+                yield Completion(disp, start_position=-len(prefix), display=disp, display_meta="dir" if p.is_dir() else "file")
+            return
+        if text.lstrip().startswith("/"):
+            from src.skills_loader import skill_index
+            query = text.lstrip()[1:]
+            entries = [(f"/{k}", f"/{k}", "cmd") for k in self.cli._cmd_table]
+            entries += [(f"/{s}", f"/{s}", "skill") for s in skill_index.skills.keys()]
+            ranked = _RankedCompleter(entries).ranked(query)
+            for _, value, label, meta in ranked[:60]:
+                yield Completion(value, start_position=-len(text.lstrip()), display=label, display_meta=meta)
+
+
 class ZervGenCLI:
     def __init__(self, config=None):
         global C
@@ -206,6 +238,12 @@ class ZervGenCLI:
             "verbose": lambda a: self._cmd_verbose(a),
             "view": lambda a: self._cmd_view(a),
             "rich": lambda a: self._cmd_rich(a),
+            "peek": lambda a: self._cmd_peek(a),
+            "rewind": lambda a: self._handle_rewind(a),
+            "export": lambda a: self._handle_export(a),
+            "add-dir": lambda a: self._handle_add_dir(a),
+            "skill": lambda a: self._handle_skill(a),
+            "rename": lambda a: self._cmd_rename(a),
         }
 
     async def _setup_permission_handler(self):
@@ -242,7 +280,7 @@ class ZervGenCLI:
         return True
 
     def _cmd_rich(self, args: Optional[str] = None) -> bool:
-        """Toggle the answer panel; markdown and links render either way."""
+        """Toggle the Rich answer panel; markdown and links render either way."""
         arg = (args or "").strip().lower()
         if arg in ("on", "1", "true", "enable"):
             set_rich(True)
@@ -272,6 +310,45 @@ class ZervGenCLI:
             CC.print(f"[red]Not a file:[/red] {self._escape(target)}")
             return True
         self.transcript.media.render(os.path.expanduser(target))
+        return True
+
+    def _cmd_peek(self, args: Optional[str] = None) -> bool:
+        """Inspect the orchestrator and every live sub-agent: /peek [agent_id]."""
+        if not self.orchestrator:
+            CC.print("[red]System not initialized.[/red]")
+            return True
+        target = (args or "").strip()
+        agents = dict(getattr(self.orchestrator, "agents", {}) or {})
+
+        def agent_row(aid: str, agent) -> str:
+            run = getattr(agent, "_run", None)
+            step = getattr(getattr(run, "budget", None), "steps", 0) if run else 0
+            status = getattr(getattr(run, "status", None), "value", "?") if run else "?"
+            goal = getattr(run, "goal", "") if run else ""
+            label = f"[{aid}] {agent.name} · {status} · step {step}"
+            if goal:
+                label += f"\n    task: {self._escape(goal[:160])}"
+            return label
+
+        if target:
+            match = None
+            for aid, agent in agents.items():
+                if aid == target or aid.startswith(target) or agent.name == target:
+                    match = agent
+                    break
+            if match is None:
+                CC.print(f"[yellow]No live agent matches '{self._escape(target)}'. Use /peek to list.[/yellow]")
+                return True
+            CC.print(Panel(Text(agent_row(target, match)), title="Agent", border_style="cyan"))
+            return True
+
+        lines = [agent_row(aid, agent) for aid, agent in agents.items()]
+        body = "\n\n".join(lines) if lines else "No delegated agents right now."
+        head = f"orchestrator · {self.orchestrator.mode}"
+        run = getattr(self.orchestrator, "_run", None)
+        if run:
+            head += f" · step {getattr(run.budget, 'steps', 0)} · {getattr(run.status, 'value', '?')}"
+        CC.print(Panel(Text(head + "\n\n" + body), title="Peek", border_style="cyan"))
         return True
 
     async def _init_system(self) -> None:
@@ -405,6 +482,17 @@ class ZervGenCLI:
                 self._should_exit = True
                 event.app.exit()
 
+        @kb.add("c-z")
+        def _(event):
+            if self._agent_running:
+                if self.orchestrator:
+                    self.orchestrator.request_interrupt()
+                t = getattr(self, "_agent_task", None)
+                if t and not t.done():
+                    t.cancel()
+            self._should_exit = True
+            event.app.exit()
+
         def get_prompt():
             if not self._show_usage:
                 return [("class:prompt", "> ")]
@@ -425,8 +513,7 @@ class ZervGenCLI:
                 return [("class:toolbar", line)]
             return [("class:toolbar", " ")]
 
-        commands = [f"/{k}" for k in self._cmd_table]
-        cmd_completer = WordCompleter(commands, sentence=True)
+        cmd_completer = _DynamicCompleter(self)
 
         input_area = TextArea(
             height=Dimension(min=1, max=12, preferred=1),
@@ -477,7 +564,7 @@ class ZervGenCLI:
 [bold {C}] ███╔╝  ██╔══╝  ██╔══██╗╚██╗ ██╔╝██║   ██║██╔══╝  ██║╚██╗██║[/bold {C}]
 [white]███████╗███████╗██║  ██║ ╚████╔╝ ╚██████╔╝███████╗██║ ╚████║[/white]
 [white]╚══════╝╚══════╝╚═╝  ╚═╝  ╚═══╝   ╚═════╝ ╚══════╝╚═╝  ╚═══╝[/white]
-[dim]v1.6.5 - [i]Stable. Simple. Smart.[/i][/dim]
+[dim]v1.6.5a - [i]Stable. Simple. Smart.[/i][/dim]
         """
         try:
             mem_count = memory_core.get_stats().get('now_count', 0)
@@ -517,7 +604,24 @@ class ZervGenCLI:
             if asyncio.iscoroutine(res):
                 await res
             return True
+        if self._force_skill(raw_cmd, args):
+            return True
         CC.print(f"[red]Unknown command: {self._escape(cmd)}[/red]\n[dim]Type /help for commands.[/dim]")
+        return True
+
+    def _force_skill(self, name: str, args: Optional[str]) -> bool:
+        """A slash-name that is not a command is a skill: inject its body next turn."""
+        from src.skills_loader import skill_index
+        skill = skill_index.get(name)
+        if not skill:
+            return False
+        forced = getattr(self.orchestrator, "_forced_skills", None)
+        if forced is None:
+            forced = self.orchestrator._forced_skills = []
+        if name not in forced:
+            forced.append(name)
+        CC.print(f"[bold green][+] SKILL FORCED: {skill.name}[/bold green] — {skill.description}")
+        CC.print(f"[dim]Body injected into the prompt for the next turn(s). /skill off clears.[/dim]")
         return True
 
     def _clear_session(self, hard: bool = False, all_sessions: bool = False) -> bool:
@@ -758,6 +862,19 @@ class ZervGenCLI:
         CC.print("[bold yellow]Run stopped.[/bold yellow]")
         return True
 
+    def _cmd_rename(self, args: Optional[str] = None) -> bool:
+        """Rename the active session (empty shows the current title)."""
+        title = (args or "").strip()
+        if not title:
+            CC.print("[yellow]Usage: /rename <new title>[/yellow]")
+            return True
+        if not self.orchestrator or not self.orchestrator._active_session_id:
+            CC.print("[yellow]No active session to rename.[/yellow]")
+            return True
+        memory_core._session_db.set_session_title(self.orchestrator._active_session_id, title[:100])
+        CC.print(f"[green]Session renamed to: {self._escape(title[:100])}[/green]")
+        return True
+
     def _cmd_logs(self, args: Optional[str] = None) -> bool:
         """``/logs [errors] [lines] [pattern]`` — tail or grep tmp/agent.log."""
         words = (args or "").strip().split()
@@ -876,6 +993,12 @@ class ZervGenCLI:
         CC.print(f"[bold][{C}]Token Counter: {'ON' if self._show_usage else 'OFF'}[/{C}][/bold]")
         return True
 
+    def _launch_omniroute(self) -> None:
+        from src.config import launch_omniroute, omniroute_is_up
+        status = launch_omniroute()
+        color = "green" if omniroute_is_up() else "yellow"
+        CC.print(f"[{color}]{self._escape(status)}[/{color}]")
+
     def _handle_provider(self, args: Optional[str]) -> Any:
         name = (args or "").strip().lower()
         if not name:
@@ -886,6 +1009,8 @@ class ZervGenCLI:
         if target not in known:
             CC.print(f"[red]Unknown provider: {self._escape(name)}[/red]\n[dim]Use /provider with no argument to list.[/dim]")
             return True
+        if target == "omniroute":
+            self._launch_omniroute()
         previous = self.config.provider
         if self.orchestrator and not self.orchestrator.switch_provider(target):
             CC.print(f"[red]Switch failed — stayed on {self._escape(previous.upper())}[/red]")
@@ -972,7 +1097,7 @@ class ZervGenCLI:
             self.orchestrator._mcp_initialized = False
             MCPManager._instance = None
             self.orchestrator._mcp = None
-        if key in {"permission_mode", "mode", "allowed_directories"}:
+        if key in {"permission_mode", "permission_allow_rules", "permission_deny_rules", "mode", "allowed_directories"}:
             self.orchestrator._runtime = self.orchestrator._build_runtime()
         self.orchestrator.invalidate_cache()
         return True
@@ -1075,6 +1200,76 @@ class ZervGenCLI:
         CC.print(f"[cyan]{self._escape(result)}[/cyan]")
         return True
 
+    async def _handle_rewind(self, args: Optional[str]) -> bool:
+        """Drop the last N conversation turns so you can redo them."""
+        if not self.orchestrator:
+            return True
+        n = int(args.strip()) if args and args.strip().isdigit() else 1
+        history = self.orchestrator.history
+        user_idx = [i for i, m in enumerate(history) if m.get("role") == "user"]
+        if len(user_idx) <= 1:
+            CC.print("[yellow]Nothing to rewind.[/yellow]")
+            return True
+        cut = user_idx[-(min(n, len(user_idx) - 1))]
+        self.orchestrator.history = history[:cut]
+        CC.print(f"[green]Rewound {min(n, len(user_idx) - 1)} turn(s). {len(user_idx) - 1 - min(n, len(user_idx) - 1)} remain.[/green]")
+        return True
+
+    async def _handle_export(self, args: Optional[str]) -> bool:
+        """Dump the current conversation to tmp/reports/export_<ts>.md."""
+        if not self.orchestrator:
+            return True
+        rows = _conversation(self.orchestrator.history)
+        if not rows:
+            CC.print("[yellow]Nothing to export.[/yellow]")
+            return True
+        path = Path("tmp/reports") / f"export_{datetime.now():%Y%m%d-%H%M%S}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = ["# ZervGen Export", f"Exported {datetime.now():%Y-%m-%d %H:%M}", ""]
+        for m in rows:
+            who = "## You" if m.get("role") == "user" else "## ZervGen"
+            lines.append(f"{who}\n\n{m.get('content', '')}\n")
+        path.write_text("\n".join(lines), encoding="utf-8")
+        CC.print(f"[green]Exported {len(rows)} messages to {path}[/green]")
+        return True
+
+    async def _handle_add_dir(self, args: Optional[str]) -> bool:
+        """Allow the agent to read/write another directory (scope whitelist)."""
+        if not args:
+            CC.print("[yellow]Usage: /add-dir <path>[/yellow]")
+            return True
+        from src.config import add_allowed_root
+        result = add_allowed_root(args.strip())
+        CC.print(f"[green]{self._escape(result)}[/green]" if "Added" in result or "Already" in result else f"[red]{self._escape(result)}[/red]")
+        if self.orchestrator:
+            self.orchestrator._runtime = self.orchestrator._build_runtime()
+        return True
+
+    async def _handle_skill(self, args: Optional[str]) -> bool:
+        """Force a skill body into the prompt now, or list / clear with off."""
+        from src.skills_loader import skill_index
+        if not self.orchestrator:
+            return True
+        name = (args or "").strip()
+        if not name:
+            CC.print("[dim]Usage: /skill <name> (off clears all)[/dim]")
+            return True
+        if name.lower() in ("off", "clear", "none"):
+            self.orchestrator._forced_skills = []
+            CC.print("[yellow]Forced skills cleared.[/yellow]")
+            return True
+        skill = skill_index.get(name)
+        if not skill:
+            CC.print(f"[red]Skill '{self._escape(name)}' not found[/red]")
+            return True
+        forced = getattr(self.orchestrator, "_forced_skills", [])
+        if name not in forced:
+            forced.append(name)
+            self.orchestrator._forced_skills = forced
+        self.orchestrator.invalidate_cache()
+        CC.print(f"[bold green][+] FORCED: {skill.name}[/bold green] — {skill.description}")
+        return True
+
     async def _handle_mode(self, args: Optional[str]) -> bool:
         if args:
             if self._apply_mode(args.upper()):
@@ -1172,12 +1367,17 @@ class ZervGenCLI:
 /key     - Set the API key for the current provider
 /expand  - Reprint the last activity group (/expand 3)
 /verbose - Toggle per-call rows instead of one collapsed row
-/rich    - Toggle Rich rendering of markdown and markup
+/rich    - Toggle the Rich answer panel (markdown always renders)
 /goal    - Set a completion contract: /goal <text> (off clears)
 /loop    - Repeat a task: /loop [--n=3] <task>
 /logs    - Tail or grep agent.log: /logs [errors] [lines] [pattern]
 /stop    - Stop the running turn now
 /view    - Preview an image, video or audio file: /view tmp/x.png
+/peek    - Inspect the orchestrator and live sub-agents: /peek [agent_id]
+/rewind  - Drop the last N conversation turns (default 1)
+/export  - Dump this conversation to tmp/reports/
+/add-dir - Allow the agent to read/write another directory
+/skill   - Force a skill body into the prompt: /skill code-review (off clears)
 /q       - Quit application
 
 [bold][{C}]PROVIDER:[/{C}][/bold]
@@ -1456,8 +1656,9 @@ class ZervGenCLI:
             pass
 
     def _permission_menu(self) -> None:
-        modes = ["ASK", "AUTO", "DENY"]
+        modes = ["ASK", "YOLO", "DENY"]
         CC.print("\n[bold]PERMISSION MODE[/bold]")
+        CC.print("  [dim]YOLO = You Only Look Once — never ask, just go[/dim]")
         for i, m in enumerate(modes, 1):
             marker = " ← current" if m == self.config.permission_mode else ""
             CC.print(f"  [{i}] {m}{marker}")
@@ -1608,7 +1809,7 @@ class ZervGenCLI:
     def _has_api_key(self) -> bool:
         from src.config import _get_all_presets, resolve_provider
         p = resolve_provider(self.config.provider)
-        if p in ("pollinations", "ollama", "lmstudio", "koboldcpp"):
+        if p in ("pollinations", "omniroute", "ollama", "lmstudio", "koboldcpp"):
             return True
         preset = _get_all_presets(self.config).get(p) or {}
         env = preset.get("api_key_env") or f"{p.upper().replace('-', '_')}_API_KEY"
@@ -1717,24 +1918,34 @@ class ZervGenCLI:
         tiers = dict(self.config.model_tiers)
         if not name:
             return self._select_tier()
+        if name in ("NONE", "OFF", "DEFAULT"):
+            name = "None"
+            self.config.active_model_tier = name
+            self.config.save()
+            self._rebuild_provider()
+            CC.print("[bold green]✓ Tier: none (default per-provider models)[/bold green]")
+            return True
         if name not in tiers:
-            CC.print(f"[red]Unknown tier: {self._escape(name)}[/red]\n[dim]Available: {', '.join(tiers)}. Set tier models with /set model_tiers.<tier>.<provider> <model>[/dim]")
+            CC.print(f"[red]Unknown tier: {self._escape(name)}[/red]\n[dim]Available: {', '.join(tiers)} (or /tier none). Set tier models with /set model_tiers.<tier>.<provider> <model>[/dim]")
             return True
         self.config.active_model_tier = name
         self.config.save()
+        self._rebuild_provider()
+        CC.print(f"[bold green]✓ Tier: {name}[/bold green]")
+        return True
+
+    def _rebuild_provider(self) -> None:
         if self.orchestrator:
             try:
                 self.orchestrator.provider = get_provider(self.config.provider, self.config)
                 self.orchestrator.invalidate_cache()
             except Exception:
                 pass
-        CC.print(f"[bold green]✓ Tier: {name}[/bold green]")
-        return True
 
     async def _select_tier(self) -> None:
         tiers = dict(self.config.model_tiers)
         current = str(self.config.active_model_tier or "None").upper()
-        entries = []
+        entries = [("NONE", "None", "current" if current == "NONE" else "default per-provider models")]
         for name, table in tiers.items():
             models = ", ".join(f"{k}={v}" for k, v in (table or {}).items()) or "no models set"
             notes = "current" if name == current else (models[:48] + "…" if len(models) > 48 else models)
@@ -1766,8 +1977,10 @@ class ZervGenCLI:
             CC.print(f"[red]Unknown provider: {self._escape(name)}[/red]")
             return
         old = self.config.provider
-        if meta.name not in ("pollinations", "local", "ollama", "lmstudio", "koboldcpp"):
-            self.config.provider = meta.name
+        self.config.provider = meta.name
+        if meta.name == "omniroute":
+            self._launch_omniroute()
+        if meta.name not in ("pollinations", "local", "omniroute", "ollama", "lmstudio", "koboldcpp"):
             if not self._has_api_key():
                 CC.print(f"[yellow]{meta.name} requires an API key.[/yellow]")
                 self._input_api_key()
@@ -2005,15 +2218,42 @@ class ZervGenCLI:
                 self._modal_cmd = None
                 await self.handle_system_command(cmd)
 
+    def _expand_mentions(self, text: str) -> str:
+        """Inline @path content so the model sees the file without a read() round-trip."""
+        def _sub(match):
+            path = match.group(1)
+            try:
+                p = Path(path).expanduser()
+                if not p.is_file():
+                    return match.group(0)
+                body = p.read_text(encoding="utf-8", errors="replace")
+                if len(body) > 20000:
+                    body = body[:20000] + "\n… [truncated]"
+                return f"[file:{path}]\n```\n{body}\n```"
+            except OSError:
+                return match.group(0)
+        return re.sub(r"@([^\s@]+)", _sub, text)
+
+    SAFE_MIDRUN_COMMANDS = {
+        "help", "history", "todo", "time", "memory", "usage", "status",
+        "get", "settings", "trace", "logs", "verbose", "rich", "expand",
+        "peek", "contract", "rename",
+    }
+
+    def _safe_midrun(self, text: str) -> bool:
+        """Only pure-read commands run while an agent is mid-run; the rest defer."""
+        name = (text.strip().split()[0] if text.strip() else "").lstrip("/").lower()
+        return name in self.SAFE_MIDRUN_COMMANDS
+
     async def _process_task(self, user_input: str) -> None:
         if not self.orchestrator:
             return
+        user_input = self._expand_mentions(user_input)
         if not self.orchestrator._active_session_id:
             self.orchestrator.new_session(title=user_input[:80])
         self.transcript.begin()
         self._agent_task = asyncio.create_task(self._do_run(user_input))
         self._agent_running = True
-        deferred: list[str] = []
         if self._app:
             self._app.invalidate()
         try:
@@ -2027,12 +2267,29 @@ class ZervGenCLI:
                         self._perm_future.set_result(msg.strip().lower() in ("y", "yes"))
                         continue
                     text = msg.strip()
-                    if text.lower() in ("/stop", "stop"):
+                    if text.lower() in ("/q", "q", "exit", "quit", "/exit"):
+                        if self._agent_task and not self._agent_task.done():
+                            self.orchestrator.request_interrupt()
+                            self._agent_task.cancel()
+                        self._should_exit = True
+                        if self._app:
+                            self._app.exit()
+                        return
+                    elif text.lower() in ("/stop", "stop"):
                         if self._agent_task and not self._agent_task.done():
                             self.orchestrator.request_interrupt()
                             self._agent_task.cancel()
                     elif text.startswith("/"):
-                        deferred.append(text)
+                        if self._safe_midrun(text):
+                            await self.handle_system_command(text)
+                        else:
+                            if self._agent_task and not self._agent_task.done():
+                                self.orchestrator.request_interrupt()
+                                self._agent_task.cancel()
+                            self._modal_cmd = text
+                            if self._app:
+                                self._app.exit()
+                            return
                     else:
                         self.orchestrator.inject_user_message(text)
                 await asyncio.sleep(0.1)
@@ -2052,8 +2309,6 @@ class ZervGenCLI:
             pass
         for m in self.orchestrator.coordinator.drain():
             self._pending_input.put_nowait(m)
-        for cmd in deferred:
-            await self.handle_system_command(cmd)
 
     async def _do_run(self, user_input: str) -> None:
         async with self._active_lock:
@@ -2089,7 +2344,13 @@ class ZervGenCLI:
             raise
         except Exception as e:
             self.transcript.end()
-            CC.print(f"[bold red]Error:[/bold red] {self._escape(str(e))}")
+            hint = ""
+            from src.config import resolve_provider
+            if resolve_provider(self.config.provider) == "omniroute":
+                from src.config import omniroute_is_up, OMNIROUTE_BASE
+                if not omniroute_is_up():
+                    hint = f"\n[dim]The OmniRoute gateway isn't responding at {OMNIROUTE_BASE}. Run /provider omniroute to auto-install & start it (`npm i -g omniroute && omniroute serve`).[/dim]"
+            CC.print(f"[bold red]Error:[/bold red] {self._escape(str(e))}{hint}")
         finally:
             async with self._active_lock:
                 self._user_active = False

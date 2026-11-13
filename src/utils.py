@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Dict, Optional, List, Any, Callable, TypeVar
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.panel import Panel
 import httpx
 import json
 import logging
@@ -27,7 +28,7 @@ from src.config import _REDACT_PATTERNS, CONTEXT_PRIORITY, CONTEXT_OVERRIDE, CON
 
 console = Console()
 
-_RICH = {"on": False}
+_RICH = {"on": True}
 
 
 def rich_on() -> bool:
@@ -40,16 +41,8 @@ def set_rich(on: bool) -> None:
 
 
 def print_block(text: str, panel: bool = False, emit=None) -> None:
-    """Paint markdown once; `emit` overrides the sink, `panel` adds the box frame."""
+    """Paint markdown once; `panel` adds the box frame, `emit` overrides the sink."""
     if not text.strip():
-        return
-    if not rich_on():
-        line = text if text.endswith("\n") else text + "\n"
-        if emit is not None:
-            emit(line)
-        else:
-            sys.stdout.write(line)
-            sys.stdout.flush()
         return
     body = Markdown(text)
     (emit or console.print)(Panel(body, border_style="cyan") if panel else body, soft_wrap=True)
@@ -60,6 +53,7 @@ TRACE_ROOT = Path("tmp/state/trace")
 STATE_LIMIT = {"runs.jsonl": 500, "incidents.jsonl": 200}
 KEEP_TRACES = 200
 KEEP_PREVIEWS = 100
+KEEP_SESSIONS = 30
 
 
 def prune_state(root: Path = Path("tmp")) -> None:
@@ -77,6 +71,7 @@ def prune_state(root: Path = Path("tmp")) -> None:
     for directory, pattern, keep in (
         (state / "trace", "*.jsonl", KEEP_TRACES),
         (Path(root) / "preview", "*.png", KEEP_PREVIEWS),
+        (Path(root) / "memory" / "sessions", "*.jsonl", KEEP_SESSIONS),
     ):
         files = []
         for path in directory.glob(pattern):
@@ -104,12 +99,7 @@ def trace_line(role: str, event_type: str, content: str) -> None:
     )
 
 class Media:
-    """Inline previews for the images and videos an agent produces.
-
-    Native protocols (kitty, iTerm2) are used when the terminal speaks them;
-    otherwise the frame is drawn as truecolor half-blocks. Anything else gets
-    one compact descriptor row — never a wall of escape codes.
-    """
+    """Inline previews for the images and videos an agent produces."""
 
     VIDEO_EXT = {".mp4", ".webm", ".mov", ".mkv", ".avi"}
     AUDIO_EXT = {".mp3", ".wav", ".ogg", ".flac", ".m4a", ".opus"}
@@ -380,12 +370,7 @@ class _Activity:
 
 
 class ActivityRenderer:
-    """Grouped transcript: a run of tool calls is one row, details on demand.
-
-    Consecutive tool results collapse into a single activity row once there are
-    three or more; one or two stay as individual rows. Nothing is lost: rows
-    are retained, ``expand()`` reprints a group, and the JSONL keeps everything.
-    """
+    """Grouped transcript: a run of tool calls is one row, details on demand."""
 
     INDENT = "  "
     KEEP = 20
@@ -543,15 +528,7 @@ class _PendingCall:
     started: float = field(default_factory=time.monotonic)
 
 class TraceBus:
-    """One logical event → one terminal line, one log line, one JSONL record.
-
-    Before this, a single answer was announced four times: the code block, the
-    ``response`` tool call, the tool result, and the answer. The terminal showed
-    four trimmed copies and ``agent.log`` got eight full copies.
-
-    Tool calls are buffered and rendered together with their result. Answers
-    render as a receipt — the UI paints the text.
-    """
+    """One logical event → one terminal line, one log line, one JSONL record."""
 
     capture_chars: int = 2000
     root: Path = TRACE_ROOT
@@ -1098,11 +1075,7 @@ def looks_like_markup(text: str) -> bool:
     return markup > len(lines) * 0.6
 
 def _fence_calls_tools(code: str, names: Optional[set[str]]) -> bool:
-    """True when a fenced block is a script the loop should run, not a sample.
-
-    A PTC block either calls a tool, or speaks the PTC dialect (top-level
-    ``return`` / ``await``). A pasted script defines functions and has none.
-    """
+    """True when a fenced block is a runnable PTC script, not a pasted sample."""
     tools = set(names or ())
     try:
         tree = ast.parse(code)
@@ -1445,14 +1418,14 @@ def discover_context_files(cwd: str = ".", subdir: str = "") -> str:
         if override.exists():
             raw = _read_rule_file(override)
             if raw:
-                return f"--- PROJECT RULES ({CONTEXT_OVERRIDE}) ---\n{raw}\n"
+                return f"--- {CONTEXT_OVERRIDE} ---\n{raw}\n"
         for name in CONTEXT_PRIORITY:
             candidate = sp / name
             if not candidate.exists():
                 continue
             raw = _read_rule_file(candidate)
             if raw:
-                return f"--- PROJECT RULES ({name}) ---\n{raw}\n"
+                return f"--- {name} ---\n{raw}\n"
     logging.getLogger(__name__).info("discover_context_files: no project context files found")
     return ""
 

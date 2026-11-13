@@ -1,14 +1,13 @@
 import asyncio
 import ast
+import fnmatch
 import hashlib
 import json
 import logging
 import inspect
 import re
 import shutil
-import subprocess
 import time
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -21,10 +20,10 @@ from src.config import MODES, GlobalSettings, load_config, ZG_PROTOCOL
 from src.core.provider import AIProvider, get_provider, is_provider_fault
 from src.skills_loader import load_role, SkillEngine
 from src.tools import TOOL_NAMES, TOOL_REGISTRY, current_agent, shell_exec, _mcp_schema, _schema_signature, _schema_doc, _native_tool_schemas
-from src.utils import get_system_context, sanitize_for_prompt, generate_random_delimiter, count_tokens, add_global_tokens, add_provider_tokens, truncate_to_tokens, context_ceiling
+from src.utils import get_system_context, sanitize_for_prompt, generate_random_delimiter, count_tokens, add_global_tokens, add_provider_tokens, context_ceiling
 from src.core.runtime import (
     Run, Artifact, RunStatus, Task,
-    Session, RunCoordinator, PermissionPolicy, ToolRuntime, Compactor,
+    Session, RunCoordinator, PermissionPolicy, ToolRuntime, Compactor, InputPending,
 )
 from src.utils import CALL_MARKUP_RE, SHORTHAND_RE, TERMINAL_TOOLS, TraceBus, TurnIntent, canonical_tool, parse_turn, strip_ptc, looks_like_python
 
@@ -33,13 +32,7 @@ console = Console()
 
 
 class _StreamFilter:
-    """Streams prose to the terminal as Markdown, hiding tool-call surfaces.
-
-    Prose accumulates into a block and paints as Markdown when a blank line
-    closes it. Fenced Python is dropped (it is a PTC call); any other fence is
-    painted as a code block. ``::tool`` lines never reach the terminal because
-    they render as a collapsed tool row instead.
-    """
+    """Streams prose as Markdown, hiding tool-call surfaces."""
 
     HOLD = 400
     BLOCK = 1200
@@ -153,8 +146,8 @@ class StemAgent:
         self.settings = settings or load_config()
         self.mode = mode.upper() if mode else "BUILD"
         self.memory = memory
-        self.session = Session(seed=initial_history)
-        self._history: List[Dict[str, str]] = self.session.messages
+        self.session = None if silent else Session(seed=initial_history)
+        self._history: List[Dict[str, str]] = self.session.messages if self.session else list(initial_history or [])
         self.coordinator = RunCoordinator()
         self.tools: Dict[str, Any] = {}
         self.interrupt_event = asyncio.Event()
@@ -223,6 +216,8 @@ class StemAgent:
                 permission_mode=getattr(self.settings, "permission_mode", "ASK"),
                 mode=self.mode,
                 roots=get_allowed_roots(),
+                allow_rules=getattr(self.settings, "permission_allow_rules", []) or [],
+                deny_rules=getattr(self.settings, "permission_deny_rules", []) or [],
             ),
             run=self._run,
             timeout=float(getattr(self.settings, "tool_timeout", 60) or 60),
@@ -275,32 +270,32 @@ class StemAgent:
         self._fallback_index = 0
 
     async def _run_hook(self, event: str, tool: str, args: Dict[str, Any]) -> Optional[str]:
-        """Run configured shell hooks; exit 2 blocks the call, stdout is the reason."""
+        """Run matched hooks; exit 2 blocks, stdout is the reason shown to the model."""
         hooks = getattr(self.settings, "tool_hooks", None) or {}
-        commands = hooks.get(event) or []
-        if isinstance(commands, str):
-            commands = [commands]
+        commands = [
+            c for key, cmds in hooks.items()
+            for c in ([cmds] if isinstance(cmds, str) else cmds)
+            if self._hook_match(key, event, tool)
+        ]
         if not commands or not tool:
             return None
-        import os
         payload = json.dumps({"event": event, "tool": tool, "args": args}, ensure_ascii=False, default=str)
-        env = dict(os.environ, ZG_HOOK_EVENT=event, ZG_HOOK_TOOL=tool, ZG_HOOK_ARGS=payload[:8000])
         for command in commands:
             proc = await asyncio.create_subprocess_shell(
-                command, stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env)
+                command, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
             out, _ = await proc.communicate(payload.encode())
             if proc.returncode == 2:
-                reason = out.decode("utf-8", "replace").strip() or f"hook blocked {tool}"
-                return reason[:500]
+                return (out.decode("utf-8", "replace").strip() or f"hook blocked {tool}")[:500]
         return None
 
-    def _runtime_event(self, kind: str, **fields) -> None:
-        """Route one tool event to the trace bus; a call and its result are one row.
+    @staticmethod
+    def _hook_match(key: str, event: str, tool: str) -> bool:
+        """Config key `event` fires on every tool; `event:glob` scopes to matching tools."""
+        base, _, pattern = key.partition(":")
+        return base == event and (not pattern or fnmatch.fnmatch(tool, pattern))
 
-        ``response()`` is a loop verb, not a tool: its call and result are
-        tracked by ``call_id`` and dropped before either becomes a row.
-        """
+    def _runtime_event(self, kind: str, **fields) -> None:
+        """Route one tool event to the trace bus; call + result collapse into one row."""
         name = fields.get("name") or ""
         call_id = fields.get("call_id") or ""
         if name in TERMINAL_TOOLS:
@@ -436,7 +431,7 @@ class StemAgent:
                 continue
             args = call.get("arguments")
             arguments = args if isinstance(args, dict) else {}
-            lines.append(f"::tool {name} {json.dumps(arguments, ensure_ascii=False)}")
+            lines.append(f"::{name} {json.dumps(arguments, ensure_ascii=False)}")
         return "\n".join(lines)
 
     async def _response_verb(self, text: Optional[str] = None) -> str:
@@ -448,12 +443,7 @@ class StemAgent:
         return self._response_value
 
     def _ptc_tools(self) -> Dict[str, Any]:
-        """Async wrappers binding each tool's signature to a runtime call.
-
-        ``response`` is the loop verb that ends a turn: it is injected straight
-        into the PTC namespace, so it produces no tool row, policy check or
-        budget entry.
-        """
+        """Async wrappers binding each tool's signature to a runtime call."""
         tools: Dict[str, Any] = {}
         active = self._active_tools()
         if any(name in TERMINAL_TOOLS for name in active):
@@ -531,8 +521,10 @@ class StemAgent:
         self._prompt_hash = None
 
     async def request_permission(self, question: str, details: str = "", default: bool = False) -> bool:
-        mode = getattr(self.settings, "permission_mode", "ASK")
+        mode = (getattr(self.settings, "permission_mode", "ASK") or "ASK").upper()
         if mode == "AUTO":
+            mode = "YOLO"
+        if mode == "YOLO":
             return True
         if mode == "DENY":
             return False
@@ -641,6 +633,16 @@ class StemAgent:
             f"NOW: {datetime.now():%Y-%m-%d %H:%M}"
         )
 
+    def _prompt_workspace(self) -> str:
+        """Live state map under tmp/, so the agent knows exactly where to peek."""
+        return (
+            "--- WORKSPACE (tmp/) ---\n"
+            "- tmp/trace/*.txt — full untruncated read()/fetch() output\n"
+            "- tmp/state/ — trace/<run_id>.jsonl (this run), runs.jsonl, incidents.jsonl\n"
+            "- tmp/memory/ — sessions.db, sessions/*.jsonl, knowledge_graph.json, peer_cards.json, vector_store/\n"
+            "- tmp/checkpoints/*.patch · tmp/preview/*.png (/view) · tmp/agent.log · tmp/errors.log"
+        )
+
     @property
     def _memory_on(self) -> bool:
         """Memory is wired and not disabled by settings."""
@@ -710,6 +712,20 @@ class StemAgent:
             logger.debug("Prompt skills failed: %s", e)
             return ""
 
+    def _prompt_forced_skills(self) -> str:
+        """Full bodies of skills the user pinned with a slash-name, this session."""
+        forced = getattr(self, "_forced_skills", None) or []
+        if not forced:
+            return ""
+        from src.skills_loader import skill_index
+        blocks = []
+        for name in list(forced):
+            body = skill_index.get_body(name)
+            if body.startswith("Error:"):
+                continue
+            blocks.append(f"--- FORCED SKILL: {name} ---\n{body}")
+        return "\n\n".join(blocks)
+
     def _prompt_protocol(self) -> str:
         """Execution protocol; native backends get the tool-first variant."""
         text = ZG_PROTOCOL.strip()
@@ -760,11 +776,13 @@ class StemAgent:
             ("tools", self._prompt_tools(), 2),
             ("mcp", self._prompt_mcp(), 3),
             ("skills", self._prompt_skills(user_input), 4),
+            ("forced", self._prompt_forced_skills(), 0),
+            ("workspace", self._prompt_workspace(), 1),
         ]
         volatile = [
             ("memory", self._prompt_memory(user_input), 5),
             ("peers", self._prompt_peer_cards(user_input), 6),
-            ("context", f"--- CONTEXT ---\n{get_system_context()}", 7),
+            ("context", f"--- ENVIRONMENT ---\n{get_system_context()}", 7),
             ("run", self._prompt_run(), 8),
         ]
         self._stable_prefix = "\n\n".join(text for _, text, _ in stable if text)
@@ -789,12 +807,7 @@ class StemAgent:
 
 
     def _log(self, role: str, content: str, event_type: str = "message", mode: str = "") -> None:
-        """Record one event: the bus renders + logs it once; history is written once.
-
-        No ``logger.info`` here on purpose — the bus owns the log line, so
-        ``tmp/agent.log`` and the terminal show the same sequence instead of
-        the terminal showing four lines for one event and the log eight.
-        """
+        """Record one event once: the trace bus renders, logs and writes history."""
         from src.utils import redact_fast
         safe_content = redact_fast(content)
         self.trace.emit(event_type, role, safe_content)
@@ -1135,8 +1148,6 @@ class StemAgent:
         return bool(getattr(self, "_answer_streamed", False))
 
     def _set_status(self, enabled: bool, label: str = "") -> None:
-        if self._silent:
-            return
         cb = getattr(self, "status_cb", None)
         if cb:
             if not enabled:
@@ -1145,6 +1156,8 @@ class StemAgent:
                 cb(label)
             else:
                 cb(getattr(self, "_status_base", "") or "thinking...")
+            return
+        if self._silent:
             return
         if enabled:
             if self._status is None:
@@ -1158,6 +1171,41 @@ class StemAgent:
     def inject_user_message(self, text: str) -> None:
         if text and text.strip():
             self.coordinator.ring(text)
+
+    async def _abortable(self, coro, timeout: float):
+        """Race one coroutine against interrupt and mid-run input so /stop and injected text act promptly."""
+        work = asyncio.ensure_future(coro)
+        stop = asyncio.ensure_future(self.interrupt_event.wait())
+        ring = asyncio.ensure_future(self.coordinator.doorbell.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {work, stop, ring}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            work.cancel()
+            stop.cancel()
+            ring.cancel()
+            await asyncio.gather(work, stop, ring, return_exceptions=True)
+            raise
+        if stop in done:
+            work.cancel()
+            ring.cancel()
+            await asyncio.gather(work, ring, return_exceptions=True)
+            raise asyncio.CancelledError("Run aborted by user.")
+        if ring in done:
+            work.cancel()
+            stop.cancel()
+            await asyncio.gather(work, stop, return_exceptions=True)
+            raise InputPending()
+        if work in done:
+            stop.cancel()
+            ring.cancel()
+            await asyncio.gather(stop, ring, return_exceptions=True)
+            return work.result()
+        work.cancel()
+        stop.cancel()
+        ring.cancel()
+        await asyncio.gather(work, stop, ring, return_exceptions=True)
+        raise asyncio.TimeoutError()
 
     async def _handle_llm_turn(self, system_prompt: str) -> str:
         if self.interrupt_event.is_set():
@@ -1190,7 +1238,9 @@ class StemAgent:
             self._set_status(False)
             stream = _StreamFilter(thought_cb=self._live_thought)
             try:
-                response = await asyncio.wait_for(self.provider.generate_text(safe_history, full_prompt, on_token=stream), timeout=provider_timeout)
+                response = await self._abortable(
+                    self.provider.generate_text(safe_history, full_prompt, on_token=stream),
+                    provider_timeout)
             except asyncio.TimeoutError:
                 self._last_streamed = stream.wrote
                 self._last_streamed_text = stream.emitted
@@ -1206,7 +1256,9 @@ class StemAgent:
         else:
             self._last_streamed = False
             self._last_streamed_text = ""
-            response = await asyncio.wait_for(self.provider.generate_text(safe_history, full_prompt), timeout=provider_timeout)
+            response = await self._abortable(
+                self.provider.generate_text(safe_history, full_prompt),
+                provider_timeout)
         response = (response or "").strip()
         if response.startswith(delim) and response.endswith(delim):
             response = response[len(delim):-len(delim)].strip()
@@ -1661,6 +1713,8 @@ class StemAgent:
                     except asyncio.CancelledError:
                         self.interrupt_event.clear()
                         return self._finish(RunStatus.STOPPED, "Stopped by user.")
+                    except InputPending:
+                        break
                     except Exception as e:
                         if self.interrupt_event.is_set():
                             return self._finish(RunStatus.STOPPED, "Stopped by user.")
@@ -1695,6 +1749,8 @@ class StemAgent:
                             import traceback
                             self._log(self.name, f"{type(e).__name__}: {e}\n{traceback.format_exc()[-800:]}", "ptc_error", self.mode)
                             return self._finish(RunStatus.FAILED, f"Error: {e}")
+                if response is None:
+                    continue
                 specs = self._tool_specs()
                 intent = parse_turn(response, set(specs) | TERMINAL_TOOLS, specs)
                 if intent.source == "auto-ptc" and not getattr(self.settings, "ptc_auto_detect", True):
@@ -1733,7 +1789,7 @@ class StemAgent:
                         self.history.append({"role": "assistant", "content": response})
                     self._log(self.name, hint, "ptc_error", self.mode)
                     self.history.append({"role": "user", "content":
-                                         f"[LOOP] {hint} Emit a ```python block, a ::tool line, or a plain final answer now."})
+                                         f"[LOOP] {hint} Emit a ```python block, a ::name(args) line, or a plain final answer now."})
                     self.invalidate_cache()
                     continue
                 self._empty_total = 0
@@ -1792,7 +1848,7 @@ class StemAgent:
                     if response.strip():
                         self.history.append({"role": "assistant", "content": response})
                     self.history.append({"role": "user", "content":
-                                         "[LOOP] That message carried no answer. Emit a ```python block, a ::tool line, or a plain final answer."})
+                                         "[LOOP] That message carried no answer. Emit a ```python block, a ::name(args) line, or a plain final answer."})
                     self.invalidate_cache()
                     continue
                 queued, terminal = await self._verify_or_repair()

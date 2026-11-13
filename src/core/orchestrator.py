@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import re
-import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -67,6 +66,7 @@ class Orchestrator(StemAgent):
         self._goal_text = ""
         self._goal_round = 0
         self._goal_max = 10
+        self._forced_skills: list = []
         if settings.checkpoints_enabled and mode.upper() == "BUILD":
             self._git_mgr = GitManager(Path.cwd(), max_snapshots=settings.checkpoint_max_snapshots)
 
@@ -111,6 +111,7 @@ class Orchestrator(StemAgent):
         self.history.clear()
         self.agents.clear()
         self._run = None
+        self._forced_skills = []
         if self.memory:
             try:
                 session_id = self.memory._session_db.create_session(
@@ -162,6 +163,32 @@ class Orchestrator(StemAgent):
         for agent in self.agents.values():
             agent.request_interrupt()
         super().request_interrupt()
+
+    def _child_status(self, role_name: str):
+        """Relay a child's status line through the CLI, tagged with its role."""
+        parent_cb = self.status_cb
+        if parent_cb is None:
+            return None
+
+        def cb(text: str) -> None:
+            if not text:
+                parent_cb("")
+            else:
+                parent_cb(f"[{role_name}] {text}")
+
+        return cb
+
+    def _child_renderer(self, role_name: str):
+        """Tag a child's trace rows with its role so chat shows who did what."""
+        base = getattr(getattr(self, "trace", None), "renderer", None)
+        if base is None or not hasattr(base, "event"):
+            return base
+
+        class _Tagged:
+            def event(self, role: str, kind: str, text: str, data: Dict[str, Any]) -> None:
+                base.event(role, kind, f"[{role_name}] {text}", data)
+
+        return _Tagged()
     
     async def _verify_artifacts(self) -> List[str]:
         failures = []
@@ -347,7 +374,20 @@ End with exactly one line: GRADE: [1-5]"""
                     limit = max(1, getattr(self.settings, "max_parallel_agents", 4))
                     wave_results = []
                     for start in range(0, len(wave_tasks), limit):
-                        wave_results.extend(await asyncio.gather(*wave_tasks[start:start + limit], return_exceptions=True))
+                        batch = wave_tasks[start:start + limit]
+                        self._set_status(True, f"orchestrator · waiting on {len(batch)} agent(s)")
+                        stop = asyncio.ensure_future(self.interrupt_event.wait())
+                        running = asyncio.ensure_future(asyncio.gather(*batch, return_exceptions=True))
+                        done, _ = await asyncio.wait({running, stop}, return_when=asyncio.FIRST_COMPLETED)
+                        stop.cancel()
+                        if running in done:
+                            wave_results.extend(running.result())
+                            continue
+                        running.cancel()
+                        await asyncio.gather(running, return_exceptions=True)
+                        for child in self.agents.values():
+                            child.request_interrupt()
+                        return "Stopped by user."
 
                     for agent_id, result in zip(agent_id_map.keys(), wave_results):
                         if agent_id in self.agents:
@@ -400,7 +440,17 @@ End with exactly one line: GRADE: [1-5]"""
             agent.invalidate_cache()
         if str(args.get("memory", "")).strip().lower() in ("off", "false", "0", "no"):
             agent.memory = None
-        result = await agent.run(full_task)
+        self._set_status(True, f"orchestrator · waiting on {agent.name}")
+        stop = asyncio.ensure_future(self.interrupt_event.wait())
+        running = asyncio.ensure_future(agent.run(full_task))
+        done, _ = await asyncio.wait({running, stop}, return_when=asyncio.FIRST_COMPLETED)
+        stop.cancel()
+        if running not in done:
+            running.cancel()
+            await asyncio.gather(running, return_exceptions=True)
+            agent.request_interrupt()
+            return "Stopped by user."
+        result = running.result()
         self._last_agent_id = agent_id
         return str(result)
 
@@ -467,8 +517,9 @@ End with exactly one line: GRADE: [1-5]"""
             orchestrator=self,
         )
         agent._ask_user = self._ask_user
-        agent.status_cb = self.status_cb
-        agent.trace.paint = False
+        agent.status_cb = self._child_status(role_name)
+        agent.trace.renderer = self._child_renderer(role_name)
+        agent.trace.paint = True
         agent._max_steps_override = max_steps or self._get_max_steps()
         agent._is_delegated = True
         agent._parent_run = getattr(self, "_run", None)

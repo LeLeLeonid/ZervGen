@@ -106,7 +106,32 @@ class OpenAIProvider(AIProvider):
             finish = choices[0].get("finish_reason", "unknown")
             raise ProviderError(f"{self.name} returned empty content (finish_reason={finish})", retryable=False)
         self._record_usage(data.get("usage"))
+        self._record_gateway_headers(getattr(response, "headers", None))
         return content
+
+    def _record_gateway_headers(self, headers) -> None:
+        if not headers:
+            return
+
+        def num(name: str) -> Optional[float]:
+            raw = headers.get(name)
+            if raw is None:
+                return None
+            try:
+                return float(str(raw).split(";")[0])
+            except (TypeError, ValueError):
+                return None
+        cost = num("x-omniroute-response-cost")
+        tokens_in = num("x-omniroute-tokens-in")
+        tokens_out = num("x-omniroute-tokens-out")
+        if cost is not None:
+            self._last_cost = cost
+        if tokens_in is not None or tokens_out is not None:
+            self._last_usage = dict(self._last_usage or {})
+            if tokens_in is not None:
+                self._last_usage["prompt_tokens"] = int(tokens_in)
+            if tokens_out is not None:
+                self._last_usage["completion_tokens"] = int(tokens_out)
 
     @staticmethod
     def _calls(message: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -175,6 +200,7 @@ class OpenAIProvider(AIProvider):
                              for item in partial if item["name"]]
         if not full.strip() and not self.native_calls:
             raise ProviderError(f"{self.name} streamed empty content", retryable=True)
+        self._record_gateway_headers(getattr(response, "headers", {}) or {})
         return full
 
     async def _dispatch(self, history: List[Dict], system_prompt: str, on_token: Optional[Callable[[str], None]]) -> str:
@@ -220,10 +246,27 @@ class OpenAIProvider(AIProvider):
         return result
 
     async def generate_image(self, prompt: str, width: Optional[int] = None, height: Optional[int] = None) -> str:
-        raise NotImplementedError(f"{self.name} does not support image generation")
+        endpoint = self.base_url[: -len("/chat/completions")] + "/images/generations"
+        size = f"{width or 1024}x{height or 1024}"
+        payload = {"model": self.model, "prompt": prompt, "size": size, "n": 1}
+        response = await get_http_client().post(endpoint, headers=self.headers, json=payload)
+        raise_for_status(response, self.name)
+        data = response.json()
+        items = data.get("data") or []
+        if items:
+            item = items[0]
+            if item.get("b64_json"):
+                return item["b64_json"]
+            if item.get("url"):
+                return str(item["url"])
+        raise ProviderError(f"{self.name} returned no image", retryable=False)
 
     async def generate_audio(self, text: str) -> bytes:
-        raise NotImplementedError(f"{self.name} does not support audio generation")
+        endpoint = self.base_url[: -len("/chat/completions")] + "/audio/speech"
+        payload = {"model": self.model, "input": text, "voice": "alloy"}
+        response = await get_http_client().post(endpoint, headers=self.headers, json=payload)
+        raise_for_status(response, self.name)
+        return response.content
 
     async def analyze_image(self, prompt: str, image: str) -> str:
         raise NotImplementedError(f"{self.name} does not support image analysis")

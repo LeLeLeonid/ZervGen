@@ -38,7 +38,7 @@ user input
   → StemAgent.run
       build system prompt (header, run, protocol, tools, skills, memory, peers, rules)
       provider.generate_text
-      parse turn: ```python``` PTC | ::tool shorthand | JSON/XML call | native call | answer
+      parse turn: ```python``` PTC | ::name(args) shorthand | JSON/XML call | native call | answer
       every call → ToolRuntime.execute (policy → ask → budget → timeout → one result)
       every turn end → sensors → critic gate
   → one answer, rendered once

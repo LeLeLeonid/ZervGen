@@ -228,12 +228,7 @@ class AIProvider:
         return float(default)
 
     def _guard_stream(self, on_token):
-        """Relay tokens while remembering whether any reached the screen.
-
-        A request whose text was already painted must never be retried: the
-        second attempt would print the answer twice. Callers mark the failure
-        ``stream_started`` and the retry policy then refuses to retry it.
-        """
+        """Relay tokens while tracking whether any already reached the screen."""
         state = {"emitted": False}
 
         def relay(text: str) -> None:

@@ -98,14 +98,14 @@ MCP_CATALOG: Dict[str, CatalogEntry] = {
         CatalogEntry(
             name="git",
             description="Inspect and operate a git repository: status, log, diff, commit.",
-            command="python",
-            args=("-m", "mcp_server_git"),
+            command="uvx",
+            args=("mcp-server-git",),
         ),
         CatalogEntry(
             name="fetch",
             description="Fetch a URL and convert it to readable markdown.",
-            command="python",
-            args=("-m", "mcp_server_fetch"),
+            command="uvx",
+            args=("mcp-server-fetch",),
         ),
         CatalogEntry(
             name="memory",
@@ -116,8 +116,8 @@ MCP_CATALOG: Dict[str, CatalogEntry] = {
         CatalogEntry(
             name="time",
             description="Current time and timezone conversion.",
-            command="python",
-            args=("-m", "mcp_server_time"),
+            command="uvx",
+            args=("mcp-server-time",),
         ),
         CatalogEntry(
             name="sequential-thinking",
@@ -304,7 +304,7 @@ def store_configs() -> Dict[str, MCPServerConfig]:
 
 def install_from_catalog(name: str, secrets: Optional[Dict[str, str]] = None,
                          enable: bool = True) -> str:
-    """Install one catalog entry into ``mcp.json``; secrets go to the env file."""
+    """Install one catalog entry into ``config.json``; secrets go to the env file."""
     entry = catalog_entry(name)
     if entry is None:
         near = ", ".join(e.name for e in search_catalog(name, limit=3))
@@ -317,11 +317,11 @@ def install_from_catalog(name: str, secrets: Optional[Dict[str, str]] = None,
         return (f"Error: '{entry.name}' needs {', '.join(missing)}. "
                 f"Call mcp_install(name='{entry.name}', env={{'{missing[0]}': '...'}}).")
     written = [key for key, value in secrets.items() if save_env_var(key, value)]
-    store = project_store()
-    store[entry.name] = _to_store_entry(entry.to_config(secrets).model_dump())
-    if not enable:
-        store[entry.name]["enabled"] = False
-    save_store(store)
+    config = load_config()
+    servers = dict(getattr(config, "mcp_servers", {}) or {})
+    servers[entry.name] = entry.to_config(secrets).model_copy(update={"enabled": enable})
+    config.mcp_servers = servers
+    config.save()
     note = f"; secrets stored in .env: {', '.join(written)}" if written else ""
     return f"MCP server '{entry.name}' installed ({entry.kind}){note}."
 
