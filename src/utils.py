@@ -355,6 +355,7 @@ class _ToolRow:
     ok: bool
     error: str = ""
     media: List[str] = field(default_factory=list)
+    diff: str = ""
 
 
 class _Activity:
@@ -362,6 +363,7 @@ class _Activity:
 
     def __init__(self):
         self.rows: List[_ToolRow] = []
+        self.pending_diff = ""
         self.started = time.monotonic()
 
     @property
@@ -394,6 +396,12 @@ class ActivityRenderer:
         from rich.markup import escape
         return escape(_flat(text))
 
+    @staticmethod
+    def _escape_preserve(text: Any) -> str:
+        """Escape markup but keep whitespace, for diffs and code."""
+        from rich.markup import escape
+        return escape(str(text or ""))
+
     def media_rows(self, paths: List[str]) -> None:
         """Preview each artifact once; media is content, not noise."""
         for path in paths:
@@ -416,7 +424,15 @@ class ActivityRenderer:
                 ok=kind == "tool_result",
                 error=str(text if kind == "tool_error" else ""),
                 media=list(data.get("media") or []) if kind == "tool_result" else [],
+                diff=self._activity.pending_diff,
             ))
+            self._activity.pending_diff = ""
+            return
+        if kind == "diff":
+            if self._activity.rows:
+                self._activity.rows[-1].diff = text
+            else:
+                self._activity.pending_diff = text
             return
         self.flush()
         self._row(kind, text)
@@ -425,7 +441,11 @@ class ActivityRenderer:
         """Print the buffered activity, collapsed unless it is short or verbose."""
         activity, self._activity = self._activity, _Activity()
         rows = activity.rows
+        if rows and activity.pending_diff:
+            rows[-1].diff = rows[-1].diff or activity.pending_diff
         if not rows:
+            if activity.pending_diff:
+                self._write_diff(activity.pending_diff)
             return
         self._groups.append(activity)
         del self._groups[:-self.KEEP]
@@ -436,6 +456,9 @@ class ActivityRenderer:
             names = ", ".join(dict.fromkeys(row.name for row in rows))
             self._write(f"{self.INDENT}[cyan]\u25b8 activity[/cyan] [dim]({len(rows)} tools \u00b7 "
                         f"{activity.elapsed:.1f}s)[/dim] [dim]{self._escape(names)}[/dim]")
+            for row in rows:
+                if row.diff:
+                    self._write_diff(row.diff)
         for row in rows:
             if row.media:
                 self.media_rows(row.media)
@@ -443,9 +466,11 @@ class ActivityRenderer:
     def _print_tool(self, row: _ToolRow) -> None:
         icon, style = ("\U0001f527", "cyan") if row.ok else ("\u26d4", "bold red")
         self._write(f"{self.INDENT}  [{style}]{icon}[/{style}] {self._escape(row.summary)}")
+        if row.ok and row.diff:
+            self._write_diff(row.diff)
         if not row.ok:
             problem = self._first_failure(row.error)
-            if problem:
+            if problem and problem not in row.summary:
                 self._write(f"{self.INDENT}    [dim]{self._escape(problem)}[/dim]")
 
     @staticmethod
@@ -477,8 +502,22 @@ class ActivityRenderer:
             self._write(f"{self.INDENT}[bold red]\u26d4[/bold red] {self._escape(head)}")
         elif kind in ("state", "loop"):
             self._write(f"{self.INDENT}[magenta]\U0001f9ed[/magenta] [dim]{self._escape(head)}[/dim]")
+        elif kind == "diff":
+            self._write_diff(text)
+        elif kind == "narration":
+            self._write(f"{self.INDENT}[dim]·[/dim] [italic]{self._escape(head)}[/italic]")
         elif kind not in ("input", "run_end", "model_output", "run_event", "agent_start"):
             self._write(f"{self.INDENT}[dim]\u00b7 {self._escape(head)}[/dim]")
+
+    def _write_diff(self, text: str) -> None:
+        """A file change: the header, then the colored hunk, indentation intact."""
+        lines = [line for line in (text or "").splitlines() if line.strip()]
+        if not lines:
+            return
+        self._write(f"{self.INDENT}    [green]✎[/green] [dim]{self._escape(lines[0])}[/dim]")
+        for line in lines[1:]:
+            color = "green" if line.startswith("+") else "red" if line.startswith("-") else "dim"
+            self._write(f"{self.INDENT}      [{color}]{self._escape_preserve(line)}[/{color}]")
 
     def expand(self, index: int = -1) -> str:
         """Reprint one retained activity with every row in full."""
@@ -535,6 +574,7 @@ class TraceBus:
 
     BUFFERED = {"tool_call"}
     SILENT = {"model_output", "ptc_result", "ptc_call", "ptc", "response", "run_event"}
+    FULL = {"answer", "model_output", "ptc", "ptc_result", "ptc_call", "run_event"}
 
     def __init__(self, role: str = "", enabled: Optional[bool] = None,
                  capture_chars: Optional[int] = None, root: Optional[Path] = None,
@@ -585,20 +625,24 @@ class TraceBus:
             logging.getLogger(__name__).debug("Trace record failed", exc_info=True)
 
     def emit(self, kind: str, role: str = "", text: str = "", *, paint: bool = True, **data: Any) -> None:
-        """Record an event and render it exactly once."""
-        if not self.enabled:
-            return
+        """Log and record every event; only the render honours trace_enabled."""
         role = role or self.role
         body = str(text or "")
         mark = _fingerprint(kind, role, body)
         if mark in self._seen:
             return
         self._seen.add(mark)
-        self._record(kind, role, body, dict(data))
+        if self.enabled:
+            self._record(kind, role, body, dict(data))
+        self._log(kind, body)
         if not paint or not self.paint or kind in self.SILENT or kind in self.BUFFERED:
             return
         self._paint(role, kind, body, dict(data))
-        logging.getLogger(__name__).info("%s%s: %s", self._where(), kind.upper(), _flat(body)[:400])
+
+    def _log(self, kind: str, body: str) -> None:
+        """Every event reaches agent.log, painted or not."""
+        limit = self.capture_chars if kind in self.FULL else 400
+        logging.getLogger(__name__).info("%s%s: %s", self._where(), kind.upper(), str(body)[:limit])
 
     def _paint(self, role: str, kind: str, body: str, data: Dict[str, Any]) -> None:
         """Render through the attached renderer, else straight to the terminal."""
@@ -617,29 +661,30 @@ class TraceBus:
         return f"[{self.run_id[:8]}:{self._step}] "
 
     def record(self, kind: str, role: str = "", text: str = "", **data: Any) -> None:
-        """Persist an event; ``run_event`` details also land in ``agent.log``."""
-        if not self.enabled:
-            return
-        self._record(kind, role or self.role, str(text or ""), dict(data))
+        """Persist an event; every one of them also lands in ``agent.log``."""
+        body = str(text or "")
         event = data.get("run_event") or {}
-        if kind == "run_event" and isinstance(event, dict) and event.get("type") == "model_output":
-            body = str(event.get("output") or "")
-            if body:
-                logging.getLogger(__name__).info("%sMODEL_OUTPUT:\n%s", self._where(), body)
+        event_type = str(event.get("type") or "") if isinstance(event, dict) else ""
+        if event_type == "model_output":
+            output = str(event.get("output") or "")
+            if output:
+                logging.getLogger(__name__).info("%sMODEL_OUTPUT:\n%s", self._where(), output)
+        elif kind != "run_event":
+            self._log(kind, body)
+        if self.enabled:
+            self._record(kind, role or self.role, body, dict(data))
 
     def tool_call(self, call_id: str, name: str, args: Dict[str, Any]) -> None:
-        """Buffer a call; it renders with its result."""
-        if not self.enabled:
-            return
+        """Buffer a call; it renders with its result, and logs on arrival."""
         self._pending[call_id] = _PendingCall(name, dict(args or {}))
-        self._record("tool_call", self.role, name,
-                     {"call_id": call_id, "name": name, "args": dict(args or {})})
+        self._log("tool_call", f"{name} {summarise_args(args)}".strip())
+        if self.enabled:
+            self._record("tool_call", self.role, name,
+                         {"call_id": call_id, "name": name, "args": dict(args or {})})
 
     def tool_result(self, call_id: str, name: str = "", *, ok: bool = True,
                     output: Any = None, error: Any = None, duration: float = 0.0) -> None:
         """Render the buffered call and its outcome as one row."""
-        if not self.enabled:
-            return
         pending = self._pending.pop(call_id, None)
         name = name or (pending.name if pending else "tool")
         args = pending.args if pending else {}
@@ -656,27 +701,28 @@ class TraceBus:
             line = f"{name} {summary} · {reason}".strip() if summary else f"{name} · {reason}"
         data = {"call_id": call_id, "name": name, "ok": ok, "duration": round(elapsed, 4),
                 "chars": len(str(output or "")),
-                "media": Media.paths(output) if ok else []}
-        self._record(kind, self.role, line, data)
+                "media": Media.paths(output) if ok else [],
+                "output": str(output) if output else ""}
+        self._log(kind, line)
+        if self.enabled:
+            self._record(kind, self.role, line, data)
         if self.paint:
             self._paint(self.role, kind, line, data)
-        logging.getLogger(__name__).info("%s%s: %s", self._where(), kind.upper(), line[:400])
 
     def answer(self, text: str, streamed: bool = False) -> None:
         """Record the final answer; paint a receipt only when the text is already shown."""
-        if not self.enabled:
-            return
         body = str(text or "")
         size = len(body)
         mark = _fingerprint("answer", self.role, f"{size}")
         if mark in self._seen:
             return
         self._seen.add(mark)
-        self._record("answer", self.role, body, {"chars": size, "streamed": streamed})
+        logging.getLogger(__name__).info("%sANSWER: %d chars\n%s", self._where(), size, body)
+        if self.enabled:
+            self._record("answer", self.role, body, {"chars": size, "streamed": streamed})
         if self.paint:
             self._paint(self.role, "answer", f"answered ({size:,} chars)",
                         {"chars": size, "streamed": streamed})
-        logging.getLogger(__name__).info("%sANSWER: %d chars\n%s", self._where(), size, body)
 
     def close(self) -> None:
         """Flush calls whose result never arrived (interrupt, crash)."""
@@ -912,6 +958,64 @@ def _parse_call_args(blob: str, spec: Any = None) -> Optional[Dict[str, Any]]:
         return {"args": [_scalar(v) for v in values]}
     return {"value": _scalar(blob)}
 
+def _split_comment(blob: str) -> tuple[str, str]:
+    """Split ``args  # note`` at the first unquoted, top-level ``#``."""
+    quote, depth = "", 0
+    for index, char in enumerate(blob):
+        if quote:
+            if char == quote and blob[index - 1] != "\\":
+                quote = ""
+            continue
+        if char in ("'", '"'):
+            quote = char
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth = max(0, depth - 1)
+        elif char == "#" and depth == 0 and (index == 0 or blob[index - 1].isspace()):
+            return blob[:index].rstrip(), blob[index + 1:].strip()
+    return blob, ""
+
+
+def _shorthand_blocks(lines: List[str]) -> List[List[int]]:
+    """Runs of consecutive non-blank lines outside a fence."""
+    blocks: List[List[int]] = []
+    current: List[int] = []
+    in_fence = False
+    for index, line in enumerate(lines + [""]):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            stripped = ""
+        if in_fence or not stripped:
+            if current:
+                blocks.append(current)
+                current = []
+            continue
+        current.append(index)
+    if current:
+        blocks.append(current)
+    return blocks
+
+
+def shorthand_notes(text: str) -> List[str]:
+    """``#`` narration inside a shorthand block: trailing on a call, or on its own line."""
+    lines = (text or "").splitlines()
+    standalone = _narration_lines(lines)
+    notes: List[str] = []
+    for index, line in enumerate(lines):
+        match = SHORTHAND_RE.match(line)
+        if match:
+            _blob, note = _split_comment(match.group(2))
+            if note:
+                notes.append(note)
+        elif index in standalone:
+            note = line.strip()[1:].strip()
+            if note:
+                notes.append(note)
+    return notes
+
+
 def parse_shorthand(text: str, names: Optional[set[str]] = None,
                     specs: Optional[Dict[str, Any]] = None) -> List[ToolCallSpec]:
     """``::name{json}``, ``::name(a, b)`` and ``::name a=1 b=2`` calls."""
@@ -927,6 +1031,7 @@ def parse_shorthand(text: str, names: Optional[set[str]] = None,
         if not match:
             continue
         name, blob = canonical_tool(match.group(1)), match.group(2)
+        blob, _note = _split_comment(blob)
         if names is not None and name not in names:
             continue
         args = _parse_call_args(blob, (specs or {}).get(name))
@@ -1095,12 +1200,59 @@ def _fence_calls_tools(code: str, names: Optional[set[str]]) -> bool:
     return False
 
 
+_PRAGMA_RE = re.compile(r"^(noqa|type:|pragma:|pylint:|fmt:|ruff:|isort:|mypy:|-\\*-|coding[:=])", re.I)
+
+
+def comment_lines(text: str) -> List[str]:
+    """Real `#` comments in a block; a `#` inside a string is not narration."""
+    import io
+    import tokenize
+    found: List[str] = []
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(text or "").readline):
+            if token.type != tokenize.COMMENT:
+                continue
+            note = token.string.lstrip("#").strip()
+            if note and not _PRAGMA_RE.match(note):
+                found.append(note)
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        if found:
+            return found
+        return [note for note in
+                (line.strip()[1:].strip() for line in (text or "").splitlines()
+                 if line.strip().startswith("#"))
+                if note and not _PRAGMA_RE.match(note)]
+    return found
+
+
+def _narration_lines(lines: List[str]) -> set[int]:
+    """`#` lines that touch a shorthand call: the progress notes, not the headings."""
+    found: set[int] = set()
+    for block in _shorthand_blocks(lines):
+        calls = [i for i in block if SHORTHAND_RE.match(lines[i])]
+        if not calls:
+            continue
+        for position, index in enumerate(block):
+            if not lines[index].strip().startswith("#"):
+                continue
+            before = block[position - 1] if position else -1
+            after = block[position + 1] if position + 1 < len(block) else -1
+            if before in calls or after in calls:
+                found.add(index)
+    return found
+
+
 def strip_ptc(text: str, names: Optional[set[str]] = None) -> str:
-    """Prose with tool-call surfaces and tool-running fences removed."""
+    """Prose with tool-call surfaces and tool-running fences removed.
+
+    `# Title` headings survive; a progress note beside a call does not.
+    """
     lines: List[str] = []
     block: Optional[List[str]] = None
     fence = ""
-    for line in (text or "").splitlines():
+    source = (text or "").splitlines()
+    narration = _narration_lines(source)
+    for index, line in enumerate(source):
         stripped = line.strip()
         if stripped.startswith("```"):
             if block is None:
@@ -1116,7 +1268,7 @@ def strip_ptc(text: str, names: Optional[set[str]] = None) -> str:
         if block is not None:
             block.append(line)
             continue
-        if SHORTHAND_RE.match(line):
+        if SHORTHAND_RE.match(line) or index in narration:
             continue
         lines.append(line)
     if block is not None:
@@ -1426,7 +1578,7 @@ def discover_context_files(cwd: str = ".", subdir: str = "") -> str:
             raw = _read_rule_file(candidate)
             if raw:
                 return f"--- {name} ---\n{raw}\n"
-    logging.getLogger(__name__).info("discover_context_files: no project context files found")
+    logging.getLogger(__name__).debug("discover_context_files: no project context files found")
     return ""
 
 
@@ -1678,6 +1830,9 @@ class ModelCatalog:
 
 def safe_run(cmd: list, cwd=None, timeout=30, **kwargs):
     merged = dict(capture_output=True, text=True, timeout=timeout)
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "echo", "SSH_ASKPASS": "echo"}
+    env.update(kwargs.get("env") or {})
+    kwargs["env"] = env
     if sys.platform == "win32":
         CREATE_NO_WINDOW = 0x08000000
         si = _subprocess.STARTUPINFO()

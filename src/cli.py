@@ -37,9 +37,10 @@ warnings.filterwarnings("ignore", category=ResourceWarning)
 from src.config import load_config, MODES, MODE_ORDER, ENV_PATH, config_entries, set_config_value
 from src.core.memory import memory_core
 from src.core.orchestrator import Orchestrator
+from src.core.runtime import Compactor
 from src.core.provider import get_provider, get_model_name, list_live_models, list_providers
 from src.skills_loader import get_all_roles
-from src.utils import get_global_tokens, reset_global_tokens, count_tokens, add_global_tokens, ModelCatalog, ActivityRenderer, rich_on, set_rich, print_block
+from src.utils import get_global_tokens, reset_global_tokens, count_tokens, add_global_tokens, ModelCatalog, ActivityRenderer, rich_on, set_rich, print_block, safe_run, strip_ptc
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -63,10 +64,17 @@ def _conversation(messages: list) -> list:
             continue
         role = msg.get("role", "user")
         content = str(msg.get("content") or "")
+        if role == "system" and content.startswith("<context-summary>"):
+            rows.append({"role": "system", "content": content})
+            continue
         if not content.strip() or role not in ("user", "assistant"):
             continue
-        if role == "assistant" and _EVENT_NOISE.match(content):
-            continue
+        if role == "assistant":
+            if _EVENT_NOISE.match(content):
+                continue
+            content = strip_ptc(content)
+            if not content:
+                continue
         rows.append({"role": role, "content": content})
     return rows
 
@@ -191,6 +199,7 @@ class ZervGenCLI:
         self._app: Optional[Application] = None
         self._agent_running = False
         self._should_exit = False
+        self._quit_requested = False
         self._pending_input: asyncio.Queue = None
         self._agent_task: Optional[asyncio.Task] = None
         self._perm_future: Optional[asyncio.Future] = None
@@ -208,8 +217,8 @@ class ZervGenCLI:
             "memory": lambda a: CC.print(Panel(str(memory_core.get_stats()), title="Memory Stats", border_style="green")),
             "usage": lambda a: self._toggle_usage(),
             "compact": lambda a: self._compact_memory(),
-            "load": lambda a: self._load_session(),
-            "sessions": lambda a: self._sessions_menu(),
+            "load": lambda a: self._load_session(a),
+            "sessions": lambda a: self._sessions_menu(a),
             "status": lambda a: CC.print(Panel(str(self.orchestrator.get_mode_status()), title="Status", border_style="cyan")),
             "stop": lambda a: self._halt_run(),
             "dream": lambda a: self._toggle_dream(),
@@ -231,6 +240,7 @@ class ZervGenCLI:
             "search": lambda a: self._handle_search(a),
             "rollback": lambda a: self._handle_rollback(a),
             "resume": lambda a: self._handle_resume(a),
+            "diff": lambda a: self._handle_diff(a),
             "reload": lambda a: self._cmd_reload(),
             "trace": lambda a: self._cmd_trace(a),
             "logs": lambda a: self._cmd_logs(a),
@@ -358,7 +368,7 @@ class ZervGenCLI:
         for name in chain:
             try:
                 provider = get_provider(name, self.config)
-                self.orchestrator = Orchestrator(provider, self.config, mode=self.config.mode, memory=memory_core)
+                self.orchestrator = Orchestrator(provider, self.config, mode=self.config.mode, memory=memory_core, renderer=self._transcript)
                 self.orchestrator.status_cb = self._on_status
                 self.orchestrator.trace.renderer = self.transcript
                 if name != chosen:
@@ -396,7 +406,7 @@ class ZervGenCLI:
             return
         if str(self.config.mode).upper() in ("ASK", "CALL"):
             return
-        await self.orchestrator._init_mcp()
+        await self.orchestrator._init_mcp(connect=False)
         manager = self.orchestrator._mcp
         if manager is None or not getattr(manager, "servers", None):
             return
@@ -474,12 +484,14 @@ class ZervGenCLI:
                     t.cancel()
             else:
                 self._should_exit = True
+                self._quit_requested = True
                 event.app.exit()
 
         @kb.add("c-d")
         def _(event):
             if not event.app.current_buffer.text:
                 self._should_exit = True
+                self._quit_requested = True
                 event.app.exit()
 
         @kb.add("c-z")
@@ -491,6 +503,7 @@ class ZervGenCLI:
                 if t and not t.done():
                     t.cancel()
             self._should_exit = True
+            self._quit_requested = True
             event.app.exit()
 
         def get_prompt():
@@ -592,11 +605,16 @@ class ZervGenCLI:
         console.print(Align.center(layout, vertical="middle"))
 
     async def handle_system_command(self, cmd: str) -> bool:
+        parts = cmd.split()
+        raw_cmd = parts[0].lower().lstrip("/")
+        if raw_cmd in ("q", "quit", "exit"):
+            self._should_exit = True
+            self._quit_requested = True
+            await self._cleanup()
+            raise SystemExit(0)
         if not self.orchestrator:
             CC.print("[red]System not initialized.[/red]")
             return True
-        parts = cmd.split()
-        raw_cmd = parts[0].lower().lstrip("/")
         args = " ".join(parts[1:]) if len(parts) > 1 else None
         handler = self._cmd_table.get(raw_cmd)
         if handler:
@@ -650,7 +668,7 @@ class ZervGenCLI:
         if verb == "doctor":
             return await self._mcp_doctor()
         if verb in ("search", "find"):
-            return self._mcp_search(" ".join(words[1:]))
+            return await self._mcp_search(" ".join(words[1:]))
         if verb in ("install", "add") and len(words) > 1:
             return await self._mcp_install(words[1], " ".join(words[2:]))
         if verb in ("remove", "rm", "uninstall") and len(words) > 1:
@@ -669,9 +687,13 @@ class ZervGenCLI:
             await self._warm_mcp()
         return True
 
-    def _mcp_search(self, query: str) -> bool:
-        from src.core.mcp_manager import search_catalog
-        rows = search_catalog(query)
+    async def _mcp_search(self, query: str) -> bool:
+        """Built-in catalog plus the official registry, in one table."""
+        from src.core.mcp_manager import search_catalog, search_registry
+        builtin = search_catalog(query)
+        remote = await search_registry(query, limit=20)
+        seen = {row["name"] for row in builtin}
+        rows = builtin + [row for row in remote if row["name"] not in seen]
         if not rows:
             CC.print(f"[yellow]No MCP server matches '{self._escape(query)}'.[/yellow]")
             return True
@@ -681,20 +703,23 @@ class ZervGenCLI:
         table.add_column("Installed", style="green")
         table.add_column("Description", style="dim")
         for row in rows:
-            table.add_row(Text(row["name"]), Text(row["transport"]),
-                          Text("yes" if row["installed"] else "-"), Text(row["description"]))
+            table.add_row(Text(row.get("key") or row["name"]), Text(row["transport"]),
+                          Text("yes" if row["installed"] else "-"),
+                          Text(row["description"][:90]))
         CC.print(table)
         CC.print("[dim]/mcp install <name>  ·  /mcp doctor  ·  /mcp list[/dim]")
         return True
 
     async def _mcp_install(self, name: str, env_args: str) -> bool:
-        from src.core.mcp_manager import install_from_catalog
+        from src.core.mcp_manager import install_from_catalog, install_from_registry
         secrets: Dict[str, str] = {}
         for pair in env_args.split():
             key, sep, value = pair.partition("=")
             if sep:
                 secrets[key.strip()] = value.strip()
         result = install_from_catalog(name, secrets)
+        if result.startswith("Error"):
+            result = install_from_registry(name, secrets)
         CC.print(f"[{'green' if not result.startswith('Error') else 'red'}]{self._escape(result)}[/]")
         if not result.startswith("Error") and self.orchestrator:
             manager = getattr(self.orchestrator, "_mcp", None)
@@ -1000,14 +1025,21 @@ class ZervGenCLI:
         CC.print(f"[{color}]{self._escape(status)}[/{color}]")
 
     def _handle_provider(self, args: Optional[str]) -> Any:
-        name = (args or "").strip().lower()
+        raw = (args or "").strip()
+        verb, _, rest = raw.partition(" ")
+        if verb.lower() in ("add", "new", "custom"):
+            return self._add_provider(rest.strip())
+        if verb.lower() in ("remove", "rm", "delete"):
+            return self._remove_provider(rest.strip())
+        name = raw.lower()
         if not name:
             return self._select_provider()
         from src.config import resolve_provider
         target = resolve_provider(name)
-        known = {meta.name for meta in list_providers()} | {target}
+        known = {meta.name for meta in list_providers(self.config)}
         if target not in known:
-            CC.print(f"[red]Unknown provider: {self._escape(name)}[/red]\n[dim]Use /provider with no argument to list.[/dim]")
+            CC.print(f"[red]Unknown provider: {self._escape(name)}[/red]\n"
+                     f"[dim]Use /provider to list, /provider add to register an [OI]-compatible one.[/dim]")
             return True
         if target == "omniroute":
             self._launch_omniroute()
@@ -1023,6 +1055,115 @@ class ZervGenCLI:
             self._input_api_key()
         model = get_model_name(self.config.provider, self.config)
         CC.print(f"[bold]Provider:[/bold] {self.config.provider.upper()}  [dim]Model: {model}[/dim]")
+        return True
+
+    @staticmethod
+    def _ask(prompt: str, default: str = "", password: bool = False) -> str:
+        """Prompt once; a non-interactive shell falls back to the default."""
+        if not sys.stdin.isatty():
+            return default
+        try:
+            return Prompt.ask(prompt, password=password, default=default).strip()
+        except (EOFError, KeyboardInterrupt):
+            return default
+
+    def _add_provider(self, spec: str) -> bool:
+        """Register an [OI]-compatible endpoint from config.json, no code edit."""
+        from src.config import save_env_var
+        import shlex
+        try:
+            parts = shlex.split(spec or "")
+        except ValueError as exc:
+            CC.print(f"[red]{self._escape(str(exc))}[/red]")
+            return True
+        fields: Dict[str, str] = {}
+        positional: List[str] = []
+        for token in parts:
+            key, sep, value = token.partition("=")
+            if sep and key and not value.startswith("="):
+                fields[key.strip().lower()] = value.strip()
+            else:
+                positional.append(token)
+        name = (fields.pop("name", "") or (positional.pop(0) if positional else "")).strip().lower()
+        name = name or self._ask("Provider name (e.g. mygateway)").lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", name or ""):
+            CC.print("[red]Name must be lowercase letters, digits, '.', '_' or '-'.[/red]")
+            return True
+        if name in {meta.name for meta in list_providers(self.config)}:
+            CC.print(f"[red]{self._escape(name)} already exists.[/red] [dim]Use /provider {name} to switch.[/dim]")
+            return True
+        base_url = (fields.pop("base_url", "") or fields.pop("url", "") or
+                    (positional.pop(0) if positional else "")).strip()
+        base_url = base_url or self._ask("Base URL (e.g. https://api.example.com/v1)")
+        if not base_url.startswith(("http://", "https://")):
+            CC.print("[red]Base URL must start with http:// or https://[/red]")
+            return True
+        model = (fields.pop("model", "") or fields.pop("default_model", "") or
+                 (positional.pop(0) if positional else "")).strip()
+        model = model or self._ask("Default model")
+        key_env = (fields.pop("api_key_env", "") or fields.pop("key_env", "") or
+                   (positional.pop(0) if positional else "")).strip()
+        key_env = key_env or f"{name.upper().replace('-', '_')}_API_KEY"
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key_env):
+            CC.print("[red]API key env var must be UPPER_SNAKE_CASE.[/red]")
+            return True
+        preset: Dict[str, Any] = {"base_url": base_url, "api_key_env": key_env, "default_model": model}
+        dialect = fields.pop("dialect", "").lower()
+        if dialect:
+            if dialect not in ("openai", "anthropic", "google"):
+                CC.print("[red]dialect must be openai, anthropic or google.[/red]")
+                return True
+            preset["dialect"] = dialect
+        headers: Dict[str, str] = {}
+        for item in positional:
+            header, sep, value = item.partition(":")
+            if sep and header.strip():
+                headers[header.strip()] = value.strip()
+        if headers:
+            preset["headers"] = headers
+        secret = (fields.pop("api_key", "") or fields.pop("key", "")).strip()
+        if not secret and not os.environ.get(key_env):
+            secret = self._ask(f"{key_env} value (blank to set later)", password=True)
+        if secret:
+            if save_env_var(key_env, secret):
+                os.environ[key_env] = secret
+                CC.print(f"[green]Key saved to {ENV_PATH}[/green]")
+            else:
+                CC.print("[yellow]Could not write the key to .zervgen/.env — export it yourself.[/yellow]")
+        presets = dict(getattr(self.config, "compatible_presets", None) or {})
+        presets[name] = preset
+        self.config.compatible_presets = presets
+        if model:
+            self.config.provider_models[name] = model
+        self.config.provider = name
+        if self.orchestrator and not self.orchestrator.switch_provider(name):
+            self.config.save()
+            CC.print("[yellow]Saved to config.json, but the switch failed — check base_url and key.[/yellow]")
+            return True
+        self.config.save()
+        CC.print(f"[bold green]✓ {name.upper()}[/bold green] [dim]{self._escape(base_url)} · "
+                 f"{self._escape(model or '(no model)')} · {key_env}[/dim]")
+        if not os.environ.get(key_env):
+            CC.print(f"[dim]{key_env} is unset — /key sets it while this provider is active.[/dim]")
+        return True
+
+    def _remove_provider(self, name: str) -> bool:
+        """Drop a provider registered in config.json."""
+        name = (name or "").strip().lower()
+        presets = dict(getattr(self.config, "compatible_presets", None) or {})
+        if not name or name not in presets:
+            CC.print(f"[red]{self._escape(name or '(none)')} is not a registered provider.[/red]\n"
+                     f"[dim]Only providers added with /provider add can be removed.[/dim]")
+            return True
+        presets.pop(name, None)
+        self.config.compatible_presets = presets
+        self.config.provider_models.pop(name, None)
+        if self.config.provider == name:
+            self.config.provider = "pollinations"
+            if self.orchestrator:
+                self.orchestrator.switch_provider("pollinations")
+        self.config.save()
+        CC.print(f"[green]Removed {self._escape(name)}[/green]")
         return True
 
     def _handle_get(self, args: Optional[str]) -> bool:
@@ -1215,6 +1356,48 @@ class ZervGenCLI:
         CC.print(f"[green]Rewound {min(n, len(user_idx) - 1)} turn(s). {len(user_idx) - 1 - min(n, len(user_idx) - 1)} remain.[/green]")
         return True
 
+    def _handle_diff(self, args: Optional[str]) -> bool:
+        """Toggle the in-chat diff; `last` shows the newest checkpoint instead."""
+        word = (args or "").strip().lower()
+        if word in ("last", "show", "git"):
+            return self._show_checkpoint_diff()
+        if word in ("on", "enable", "1", "true"):
+            enabled = True
+        elif word in ("off", "disable", "0", "false"):
+            enabled = False
+        else:
+            enabled = not bool(getattr(self.config, "diff_enabled", True))
+        self.config.diff_enabled = enabled
+        self.config.save()
+        CC.print(f"[bold {'green' if enabled else 'yellow'}]Diff in chat: {'ON' if enabled else 'OFF'}[/bold {'green' if enabled else 'yellow'}]")
+        return True
+
+    def _show_checkpoint_diff(self) -> bool:
+        """Print the last checkpoint's diff from the shadow repo."""
+        manager = getattr(self.orchestrator, "_git_mgr", None) if self.orchestrator else None
+        if not manager:
+            CC.print("[yellow]No checkpoints (enable checkpoints and use BUILD mode)[/yellow]")
+            return True
+        try:
+            revision = manager.latest_revision()
+            if not revision:
+                CC.print("[yellow]No commits yet[/yellow]")
+                return True
+            env = {**os.environ, "GIT_DIR": str(manager.repo_dir / ".git"), "GIT_WORK_TREE": str(manager.cwd)}
+            parents = safe_run(["git", "rev-list", "--parents", "-n", "1", revision],
+                               cwd=manager.repo_dir, env=env, text=True)
+            has_parent = len((parents.stdout or "").split()) > 1
+            span = ["HEAD~1", "HEAD"] if has_parent else ["--root", "HEAD"]
+            r = safe_run(["git", "diff", *span, "--", "."], cwd=manager.repo_dir, env=env, text=True)
+            if r.returncode == 0 and r.stdout.strip():
+                from rich.syntax import Syntax
+                CC.print(Syntax(r.stdout, "diff", theme="monokai", line_numbers=False))
+            else:
+                CC.print("[dim]No changes[/dim]")
+        except Exception as e:
+            CC.print(f"[red]Error: {self._escape(e)}[/red]")
+        return True
+
     async def _handle_export(self, args: Optional[str]) -> bool:
         """Dump the current conversation to tmp/reports/export_<ts>.md."""
         if not self.orchestrator:
@@ -1337,11 +1520,23 @@ class ZervGenCLI:
             if 0 <= idx < len(role_list):
                 name, cfg = role_list[idx]
                 self.orchestrator.set_role(name)
-                self.orchestrator._log(name.capitalize(), f"AGENT: {name}", "state")
+                self._pin_session_role(name)
                 CC.print(f"[green]Agent switched to: {self._escape(name)}[/green]")
         except (ValueError, IndexError):
             pass
         return True
+
+    def _pin_session_role(self, role: str) -> None:
+        """Pin the agent to the active session so /load brings it back."""
+        if not self.orchestrator._active_session_id and not self.orchestrator.history:
+            self.orchestrator.new_session()
+        session_id = getattr(self.orchestrator, "_active_session_id", None)
+        if not session_id:
+            return
+        try:
+            memory_core._session_db.save_message(session_id, "system", role, tool_name="agent_role")
+        except Exception:
+            logger.debug("Session role save failed", exc_info=True)
 
     def _show_help(self) -> bool:
         roles = "\n".join(f"- [{C}]{k}[/{C}]: {v.description}" for k, v in get_all_roles().items())
@@ -1357,9 +1552,11 @@ class ZervGenCLI:
 /rollback - Rollback last agent step (BUILD mode)
 /resume  - Restore the latest checkpoint and continue its goal
 /memory  - Show memory statistics
-/load    - Load your sessions
+/load    - Load a session, or delete them: /load <n> | /load d <n> | /load all
+/sessions - List sessions; /sessions clear deletes all, /sessions delete <n> removes one
+/diff    - Toggle in-chat diffs: /diff | /diff on|off | /diff last (checkpoint diff)
 /usage   - Toggle the Token Counter
-/compact - Compact short-term memory into long-term storage
+/compact - Fold the middle of the conversation into one checkpoint
 /reload  - Reload your skills
 /mcp     - Model Context Protocol (/mcp doctor to probe)
 /get     - List every setting, or show one: /get max_steps
@@ -1383,6 +1580,9 @@ class ZervGenCLI:
 [bold][{C}]PROVIDER:[/{C}][/bold]
 /provider          - Pick a provider from a filtered list
 /provider <name>   - Switch provider for this session
+/provider add <name> [base_url] [model] [KEY_ENV]
+                   - Register any [OI]-compatible endpoint in config.json
+/provider rm <name> - Drop a provider you added
 /model             - Pick a model from the live catalog
 /model <name>      - Set the model for the current provider
 /tier              - Pick an active model tier (NOOB/COOL/APEX)
@@ -1431,7 +1631,8 @@ class ZervGenCLI:
             CC.print("[dim]Could not read TODOs.[/dim]")
         return True
 
-    async def _load_session(self) -> bool:
+    async def _load_session(self, args: Optional[str] = None, index: int = 0) -> bool:
+        """Load a session by number, or list them and ask."""
         if not self.orchestrator:
             CC.print("[red]System not initialized.[/red]")
             return True
@@ -1446,31 +1647,45 @@ class ZervGenCLI:
             CC.print("[dim]No sessions found.[/dim]")
             return True
 
-        CC.print(f"\n{_acm('AVAILABLE SESSIONS')}:")
-        for i, s in enumerate(sessions[:10], 1):
-            title = s.get('title') or 'Untitled'
-            msgcnt = s.get('message_count', 0)
-            start_ts = s.get('started_at')
-            if start_ts:
-                try:
-                    started = datetime.fromtimestamp(start_ts).strftime('%m-%d %H:%M')
-                except Exception:
-                    started = str(start_ts)
-            else:
-                started = ''
-            CC.print(f"[{i}] {self._escape(title)} ({msgcnt} msgs) [{self._escape(started)}]")
+        words = (args or "").strip().split()
+        if words and words[0].lower() in ("all", "--all", "nuke"):
+            return self._delete_sessions(all_sessions=True)
+        if words and words[0].lower() in ("d", "delete", "rm"):
+            return self._delete_sessions(targets=" ".join(words[1:]), sessions=sessions)
 
-        try:
-            choice = IntPrompt.ask("Load Session #", choices=[str(i) for i in range(1, min(10, len(sessions)) + 1)])
-            idx = int(choice) - 1
-            selected = sessions[idx]
-            session_id = selected['id']
-        except (ValueError, IndexError, KeyError):
+        number = index or (int(words[0]) if words and words[0].isdigit() else 0)
+        if not number:
+            CC.print(f"\n{_acm('AVAILABLE SESSIONS')}:")
+            for i, s in enumerate(sessions[:10], 1):
+                title = s.get('title') or 'Untitled'
+                msgcnt = s.get('message_count', 0)
+                start_ts = s.get('started_at')
+                started = ''
+                if start_ts:
+                    try:
+                        started = datetime.fromtimestamp(start_ts).strftime('%m-%d %H:%M')
+                    except Exception:
+                        started = str(start_ts)
+                CC.print(f"[{i}] {self._escape(title)} ({msgcnt} msgs) [{self._escape(started)}]")
+            CC.print("[dim]<n> load · d <n> delete · all delete every session[/dim]")
+            raw = self._ask("Load Session #")
+            if raw.lower() in ("all", "--all", "nuke"):
+                return self._delete_sessions(all_sessions=True)
+            verb, _, rest = raw.partition(" ")
+            if verb.lower() in ("d", "delete", "rm"):
+                return self._delete_sessions(targets=rest.strip(), sessions=sessions)
+            if not raw.isdigit():
+                CC.print("[dim]Cancelled.[/dim]")
+                return True
+            number = int(raw)
+
+        if not 0 < number <= min(10, len(sessions)):
             CC.print("[red]Invalid selection[/red]")
             return True
+        selected = sessions[number - 1]
 
         try:
-            session = memory_core._session_db.load_session(session_id)
+            session = memory_core._session_db.load_session(selected['id'])
             if not session:
                 CC.print("[red]Session not found.[/red]")
                 return True
@@ -1481,30 +1696,20 @@ class ZervGenCLI:
             history = _conversation(session.get("messages", []))
 
             self.orchestrator.history = history
-            memory_core.set_active_session(session_id)
-            self.orchestrator._active_session_id = session_id
+            memory_core.set_active_session(selected['id'])
+            self.orchestrator._active_session_id = selected['id']
 
-            for msg in reversed(history):
-                content = msg.get("content", "")
-                if isinstance(content, str) and content.startswith("AGENT:"):
-                    agent_id = content.split(":", 1)[1].strip()
-                    if agent_id and agent_id != "None":
-                        self.orchestrator._last_agent_id = agent_id
-                        base_name = agent_id.split("_")[0].lower() if "_" in agent_id else agent_id
-                        if base_name:
-                            self.orchestrator.skill_name = base_name
-                            try:
-                                self.orchestrator.set_role(base_name)
-                            except Exception:
-                                pass
-                        break
+            for msg in reversed(session.get("messages", [])):
+                if msg.get("tool_name") == "agent_role" and msg.get("content"):
+                    self.orchestrator.set_role(str(msg["content"]).strip())
+                    break
 
             reset_global_tokens()
             memory_core.clear_triggered_skills()
             in_tok, _ = count_tokens(history, "")
             add_global_tokens(in_tok)
 
-            CC.print(f"[green]Loaded session: {self._escape(selected.get('title') or session_id)}[/green]")
+            CC.print(f"[green]Loaded session: {self._escape(selected.get('title') or selected['id'])}[/green]")
 
         except Exception as e:
             CC.print(f"[red]Failed to load session: {self._escape(e)}[/red]")
@@ -1512,60 +1717,53 @@ class ZervGenCLI:
         return True
 
     async def _compact_memory(self) -> bool:
+        """Fold the middle of the conversation into a checkpoint, keeping the tail verbatim."""
         if not self.orchestrator:
             CC.print("[red]System not initialized.[/red]")
             return True
-        history = self.orchestrator.history
-        if len(history) <= 10:
-            CC.print("[yellow]Not enough history to compact.[/yellow]")
+        history = list(self.orchestrator.history)
+        keep = max(2, int(getattr(self.config, "history_trim_size", 20) or 20))
+        if len(history) <= keep + 2:
+            CC.print(f"[yellow]Nothing to compact: {len(history)} messages, keeping the last {keep}.[/yellow]")
             return True
 
-        summary = self.orchestrator.get_history_summary(max_messages=8)
-        CC.print(Panel(summary, title="History Summary", border_style="cyan"))
-
-        system_msgs = [m for m in history if m.get("role") == "system"]
-        recent = history[-6:]
-        to_summarize = history[len(system_msgs):-6]
-
-        CC.print(f"[cyan]Compacting {len(to_summarize)} messages...[/cyan]")
-
-        transcript = "\n".join(
-            f"{m.get('role', '?')}: {str(m.get('content', ''))[:500]}"
-            for m in to_summarize
-        )
-
-        prompt = (
-            "Create a compact session checkpoint. Output this structure:\n"
-            "## Active Task\n[user's current request verbatim]\n"
-            "## Progress\n[numbered list: what was done, include file paths]\n"
-            "## In Progress\n[currently working on]\n"
-            "## Blocked\n[blockers, include exact error text]\n"
-            "## Next Steps\n[what remains]\n"
-            "## Key Context\n[file paths, config values, specific data]\n\n"
-            "Preserve exact file paths, error messages, and values.\n\n"
-            + transcript
-        )
-
+        before = Compactor.used(history)
+        CC.print(f"[cyan]Compacting {len(history) - keep} of {len(history)} messages ({_fmt_tokens(before)} tok)...[/cyan]")
+        compactor = Compactor(self.orchestrator.provider)
         try:
-            provider = self.orchestrator.provider
-            result = await provider.generate_text(
-                [{"role": "user", "content": prompt}],
-                "You are a precise conversation summarizer. Output only the summary."
-            )
-            if isinstance(result, dict):
-                summary = result.get("content", "Summary unavailable")
-            else:
-                summary = str(result)
-            summary_msg = {"role": "user", "content": f"[CONTEXT SUMMARY]\n{summary[:2000]}"}
-            self.orchestrator.history = system_msgs + [summary_msg] + recent
-            reset_global_tokens()
-            in_tok, _ = count_tokens(self.orchestrator.history, "")
-            add_global_tokens(in_tok)
-            
-            await memory_core.add_memory(summary[:500], category="compacted", tier="recent")
-            CC.print(f"[bold green]Compacted {len(to_summarize)} messages into 1 summary.[/bold green]")
+            compacted = await compactor.compact(history, budget=1, keep=keep)
         except Exception as e:
             CC.print(f"[red]Compaction failed: {self._escape(e)}[/red]")
+            return True
+        if len(compacted) >= len(history):
+            CC.print("[yellow]Compaction produced nothing to fold.[/yellow]")
+            return True
+
+        self.orchestrator.history = compacted
+        after = Compactor.used(self.orchestrator.history)
+        reset_global_tokens()
+        add_global_tokens(after)
+
+        session_id = self.orchestrator._active_session_id
+        if session_id:
+            try:
+                rows = list(self.orchestrator.history) + [
+                    {"role": "system", "content": self.orchestrator.skill_name,
+                     "tool_name": "agent_role"}]
+                memory_core._session_db.replace_messages(session_id, rows)
+            except Exception:
+                logger.debug("Session rewrite failed", exc_info=True)
+
+        summary = str(compacted[0].get("content", ""))
+        try:
+            await memory_core.add_memory(summary[:500], category="compacted", tier="recent")
+        except Exception:
+            logger.debug("Checkpoint memory failed", exc_info=True)
+
+        CC.print(
+            f"[bold green]Compacted {len(history)} → {len(compacted)} messages "
+            f"({_fmt_tokens(before)} → {_fmt_tokens(after)} tok).[/bold green]"
+        )
         return True
 
     async def settings_menu(self) -> None:
@@ -1745,21 +1943,30 @@ class ZervGenCLI:
             [("Toggle Enable/Disable", toggle), ("Set Trim Size", set_size)]
         )
 
-    def _sessions_menu(self) -> bool:
+    def _sessions_menu(self, args: Optional[str] = None) -> bool:
+        """List sessions; `/sessions delete <n>` removes some, `/sessions clear` removes all."""
         if not self.orchestrator:
             CC.print("[red]System not initialized.[/red]")
             return True
 
+        words = (args or "").strip().split()
+        verb = words[0].lower() if words else ""
         try:
             sessions = memory_core._session_db.list_sessions(20)
         except Exception as e:
             CC.print(f"[red]Error listing sessions: {self._escape(e)}[/red]")
             return True
 
+        if verb in ("clear", "all", "--all", "nuke"):
+            return self._delete_sessions(all_sessions=True, force="--yes" in words)
+        if verb in ("delete", "rm", "del", "d"):
+            return self._delete_sessions(targets=" ".join(words[1:]), sessions=sessions)
+
         if not sessions:
             CC.print("[dim]No sessions found.[/dim]")
             return True
 
+        active = self.orchestrator._active_session_id
         table = Table(title="Recent Sessions", show_header=True, box=None)
         table.add_column("#", style="cyan", no_wrap=True)
         table.add_column("Title", style="green")
@@ -1770,16 +1977,54 @@ class ZervGenCLI:
             title = s.get('title') or 'Untitled'
             msgcnt = s.get('message_count', 0)
             ts = s.get('started_at')
+            started = ''
             if ts:
                 try:
                     started = datetime.fromtimestamp(ts).strftime('%m-%d %H:%M')
                 except Exception:
                     started = str(ts)
-            else:
-                started = ''
+            if s.get("id") == active:
+                title = f"{title} (current)"
             table.add_row(str(i), Text(title), str(msgcnt), started)
 
         CC.print(table)
+        CC.print("[dim]/sessions delete <n> … · /sessions clear (all) · /load <n>[/dim]")
+        return True
+
+    def _delete_sessions(self, all_sessions: bool = False, targets: str = "",
+                         sessions: Optional[List[Dict]] = None, force: bool = False) -> bool:
+        """Delete every session, or the numbered ones the user picked."""
+        db = memory_core._session_db
+        if all_sessions:
+            if not force and self._ask("Delete ALL sessions? type 'yes'").lower() not in ("yes", "y"):
+                CC.print("[dim]Cancelled.[/dim]")
+                return True
+            db.delete_all_sessions()
+            memory_core.set_active_session(None)
+            self.orchestrator._active_session_id = None
+            self.orchestrator.history = []
+            self.orchestrator.agents.clear()
+            reset_global_tokens()
+            CC.print("[green]All sessions deleted.[/green]")
+            return True
+        rows = sessions or db.list_sessions(20)
+        picked = [t for t in targets.replace(",", " ").split() if t.isdigit()]
+        if not picked:
+            CC.print("[dim]Usage: /sessions delete <n> [n…] · /sessions clear[/dim]")
+            return True
+        removed = 0
+        for token in picked:
+            index = int(token) - 1
+            if not 0 <= index < len(rows):
+                continue
+            session_id = rows[index]["id"]
+            db.delete_session(session_id)
+            removed += 1
+            if session_id == self.orchestrator._active_session_id:
+                memory_core.set_active_session(None)
+                self.orchestrator._active_session_id = None
+                self.orchestrator.history = []
+        CC.print(f"[green]Deleted {removed} session(s).[/green]")
         return True
 
     async def _dream_menu(self) -> None:
@@ -1958,7 +2203,7 @@ class ZervGenCLI:
 
     async def _select_provider(self) -> None:
         from src.config import resolve_provider
-        providers = list_providers()
+        providers = list_providers(self.config)
         current = resolve_provider(self.config.provider)
         entries = []
         for meta in providers:
@@ -2175,6 +2420,7 @@ class ZervGenCLI:
             await self._init_system()
         self._pending_input = asyncio.Queue()
         self._should_exit = False
+        self._quit_requested = False
         self._modal_cmd = None
         self.print_banner(show_menu=False)
         CC.print(f"\n[{C}]Ready. /help · /stop to halt a run · Ctrl+D exit.[/{C}]\n")
@@ -2188,8 +2434,9 @@ class ZervGenCLI:
                         continue
                     if not user_input.strip():
                         continue
-                    if user_input.lower() in ('exit', 'quit', 'q', '/q'):
+                    if user_input.lower() in ('exit', 'quit', 'q', '/q', '/exit', '/quit'):
                         self._should_exit = True
+                        self._quit_requested = True
                         self._app.exit()
                         return
                     if user_input.lower() in ('back', '/back', 'menu'):
@@ -2267,11 +2514,12 @@ class ZervGenCLI:
                         self._perm_future.set_result(msg.strip().lower() in ("y", "yes"))
                         continue
                     text = msg.strip()
-                    if text.lower() in ("/q", "q", "exit", "quit", "/exit"):
+                    if text.lower() in ("/q", "q", "exit", "quit", "/exit", "/quit"):
                         if self._agent_task and not self._agent_task.done():
                             self.orchestrator.request_interrupt()
                             self._agent_task.cancel()
                         self._should_exit = True
+                        self._quit_requested = True
                         if self._app:
                             self._app.exit()
                         return
@@ -2369,7 +2617,7 @@ class ZervGenCLI:
             try:
                 choice = Prompt.ask(_acm("Enter"), default="1")
 
-                if choice.lower() in ('q', '/q', 'exit', 'quit', '3'):
+                if choice.lower() in ('q', '/q', 'exit', 'quit', '/exit', '3'):
                     await self._cleanup()
                     raise SystemExit(0)
                 elif choice.startswith("/"):
@@ -2378,6 +2626,9 @@ class ZervGenCLI:
                     await self.handle_system_command(choice)
                 elif choice == "1":
                     await self.chat_loop()
+                    if self._quit_requested:
+                        await self._cleanup()
+                        raise SystemExit(0)
                 elif choice == "2":
                     await self.settings_menu()
                 else:

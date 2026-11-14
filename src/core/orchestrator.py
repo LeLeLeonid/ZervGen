@@ -46,17 +46,21 @@ class Orchestrator(StemAgent):
         settings: Optional[GlobalSettings] = None,
         mode: str = "CALL",
         memory: Any = None,
+        renderer: Optional[Any] = None,
     ):
         settings = settings or load_config()
         provider = provider or get_provider(getattr(settings, "provider", "pollinations"), settings)
+        saved = str(getattr(settings, "active_role", "system") or "system")
+        role = saved if role_exists(saved) else "system"
         super().__init__(
-            name="orchestrator",
+            name=role,
             provider=provider,
-            skill_name="system",
+            skill_name=role,
             settings=settings,
             mode=mode,
             memory=memory,
             silent=False,
+            renderer=renderer,
         )
         self.agents: Dict[str, StemAgent] = {}
         self._last_agent_id: Optional[str] = None
@@ -79,13 +83,23 @@ class Orchestrator(StemAgent):
         return True
 
     def set_role(self, role: str) -> bool:
+        """Switch role and remember it for this session."""
         if not role_exists(role):
             return False
         self.skill_name = role
         self.name = role
         self._load_tools()
         self.invalidate_cache()
+        self._remember_role(role)
         return True
+
+    def _remember_role(self, role: str) -> None:
+        """Persist the chosen agent so a restart resumes on it."""
+        try:
+            self.settings.active_role = role
+            self.settings.save()
+        except Exception:
+            logger.debug("Role save failed", exc_info=True)
 
     def switch_provider(self, name: str) -> bool:
         try:

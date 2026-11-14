@@ -3,6 +3,7 @@ import json
 import httpx
 import logging
 import os
+import re
 import time
 from typing import List, Dict, Optional, Any
 
@@ -342,6 +343,9 @@ def _api_key(name: str, settings, preset: Optional[Dict[str, str]]) -> str:
     key = getattr(section, "api_key", None) if section is not None else None
     if key:
         return key
+    inline = str((preset or {}).get("api_key") or "").strip()
+    if inline:
+        return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", lambda m: os.environ.get(m.group(1), ""), inline)
     env = (preset or {}).get("api_key_env") or ""
     if env:
         value = os.environ.get(env, "")
@@ -375,7 +379,7 @@ def get_provider(name: str, settings) -> AIProvider:
         raise ValueError(f"provider '{name}' not found")
     model = _resolve_model(key, settings, preset)
     api_key = _api_key(key, settings, preset)
-    dialect = provider_dialect(key)
+    dialect = str(preset.get("dialect") or provider_dialect(key))
     if dialect == "anthropic":
         from src.providers.anthropic import Provider
         return Provider.from_endpoint(key, preset["base_url"], api_key, model)
@@ -455,8 +459,8 @@ def list_live_models(provider_name: str, settings=None) -> List[str]:
         return []
 
 
-def list_providers() -> List[ProviderMeta]:
-    from src.config import _get_all_presets
+def list_providers(settings=None) -> List[ProviderMeta]:
+    from src.config import _get_all_presets, load_config
     results: List[ProviderMeta] = []
     native = {
         "pollinations": "src.providers.pollinations",
@@ -474,7 +478,7 @@ def list_providers() -> List[ProviderMeta]:
         except Exception:
             pass
     seen = {m.name for m in results}
-    for name, preset in sorted(_get_all_presets().items()):
+    for name, preset in sorted(_get_all_presets(settings or load_config()).items()):
         if name in seen:
             continue
         env = preset.get("api_key_env") or ""

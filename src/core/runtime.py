@@ -604,6 +604,8 @@ class ToolRuntime:
         if self.hooks:
             try:
                 blocked = await self.hooks("pre_tool_call", name, args)
+            except asyncio.TimeoutError:
+                blocked = "hook timed out; the call was stopped"
             except Exception:
                 blocked = "hook crashed (fail_closed)" if self.hooks_fail_closed else None
             if blocked:

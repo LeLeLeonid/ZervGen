@@ -20,12 +20,24 @@ from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
 from types import MappingProxyType
 import aiofiles
+import difflib
 import httpx
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from rich.console import Console
 from src.config import load_config, shell_block_reason, TEMP_DIR, WMO_CODES
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+
+def _change_note(path: str, old: str, new: str) -> str:
+    """`path (+N -M)` - a change the model cannot mistake for an unapplied edit."""
+    if old == new:
+        return f"{path}: no change"
+    if max(len(old), len(new)) > 2_000_000:
+        return f"{path} ({len(new):,} chars, was {len(old):,})"
+    diff = list(difflib.unified_diff(old.splitlines(), new.splitlines(), n=0, lineterm=""))
+    added = sum(1 for line in diff if line.startswith("+") and not line.startswith("+++"))
+    removed = sum(1 for line in diff if line.startswith("-") and not line.startswith("---"))
+    return f"{path} (+{added} -{removed})"
 
 TEMP_DIR.mkdir(exist_ok=True)
 console = Console()
@@ -366,7 +378,8 @@ async def shell_exec(command: str, timeout: int = 60) -> ShellResult:
     started = time.monotonic()
     process = None
     try:
-        process = await asyncio.create_subprocess_shell(command.strip(), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "echo", "SSH_ASKPASS": "echo"}
+        process = await asyncio.create_subprocess_shell(command.strip(), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env)
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=int(timeout))
         out = stdout.decode('utf-8', errors='replace').strip()
         err = stderr.decode('utf-8', errors='replace').strip()
@@ -442,8 +455,11 @@ async def process(action: str, id: str = "", command: str = "", lines: int = 40)
 
 
 
-async def list_files(path: str = ".", recursive: bool = False, exclude_cache: bool = True, ignore_dir: bool = True) -> str:
-    """List a directory, optionally recursive, confined to allowed roots."""
+async def list_files(path: str = ".", recursive: bool = False, exclude_cache: bool = True, ignore_dir: bool = True,
+                     pattern: str = "") -> str:
+    """List a directory, optionally recursive; a glob `pattern` narrows it like `glob`."""
+    if pattern:
+        return await glob_files(pattern, path)
     target = Path(path)
     if not target.exists():
         return f"Error: Path does not exist: {path}"
@@ -506,8 +522,8 @@ def _was_read(path: str) -> bool:
         return False
 
 
-async def read_file(path: str, offset: int = 0, max_chars: int = 8000) -> str:
-    """Read a file from line `offset` (1-based). The tail names the next line to read."""
+async def read_file(path: str, offset: int = 0, max_chars: int = 0) -> str:
+    """Read a file from line `offset` (1-based); the whole file unless max_chars is set."""
     if not _is_safe_path(path):
         return f"Error: Access denied: {path}"
     target = Path(path)
@@ -526,21 +542,27 @@ async def read_file(path: str, offset: int = 0, max_chars: int = 8000) -> str:
     start = max(1, int(offset or 1))
     if start > total and total:
         return f"Error: offset {start} is past end of file ({total} lines)."
+    settings = load_config()
+    limit = int(max_chars or getattr(settings, "read_max_chars", 120_000))
     chunk, used = [], 0
     index = start - 1
     while index < total:
         line = lines[index]
-        if used + len(line) > max_chars and chunk:
+        if used + len(line) > limit and chunk:
             break
         chunk.append(line)
         used += len(line)
         index += 1
     body = "".join(chunk)
     _mark_read(path)
-    tail = f"\n[lines {start}-{index} of {total}" + (f" | next_offset={index + 1}" if index < total else " | end of file") + "]"
-    if index < total and len(body) > max_chars:
-        body = body[:max_chars]
-        tail = f"\n[lines {start}-{index} of {total} | next_offset={index} | line too long, re-read with a larger max_chars]"
+    if len(body) > limit:
+        body = body[:limit]
+        tail = (f"\n[lines {start}-{index} of {total} | line {index} is longer than {limit} chars, "
+                f"cut at {limit} | next_offset={index + 1} skips the rest of it]")
+    elif index < total:
+        tail = f"\n[lines {start}-{index} of {total} | next_offset={index + 1}]"
+    else:
+        tail = f"\n[lines {start}-{index} of {total} | end of file]"
     return body + tail
 
 
@@ -549,9 +571,17 @@ async def write_file(path: str, content: str = "") -> str:
         return "Error: Invalid path or access denied."
     if Path(path).exists() and not _was_read(path):
         return f"Error: {path} exists and was not read this session. read it first, or use edit."
+    target = Path(path)
+    old = ""
+    if target.exists():
+        try:
+            if target.stat().st_size <= 2_000_000:
+                old = target.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            old = ""
     try:
-        _atomic_write(Path(path), content)
-        return f"Written to {path}"
+        _atomic_write(target, content)
+        return _change_note(path, old, content)
     except Exception as e:
         return f"Error: {e}"
 
@@ -563,7 +593,7 @@ async def append_file(path: str, content: str = "") -> str:
         target = Path(path)
         existing = target.read_text(encoding="utf-8") if target.exists() else ""
         _atomic_write(target, existing + content)
-        return f"Appended to {path}"
+        return _change_note(path, existing, existing + content)
     except Exception as e:
         return f"Error: {e}"
 
@@ -583,7 +613,7 @@ async def edit_file(path: str, find: str, replace: str = "", replace_all: bool =
             return f"Error: find matches {count} times. Pass replace_all=True or add surrounding context to make it unique."
         new = content.replace(find, replace) if replace_all else content.replace(find, replace, 1)
         _atomic_write(target, new)
-        return f"Made {count if replace_all else 1} replacement(s) in {path}"
+        return _change_note(path, content, new)
     except Exception as e:
         return f"Error: {e}"
 
@@ -1235,27 +1265,37 @@ async def add_mcp_server(
 
 
 async def search_mcp_hub(query: str = "", limit: int = 20) -> str:
-    """Search the built-in MCP catalog for installable servers."""
-    from src.core.mcp_manager import search_catalog
-    rows = search_catalog(query, limit=limit)
-    if not rows:
-        return f"No MCP server matches '{query}'."
+    """Search the built-in catalog plus the official MCP registry."""
+    from src.core.mcp_manager import search_catalog, search_registry
+    builtin = search_catalog(query, limit=limit)
+    remote = await search_registry(query, limit=limit) if limit > len(builtin) else []
+    seen = {row["name"] for row in builtin}
     lines = []
-    for row in rows:
-        mark = "[installed]" if row["installed"] else ""
+    for row in builtin:
         needs = f" env: {', '.join(row['env'])}" if row["env"] else ""
-        lines.append(f"- {row['name']} ({row['transport']}) {mark}{needs}: {row['description']}")
-    return "MCP catalog:\n" + "\n".join(lines)
+        mark = " [installed]" if row["installed"] else ""
+        lines.append(f"- {row['name']} ({row['transport']}){mark}{needs}: {row['description']}")
+    fresh = [row for row in remote if row["name"] not in seen]
+    for row in fresh[:max(0, limit - len(lines))]:
+        needs = f" env: {', '.join(row['env'])}" if row["env"] else ""
+        mark = " [installed]" if row["installed"] else ""
+        lines.append(f"- {row['key']} ({row['transport']}){mark}{needs}: {row['description']} "
+                     f"[registry: {row['name']}]")
+    if not lines:
+        return f"No MCP server matches '{query}'."
+    return "MCP catalog:\n" + "\n".join(lines) + "\nInstall with mcp_install(name)."
 
 
 async def install_mcp_server(name: str, env: str = "{}") -> str:
-    """Install a catalog MCP server into ~/.zervgen/mcp.json, storing secrets in .env."""
-    from src.core.mcp_manager import MCPManager, install_from_catalog
+    """Install an MCP server from the catalog or the registry, storing secrets in .env."""
+    from src.core.mcp_manager import MCPManager, install_from_catalog, install_from_registry
     try:
         secrets = json.loads(env) if isinstance(env, str) else dict(env or {})
     except json.JSONDecodeError:
         return "Error: env must be a JSON object."
     result = install_from_catalog(name, secrets)
+    if result.startswith("Error:"):
+        result = install_from_registry(name, secrets)
     if result.startswith("Error:"):
         return result
     MCPManager().reload_from_store()
@@ -1272,14 +1312,17 @@ async def uninstall_mcp_server(name: str) -> str:
     return result
 
 
-async def list_mcp_servers() -> dict:
-    """Returns {server_name: {enabled, connected, installed, tools, error, cmd}}."""
+async def list_mcp_servers(name: str = None) -> dict:
+    """Returns {server_name: {enabled, connected, installed, tools, error, cmd}}; `name` narrows to one."""
     import shutil
     from src.core.mcp_manager import MCPManager
     mgr = MCPManager()
+    wanted = {name} if name else None
     out = {}
-    for name, cfg in mgr.settings.mcp_servers.items():
-        srv = mgr.servers.get(name)
+    for server_name, cfg in mgr.settings.mcp_servers.items():
+        if wanted and server_name not in wanted:
+            continue
+        srv = mgr.servers.get(server_name)
         if cfg.kind != "stdio":
             installed = bool(cfg.url)
         elif cfg.command == "internal":
@@ -1296,7 +1339,7 @@ async def list_mcp_servers() -> dict:
                 or shutil.which(f"{cfg.command}.exe")
                 or shutil.which(f"{cfg.command}.cmd")
             )
-        out[name] = {
+        out[server_name] = {
             "enabled": bool(cfg.enabled),
             "state": srv.state if srv else ("installed" if installed else "missing"),
             "connected": bool(srv and srv.connected),
@@ -1307,7 +1350,9 @@ async def list_mcp_servers() -> dict:
             "error": srv._last_error if srv and srv._last_error else None,
             "cmd": cfg.url if cfg.kind != "stdio" else cfg.command,
         }
-    return out or {"error": "No MCP servers configured."}
+    if not out:
+        return {"error": f"No MCP server named '{name}'." if name else "No MCP servers configured."}
+    return out
 
 
 async def mcp_execute(server: str, tool: str = "", arguments: str = "{}", args: str = None) -> str:
@@ -1352,16 +1397,20 @@ async def mcp_execute(server: str, tool: str = "", arguments: str = "{}", args: 
 
 
 async def scan_tools(name: str = "") -> str:
-    """List active tools, or show one tool's full signature and arguments."""
+    """List built-in tools, or show one tool's full signature and arguments."""
     agent = _resolve_agent()
     tools = dict(getattr(agent, "tools", None) or TOOL_REGISTRY)
     if name:
         public = TOOL_NAMES.get(name, name)
         func = tools.get(public)
         if func is None:
+            route = (getattr(getattr(agent, "_mcp", None), "_calls", None) or {}).get(name)
+            if route:
+                return (f"- {name} is an MCP tool, not a built-in: "
+                        f"mcp(\"{route[0]}\", \"{route[1]}\", arguments={{…}}) runs it.")
             return f"Error: tool '{name}' is not active."
         return f"- {public}{_signature_text(func)}: {' '.join((inspect.getdoc(func) or '').split())}"
-    return "Available tools:\n" + "\n".join(
+    return "Built-in tools (MCP tools are listed by mcps()):\n" + "\n".join(
         f"- {key}{_signature_text(func)}: {' '.join((inspect.getdoc(func) or '').split())[:120]}"
         for key, func in tools.items()
     )

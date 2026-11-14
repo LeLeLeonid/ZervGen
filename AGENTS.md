@@ -59,6 +59,7 @@ TAB in an empty prompt cycles modes. `/mode` opens the menu.
 
 Called as Python inside a ```` ```python ```` block, or as shorthand:
 
+Reading the 'PLAN.md', *recall* and delegating...
 ```python
 content = await read("tmp/PLAN.md")
 hits = await recall("database schema", limit=5)
@@ -66,6 +67,7 @@ result = await delegate(agent_name="code", task=f"Execute: {content}")
 ```
 
 ```text
+Scanning and testing the CLI...
 ::read("src/cli.py", 0, 4000)
 ::shell("pytest -q")
 ```

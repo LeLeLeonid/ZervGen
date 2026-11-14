@@ -1,5 +1,6 @@
 import asyncio
 import ast
+import difflib
 import fnmatch
 import hashlib
 import json
@@ -25,7 +26,7 @@ from src.core.runtime import (
     Run, Artifact, RunStatus, Task,
     Session, RunCoordinator, PermissionPolicy, ToolRuntime, Compactor, InputPending,
 )
-from src.utils import CALL_MARKUP_RE, SHORTHAND_RE, TERMINAL_TOOLS, TraceBus, TurnIntent, canonical_tool, parse_turn, strip_ptc, looks_like_python
+from src.utils import CALL_MARKUP_RE, SHORTHAND_RE, TERMINAL_TOOLS, TraceBus, TurnIntent, canonical_tool, comment_lines, parse_turn, shorthand_notes, strip_ptc, looks_like_python
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -74,7 +75,6 @@ class _StreamFilter:
         if not body.strip():
             return
         if lang in ("python", "py") or (not lang and looks_like_python(body)):
-            self.emitted = (self.emitted + "\n" + body)[-20_000:]
             return
         self._emit(f"```{lang}\n{body}\n```\n")
 
@@ -135,6 +135,7 @@ class StemAgent:
         initial_history: Optional[List[Dict]] = None,
         silent: bool = False,
         orchestrator: Optional[Any] = None,
+        renderer: Optional[Any] = None,
     ):
         self.name = name
         self.provider = provider
@@ -186,6 +187,7 @@ class StemAgent:
             role=name,
             enabled=bool(getattr(self.settings, "trace_enabled", True)),
             capture_chars=int(getattr(self.settings, "trace_capture_chars", 2000) or 2000),
+            renderer=renderer,
         )
         self.trace.paint = not silent
         self._load_tools()
@@ -280,19 +282,32 @@ class StemAgent:
         if not commands or not tool:
             return None
         payload = json.dumps({"event": event, "tool": tool, "args": args}, ensure_ascii=False, default=str)
+        limit = float(getattr(self.settings, "hook_timeout", 10) or 10)
         for command in commands:
             proc = await asyncio.create_subprocess_shell(
-                command, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
-            out, _ = await proc.communicate(payload.encode())
+                command, stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            try:
+                out, _err = await asyncio.wait_for(proc.communicate(payload.encode()), timeout=limit)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                raise TimeoutError(f"hook timed out after {limit:.0f}s") from None
             if proc.returncode == 2:
                 return (out.decode("utf-8", "replace").strip() or f"hook blocked {tool}")[:500]
         return None
 
     @staticmethod
     def _hook_match(key: str, event: str, tool: str) -> bool:
-        """Config key `event` fires on every tool; `event:glob` scopes to matching tools."""
+        """Config key `event` fires on every tool; `event:a,b` scopes to those tools."""
         base, _, pattern = key.partition(":")
-        return base == event and (not pattern or fnmatch.fnmatch(tool, pattern))
+        if base != event:
+            return False
+        if not pattern:
+            return True
+        name = canonical_tool(tool)
+        return any(fnmatch.fnmatch(tool, canonical_tool(p)) or fnmatch.fnmatch(name, canonical_tool(p))
+                   for p in pattern.split(",") if p.strip())
 
     def _runtime_event(self, kind: str, **fields) -> None:
         """Route one tool event to the trace bus; call + result collapse into one row."""
@@ -352,9 +367,11 @@ class StemAgent:
             text = re.sub(r'<[^>]+>', ' ', result)
             text = re.sub(r'\s+', ' ', text).strip()
             return f"[HTML Extracted Text]: {text[:1500]}"
-        TRUNC_LIMIT = getattr(self.settings, 'tool_output_limit', 8000)
+        if tool_name in ("read", "read_file"):
+            return result
+        TRUNC_LIMIT = getattr(self.settings, 'tool_output_limit', 24_000)
         if len(result) > TRUNC_LIMIT:
-            return result[:TRUNC_LIMIT] + f"\n... [TRUNCATED {len(result) - TRUNC_LIMIT} CHARS — use read with offset to get the rest]"
+            return result[:TRUNC_LIMIT] + f"\n... [TRUNCATED {len(result) - TRUNC_LIMIT} CHARS]"
         return result
 
     async def _tool_set_mode(self, mode: str) -> str:
@@ -380,7 +397,7 @@ class StemAgent:
             allowed = set(TOOL_REGISTRY.keys())
         else:
             allowed.update({"response", "skill", "find", "skill_hub", "skill_install",
-                            "recall", "graph", "skills", "mcps",
+                            "recall", "graph", "skills", "mcps", "mcp_search",
                             "skill_external", "tools"})
         self.tools = {k: v for k, v in TOOL_REGISTRY.items() if k in allowed}
 
@@ -398,19 +415,27 @@ class StemAgent:
             tools[public] = self._make_mcp_wrapper(tool_name, spec, server_name)
         return tools
 
+    def _is_mcp_tool(self, name: str) -> bool:
+        """True for a tool published by an MCP server, never for a built-in."""
+        return name in (getattr(self._mcp, "_calls", None) or {})
+
     def _active_tools(self) -> dict:
         write_set = {"write", "append", "edit", "shell"}
         tools = dict(self.tools)
         for name, func in self._mcp_tools().items():
             tools.setdefault(name, func)
         if self.mode in ("ASK", "CALL"):
-            return {k: v for k, v in tools.items() if k not in write_set}
+            return {k: v for k, v in tools.items() if k not in write_set and not self._is_mcp_tool(k)}
         return tools
 
     def _tool_specs(self) -> Dict[str, Any]:
         """Active tool callables, keyed by public name (for argument binding)."""
         return {name: func for name, func in self._active_tools().items()
                 if name not in TERMINAL_TOOLS}
+
+    def _builtin_names(self) -> List[str]:
+        """Built-in tool names only; MCP tools are named separately."""
+        return sorted(k for k in self._tool_specs() if not self._is_mcp_tool(k))
 
     def _native_specs(self) -> List[Dict[str, Any]]:
         """Canonical tool descriptions, or [] when the wire stays text-only."""
@@ -471,14 +496,14 @@ class StemAgent:
                 tools[legacy] = tools[public]
         return tools
 
-    async def _init_mcp(self) -> None:
+    async def _init_mcp(self, connect: bool = True) -> None:
         if self._mcp_initialized or not getattr(self.settings, 'mcp_enabled', True):
             return
         try:
             from src.core.mcp_manager import MCPManager
             self._mcp = MCPManager(self.settings)
             self._mcp_initialized = True
-            if getattr(self.settings, "mcp_connect_on_start", True):
+            if connect and getattr(self.settings, "mcp_connect_on_start", True):
                 await self._mcp.connect_all()
         except Exception as e:
             logger.warning(f"MCP init failed (will retry): {e}")
@@ -671,17 +696,36 @@ class StemAgent:
         return ""
 
     def _prompt_mcp(self) -> str:
+        """MCP tools live in their own section: they are not built-ins and never mix with them."""
         if not getattr(self.settings, "mcp_enabled", True) or not self._mcp:
             return ""
-        if not getattr(self.settings, "prompt_show_mcp_tools", False):
+        if not getattr(self.settings, "prompt_show_mcp_tools", True):
             return ""
-        active = []
+        budget = max(200, int(getattr(self.settings, "prompt_mcp_chars", 900) or 900))
+        lines: List[str] = []
         for name, srv in self._mcp.servers.items():
-            if srv.connected:
-                active.append(f"- {name}: {len(srv.tools)} tools")
-            elif srv.state in ("degraded", "dead"):
-                active.append(f"- {name}: {srv.state} ({len(srv.tools)} cached tools) — call mcp to retry")
-        return "--- MCP ---\n" + "\n".join(active) if active else ""
+            if not srv.connected and srv.state not in ("degraded", "dead"):
+                continue
+            names = list((getattr(srv, "public_names", None) or {}).values())
+            if names:
+                lines.append(f"- {name}: {', '.join(names)}")
+            elif srv.connected:
+                lines.append(f"- {name}: {len(srv.tools)} tools")
+            else:
+                lines.append(f"- {name}: {srv.state} ({len(srv.tools)} cached tools) — call mcp to retry")
+        if not lines:
+            return ""
+        header = "--- MCP (separate from built-in tools) ---"
+        kept: List[str] = []
+        used = len(header)
+        for line in lines:
+            if used + len(line) + 1 > budget and kept:
+                break
+            kept.append(line)
+            used += len(line) + 1
+        if len(kept) < len(lines):
+            kept.append(f"- … {len(lines) - len(kept)} more servers, call mcps()")
+        return header + "\n" + "\n".join(kept)
 
     def _prompt_skills(self, user_input: str) -> str:
         """Skill topology: a category-grouped index; bodies load on demand."""
@@ -735,19 +779,19 @@ class StemAgent:
         return f"--- EXECUTION PROTOCOL ---\n{text}"
 
     def _prompt_tools(self, declared_names: set[str] | None = None) -> str:
-        active = self._active_tools()
+        active = {k: v for k, v in self._active_tools().items() if not self._is_mcp_tool(k)}
         if not active:
             return ""
         subset = {k: v for k, v in active.items() if declared_names is None or k in declared_names}
         if self._native_specs():
             names = ", ".join(sorted(subset))
-            return ("--- AVAILABLE TOOLS ---\n"
-                    f"{len(subset)} tools are attached to this request as native functions.\n"
+            return ("--- TOOLS ---\n"
+                    f"{len(subset)} built-in tools are attached to this request as native functions.\n"
                     f"{names}\n"
                     "Call them directly. tools(name) shows one tool's arguments.")
         from src.tools import render_tool_index
         budget = max(400, int(getattr(self.settings, "prompt_tools_chars", 2600) or 2600))
-        return ("--- AVAILABLE TOOLS ---\n"
+        return ("--- TOOLS ---\n"
                 f"{render_tool_index(subset, budget)}\n"
                 "tools(name) prints one tool's full docstring and arguments.")
 
@@ -820,7 +864,8 @@ class StemAgent:
                 safe_role = role
             else:
                 safe_role = "assistant"
-            self.history.append({"role": safe_role, "content": self._strip_ptc(safe_content)})
+            body = safe_content if safe_role == "user" else self._strip_ptc(safe_content)
+            self.history.append({"role": safe_role, "content": body})
 
     def _persist_turn(self, role: str, content: str) -> None:
         """Store a finished conversation turn; logs and tool noise stay out of the session."""
@@ -878,6 +923,8 @@ class StemAgent:
             pass
         if outcome.success:
             output = str(outcome.output or "")
+            if tool_name in {"write", "append", "edit"}:
+                self._emit_diff(str(args.get("path", "")))
             if tool_name in {"write", "append", "edit"} and self._run:
                 path = str(args.get("path", ""))
                 if path:
@@ -1010,8 +1057,10 @@ class StemAgent:
                 if idx != -1:
                     first_sentence = raw_text[:idx + 1].strip()
                     break
-        comments = [l.strip().lstrip("#").strip() for l in code.split("\n") if l.strip().startswith("#")]
-        if raw_text and comments:
+        comments = comment_lines(code)
+        for comment in comments[:4]:
+            self.trace.emit("narration", self.name, comment[:160])
+        if comments:
             comment_thought = " -> ".join(c[:60] for c in comments[:3])
         elif raw_text:
             non_comments = [l.strip() for l in code.split("\n") if l.strip() and not l.strip().startswith("#")]
@@ -1131,6 +1180,9 @@ class StemAgent:
             return err
 
     def _get_max_steps(self) -> int:
+        """ASK is one turn; the loop grants a second only to read back a tool result."""
+        if self.mode == "ASK":
+            return 1
         return self._max_steps_override or self.settings.max_steps
 
     def _live_thought(self, text: str):
@@ -1458,6 +1510,29 @@ class StemAgent:
         target = Path(path)
         store[path] = target.read_bytes() if target.is_file() else None
 
+    def _emit_diff(self, path: str) -> None:
+        """Render the change the tool just made; the model gets only the counts."""
+        if not path or not getattr(self.settings, "diff_enabled", True):
+            return
+        store = getattr(self, "_file_baseline", {}) or {}
+        target = Path(path)
+        try:
+            after = target.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return
+        before = store.get(path)
+        old = before.decode("utf-8", "replace") if isinstance(before, bytes) else ""
+        if old == after:
+            return
+        diff = list(difflib.unified_diff(old.splitlines(), after.splitlines(), n=2, lineterm=""))
+        body = [line for line in diff if not line.startswith(("--- ", "+++ "))]
+        added = sum(1 for line in body if line.startswith("+"))
+        removed = sum(1 for line in body if line.startswith("-"))
+        shown = body[:40]
+        if len(body) > 40:
+            shown.append(f"… {len(body) - 40} more lines")
+        self.trace.emit("diff", self.name, f"{path} (+{added} -{removed})\n" + "\n".join(shown))
+
     def _new_failure(self, path: Path, reason: str) -> bool:
         """True when this failure was not already present before the edit."""
         store = getattr(self, "_file_baseline", {}) or {}
@@ -1610,6 +1685,7 @@ class StemAgent:
         self._sensor_attempts = 0
         self._empty_total = 0
         self._turn_signatures = []
+        self._file_baseline = {}
         if not task or not isinstance(task, str):
             return "Error: Invalid task"
         task = task.strip()
@@ -1633,6 +1709,8 @@ class StemAgent:
             pass
         step = 0
         max_steps = self._get_max_steps()
+        # ASK allows one extra turn so a tool result can be turned into an answer.
+        step_limit = max_steps + 1 if self.mode == "ASK" else max_steps
         self._delegation_count = 0
         self._active_todos = []
         self.invalidate_cache()
@@ -1655,7 +1733,7 @@ class StemAgent:
         timeout = int(getattr(self.settings, "run_timeout", 0) or 0)
         deadline = (time.monotonic() + timeout) if timeout > 0 else None
         try:
-            while step < max_steps:
+            while step < step_limit:
                 step += 1
                 if deadline and time.monotonic() > deadline:
                     self._log(self.name, "Run timeout exceeded", "ptc_error", self.mode)
@@ -1689,11 +1767,11 @@ class StemAgent:
                 cost = float(self._run.metadata.get("cost_usd", 0.0) or 0.0)
                 self.trace.emit(
                     "step", self.name,
-                    f"step {step}/{max_steps} · {tokens:,} ctx · ${cost:.4f}",
+                    f"step {step}/{step_limit} · {tokens:,} ctx · ${cost:.4f}",
                     prompt_hash=self._prompt_hash, prompt_chars=len(self._cached_system_prompt or ""),
                     history_tokens=tokens, cost_usd=round(cost, 6),
                 )
-                self._status_base = f"step {step}/{max_steps} · {tokens:,} ctx · ${cost:.4f}"
+                self._status_base = f"step {step}/{step_limit} · {tokens:,} ctx · ${cost:.4f}"
                 self._set_status(True)
                 response = None
                 attempt = 0
@@ -1780,7 +1858,9 @@ class StemAgent:
                     hint = {
                         "markup": "That was raw XML/HTML, not a tool call or an answer.",
                         "broken-call": f"That tool call did not parse: {getattr(intent, 'reason', '')}. "
-                                       f"Valid tools: {', '.join(sorted(specs))}.",
+                                       f"Built-in tools: {', '.join(self._builtin_names())}. "
+                                       "MCP tools are separate: mcps() lists servers, "
+                                       "mcp(server, tool, arguments) runs one.",
                     }.get(intent.source, "You returned nothing.")
                     self._empty_total = getattr(self, "_empty_total", 0) + 1
                     if self._empty_total >= 6:
@@ -1802,10 +1882,12 @@ class StemAgent:
                         raw_output = await self._run_code(intent.code, response)
                         if raw_output and str(raw_output).startswith("PTC ") and self._record_error_tripwire(str(raw_output)):
                             return self._finish(RunStatus.FAILED, raw_output)
-                        if raw_output and (not self.history or self.history[-1].get("content") != raw_output):
+                        if raw_output and not self._response_called and (not self.history or self.history[-1].get("content") != raw_output):
                             self._record_tool_result("python", raw_output)
                         stable = str(raw_output)
                     else:
+                        for note in shorthand_notes(response)[:4]:
+                            self.trace.emit("narration", self.name, note[:160])
                         outputs = []
                         for call in intent.calls:
                             result = await self._execute_tool(call.name, call.args)
@@ -1872,13 +1954,19 @@ class StemAgent:
             self._set_status(False)
 
     def get_history_summary(self, max_messages: int = -1) -> str:
+        """One line per turn; a call-only assistant turn is already shown by its tool row."""
         if not self.history:
             return "No history."
         msgs = self.history if max_messages < 0 else self.history[-max_messages:]
+        names = set(self._builtin_names())
         lines = []
         for m in msgs:
             role = m.get("role", "?")
             content = str(m.get("content", ""))
+            if role == "assistant":
+                content = strip_ptc(content, names)
+                if not content:
+                    continue
             preview = content[:800].replace("\n", " ").replace("[", "\\[").replace("]", "\\]")
             if len(content) > 800:
                 preview += "..."

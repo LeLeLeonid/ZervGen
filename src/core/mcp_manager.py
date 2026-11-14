@@ -22,26 +22,39 @@ logger = logging.getLogger(__name__)
 MCP_SDK_AVAILABLE = False
 MCP_MODERN_CLIENT = None
 _HTTP_CLIENT = None
-try:
-    from mcp import Client, ClientSession, StdioServerParameters
-    from mcp.client.sse import sse_client
-    from mcp.client.stdio import stdio_client
-    from mcp.client.streamable_http import streamable_http_client
+ClientSession = StdioServerParameters = None
+sse_client = stdio_client = streamable_http_client = None
+_sdk_loaded = False
 
-    MCP_SDK_AVAILABLE = True
-    MCP_MODERN_CLIENT = Client
+
+def _load_sdk() -> bool:
+    """Import the MCP SDK on first connect; it costs over a second at startup."""
+    global MCP_SDK_AVAILABLE, MCP_MODERN_CLIENT, _HTTP_CLIENT, _sdk_loaded
+    global ClientSession, StdioServerParameters, sse_client, stdio_client, streamable_http_client
+    if _sdk_loaded:
+        return MCP_SDK_AVAILABLE
+    _sdk_loaded = True
     try:
-        import httpx2 as _HTTP_CLIENT
-    except ImportError:
-        import httpx as _HTTP_CLIENT
-except ImportError:
-    try:
-        from mcp import ClientSession, StdioServerParameters
+        from mcp import Client, ClientSession, StdioServerParameters
+        from mcp.client.sse import sse_client
         from mcp.client.stdio import stdio_client
+        from mcp.client.streamable_http import streamable_http_client
 
         MCP_SDK_AVAILABLE = True
+        MCP_MODERN_CLIENT = Client
+        try:
+            import httpx2 as _HTTP_CLIENT
+        except ImportError:
+            import httpx as _HTTP_CLIENT
     except ImportError:
-        pass
+        try:
+            from mcp import ClientSession, StdioServerParameters
+            from mcp.client.stdio import stdio_client
+
+            MCP_SDK_AVAILABLE = True
+        except ImportError:
+            pass
+    return MCP_SDK_AVAILABLE
 
 _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _UNSAFE = re.compile(r"[^A-Za-z0-9_]")
@@ -173,11 +186,16 @@ def catalog_entry(name: str) -> Optional[CatalogEntry]:
 
 
 def search_catalog(query: str = "", limit: int = 20) -> List[Dict[str, Any]]:
-    """Catalog rows whose name contains the query; empty query lists everything."""
+    """Built-in rows matching the query in their name or description; empty query lists everything."""
     needle = (query or "").strip().casefold()
     installed = load_store()
-    rows = [entry for entry in catalog_entries() if needle in entry.name.casefold()]
-    rows.sort(key=lambda entry: entry.name)
+
+    def _hit(entry: CatalogEntry) -> bool:
+        if not needle:
+            return True
+        return needle in entry.name.casefold() or needle in entry.description.casefold()
+
+    rows = sorted((entry for entry in catalog_entries() if _hit(entry)), key=lambda e: e.name)
     return [
         {
             "name": entry.name,
@@ -189,6 +207,125 @@ def search_catalog(query: str = "", limit: int = 20) -> List[Dict[str, Any]]:
         }
         for entry in rows[:max(1, int(limit))]
     ]
+
+
+REGISTRY_URL = "https://registry.modelcontextprotocol.io/v0/servers"
+_registry_rows: Dict[str, Dict[str, Any]] = {}
+
+
+def _registry_key(name: str) -> str:
+    """A config-safe key: `ai.cloudbrowser/mcp` → `ai-cloudbrowser-mcp`."""
+    return re.sub(r"[^A-Za-z0-9_-]+", "-", str(name or "")).strip("-").lower()
+
+
+def _registry_args(package: Dict[str, Any]) -> List[str]:
+    """The command line a package declares, with `-y` for an unpinned npx run."""
+    ident = str(package.get("identifier") or "")
+    extra = [str(arg.get("value")) for arg in (package.get("runtimeArguments") or []) if arg.get("value")]
+    kind = str(package.get("registryType") or "").lower()
+    if kind == "pypi":
+        return [ident]
+    if "-y" not in extra and "--yes" not in extra:
+        extra = ["-y", *extra]
+    return [*extra, ident]
+
+
+def _registry_row(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """One registry record → an installable row, or None when it declares no transport."""
+    server = entry.get("server") if isinstance(entry.get("server"), dict) else entry
+    name = str(server.get("name") or "").strip()
+    if not name:
+        return None
+    remotes = [r for r in (server.get("remotes") or []) if isinstance(r, dict) and r.get("url")]
+    packages = [p for p in (server.get("packages") or []) if isinstance(p, dict) and p.get("identifier")]
+    url, command, args, env = "", "", [], []
+    if remotes:
+        url = str(remotes[0]["url"])
+        env = [str(h.get("name")) for h in (remotes[0].get("headers") or []) if h.get("name")]
+    elif packages:
+        package = packages[0]
+        hint = str(package.get("runtimeHint") or "").lower()
+        kind = str(package.get("registryType") or "").lower()
+        command = hint if hint in ("npx", "uvx", "node", "python", "docker") else ("uvx" if kind == "pypi" else "npx")
+        if command == "node":
+            command = "npx"
+        args = _registry_args(package)
+        env = [str(e.get("name")) for e in (package.get("environmentVariables") or []) if e.get("name")]
+    else:
+        return None
+    return {
+        "key": _registry_key(name),
+        "name": name,
+        "description": str(server.get("description") or ""),
+        "transport": "http" if url else "stdio",
+        "url": url,
+        "command": command,
+        "args": args,
+        "target": url or f"{command} {' '.join(args)}".strip(),
+        "env": env,
+        "installed": False,
+    }
+
+
+async def search_registry(query: str = "", limit: int = 20) -> List[Dict[str, Any]]:
+    """Official MCP registry; results are cached so install can reuse them."""
+    import httpx
+
+    params: Dict[str, Any] = {"limit": max(1, min(100, int(limit)))}
+    if (query or "").strip():
+        params["search"] = query.strip()
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            response = await client.get(REGISTRY_URL, params=params)
+            response.raise_for_status()
+            payload = response.json()
+    except Exception as exc:
+        logger.warning("MCP registry unavailable: %s", exc)
+        return []
+    rows: Dict[str, Dict[str, Any]] = {}
+    for entry in payload.get("servers") or []:
+        row = _registry_row(entry)
+        if row and row["key"] not in rows:
+            rows[row["key"]] = row
+    installed = load_store()
+    for key, row in rows.items():
+        row["installed"] = key in installed or row["name"] in installed
+    _registry_rows.update(rows)
+    return list(rows.values())
+
+
+def install_from_registry(key: str, secrets: Optional[Dict[str, str]] = None,
+                          enable: bool = True) -> str:
+    """Install a registry row into ``mcp.json``; secrets stay as ``${VAR}`` refs."""
+    from src.config import save_env_var
+
+    row = _registry_rows.get(_registry_key(key))
+    if row is None:
+        return (f"Error: '{key}' is not in the registry cache. "
+                f"Run search_mcp_hub('{key}') first so its definition is known.")
+    secrets = {k: v for k, v in (secrets or {}).items() if v}
+    stored_env = {name: f"${{{name}}}" for name in row["env"] if name in secrets}
+    written = [name for name in stored_env if save_env_var(name, secrets[name])]
+    missing = [name for name in row["env"] if name not in secrets and not os.environ.get(name)]
+    entry: Dict[str, Any] = {"type": "stdio" if row["command"] else "http"}
+    if row["url"]:
+        entry["url"] = row["url"]
+        if stored_env:
+            entry["headers"] = stored_env
+    else:
+        entry["command"] = row["command"]
+        entry["args"] = list(row["args"])
+        if stored_env:
+            entry["env"] = stored_env
+    entry["enabled"] = bool(enable)
+    store = project_store()
+    store[row["key"]] = entry
+    save_store(store)
+    note = f"; secrets stored in .env: {', '.join(written)}" if written else ""
+    if missing:
+        note += (f"; still unset: {', '.join(missing)} — the server will fail to connect "
+                 f"until they are exported or passed as KEY=VALUE")
+    return f"MCP server '{row['key']}' installed from the registry ({entry['type']}){note}."
 
 
 def _read_store(path: Path) -> Dict[str, Dict[str, Any]]:
@@ -546,7 +683,7 @@ class MCPServer:
             self.tools = dict(TOOL_REGISTRY)
             self._mark_ready()
             return True
-        if not MCP_SDK_AVAILABLE:
+        if not _load_sdk():
             self._last_error = "MCP SDK is not installed"
             self._record_failure()
             return False

@@ -189,10 +189,10 @@ Call a tool when you need something you do not have:
 2. Fenced python when you need control flow or a multi-line shell command (a heredoc, a pipeline across lines, a loop): `result = await shell("cd tmp/x && .venv/bin/python - <<'EOF'\nimport os\nEOF")` — the heredoc lives inside a Python string here, which parses.
 3. Native tool calls when your provider offers them.
 XML and JSON call shapes still parse; prefer the two above.
-Read before you overwrite: write(path) refuses a file that exists and was not read this session. edit(path, find, replace) changes a slice and needs no full read.
+Read the whole file before you change it: read(path) returns it in one call and the tail tells you if more remains. Output is trimmed automatically when it is heavy, so read fully instead of guessing.
+Edit with tools, never with pasted text: report that a file changed only after write/edit ran and returned success. Printing a diff or a proposed file body as your answer is not an edit.
 Do not read a file again to confirm an edit landed: edit errors when the text is not found, so a success is the confirmation.
-One read with a range beats three reads hunting for a line.
-For files over 400 lines, grep/sed/tail through shell instead of reading them whole: shell("grep -n 'def x' src/y.py"), shell("sed -n '120,160p' src/y.py"), shell("tail -n 50 tmp/agent.log").
+Write a short # comment before each tool call saying what you are doing; the user reads those in chat as progress.
 Long-running commands (servers, watchers): process("start", command=...) then process("read", id=...) / process("kill", id=...).
 When you have enough to act, act. Do not re-derive what the conversation already settled or narrate options you will not take.
 Load a skill with skill(name) before following it.
@@ -336,6 +336,10 @@ class GlobalSettings(BaseModel):
     provider: str = "pollinations"
     max_steps: int = 50
     tool_timeout: int = 60
+    read_max_chars: int = 120_000
+    tool_output_limit: int = 24_000
+    diff_enabled: bool = True
+    active_role: str = "system"
     delegation_timeout: int = 300
     provider_timeout: int = 120
     debug_mode: bool = False
@@ -350,7 +354,7 @@ class GlobalSettings(BaseModel):
     openrouter: OpenRouterSettings = Field(default_factory=OpenRouterSettings)
     openai: OpenAISettings = Field(default_factory=OpenAISettings)
     anthropic: AnthropicSettings = Field(default_factory=AnthropicSettings)
-    compatible_presets: Dict[str, Dict[str, str]] = Field(default_factory=dict)
+    compatible_presets: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     provider_models: Dict[str, str] = Field(default_factory=dict)
     mode: str = "BUILD"
     permission_mode: str = "ASK"
@@ -382,6 +386,7 @@ class GlobalSettings(BaseModel):
     prompt_skill_description_chars: int = 90
     prompt_skills_chars: int = 7000
     prompt_tools_chars: int = 2600
+    prompt_mcp_chars: int = 900
     prompt_show_mcp_tools: bool = True
     prompt_max_chars: int = 14000
     prompt_memory_limit: int = 4
@@ -406,10 +411,18 @@ class GlobalSettings(BaseModel):
     sensor_lsp_enabled: bool = True
     sensor_lsp_command: str = ""
     tool_hooks: Dict[str, List[str]] = Field(default_factory=lambda: {
-        "pre_tool_call:shell": ["grep -qiE 'rm[[:space:]]+-rf[[:space:]]+/|rm[[:space:]]+-r[[:space:]]+-f[[:space:]]+/' && { echo 'rm -rf / blocked'; exit 2; } || exit 0"],
-        "pre_tool_call:write_file": ["grep -qE '(api[_-]?key|secret|token|password)[[:space:]]*[:=][[:space:]]*\"[A-Za-z0-9_-]{8,}\"' && { echo 'possible secret in write_file'; exit 2; } || exit 0"],
+        "pre_tool_call:shell": [
+            r"""grep -qiE 'rm[[:space:]]+-[a-zA-Z]+[[:space:]]+(/|~|\$HOME|\.)([[:space:];"]|$)|--no-preserve-root|dd[[:space:]][^"]*of=/dev/|mkfs|:\(\)[[:space:]]*\{|chmod[[:space:]]+-R[[:space:]]+777[[:space:]]+/' && { echo 'destructive filesystem command'; exit 2; } || exit 0""",
+            r"""grep -qiE 'git[[:space:]]+push[[:space:]][^"]*(-f|--force)([[:space:];"]|$)|git[[:space:]]+reset[[:space:]]+--hard|git[[:space:]]+clean[[:space:]]+-[a-zA-Z]*f' && { echo 'irreversible git command; ask the user first'; exit 2; } || exit 0""",
+            r"""grep -qiE '(curl|wget)[^|"]*\|[[:space:]]*(sudo[[:space:]]+)?(ba|z|da)?sh([[:space:];"]|$)' && { echo 'piping a download into a shell'; exit 2; } || exit 0""",
+        ],
+        "pre_tool_call:write,edit,append": [
+            r"""grep -qE '"path"[[:space:]]*:[[:space:]]*"(\./)?(config\.json|\.zervgen/\.env)"' && { echo 'config.json and .zervgen/.env are harness control files; change them through the CLI'; exit 2; } || exit 0""",
+            r"""grep -qE 'sk-or-v1-[A-Za-z0-9]{16,}|sk-(ant-|proj-)?[A-Za-z0-9_-]{32,}|gh[pousr]_[A-Za-z0-9]{30,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|(api[_-]?key|secret|token|password)[[:space:]]*[:=][[:space:]]*\\?"[A-Za-z0-9_+/=.-]{24,}' && { echo 'a credential literal; read it from an env var'; exit 2; } || exit 0""",
+        ],
     })
     hooks_fail_closed: bool = False
+    hook_timeout: int = 10
     sensors_enabled: bool = True
     sensor_max_attempts: int = 3
     sensor_tests_enabled: bool = True
@@ -457,10 +470,13 @@ class GlobalSettings(BaseModel):
         os.replace(tmp_path, target)
 
 
-class MCPreset(TypedDict):
+class MCPreset(TypedDict, total=False):
     base_url: str
     api_key_env: str
+    api_key: str
     default_model: str
+    headers: Dict[str, str]
+    dialect: str
 
 MODES: Dict[str, Dict[str, str]] = {
     "ASK": {"description": "Fast, direct answers. Use tools when needed.",
@@ -694,26 +710,36 @@ def launch_omniroute() -> str:
     return f"omniroute spawn pending — check {OMNIROUTE_BASE} shortly."
 
 
+_ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def expand_env_refs(value: str) -> str:
+    """`${VAR}` → the environment value, empty when unset."""
+    return _ENV_REF.sub(lambda m: os.environ.get(m.group(1), ""), str(value or ""))
+
+
 def _build_preset_headers(preset: dict, api_key: str = "") -> dict:
     headers = {"Content-Type": "application/json"}
     key = api_key or os.environ.get(preset.get("api_key_env") or "", "")
     if key:
         headers["Authorization"] = f"Bearer {key}"
     for name, value in (preset.get("headers") or {}).items():
-        headers[str(name)] = str(value)
+        headers[str(name)] = expand_env_refs(value)
     return headers
 
 
 def _get_all_presets(settings=None) -> dict:
+    """Shipped presets, overlaid by config.json `compatible_presets`."""
     all_presets = _catalog_presets()
     for name, preset in COMPATIBLE_PRESETS.items():
         all_presets.setdefault(name, {}).update(preset)
-    if settings:
-        user_presets = getattr(settings, 'compatible_presets', None)
-        if isinstance(user_presets, dict):
-            for name, preset in user_presets.items():
-                if isinstance(preset, dict):
-                    all_presets.setdefault(name, {}).update(preset)
+    source = settings if settings is not None else _config_instance
+    user_presets = getattr(source, 'compatible_presets', None) if source is not None else None
+    if isinstance(user_presets, dict):
+        for name, preset in user_presets.items():
+            if isinstance(preset, dict):
+                merged = all_presets.setdefault(name, {})
+                merged.update({k: v for k, v in preset.items() if v not in (None, "")})
     return all_presets
 
 

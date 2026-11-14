@@ -151,7 +151,8 @@ def test_write_refuses_to_clobber_an_unread_file(tmp_path, monkeypatch):
     assert target.read_text() == "original"
 
     asyncio.run(tools.read_file(str(target)))
-    assert asyncio.run(tools.write_file(str(target), "new")) == f"Written to {target}"
+    result = asyncio.run(tools.write_file(str(target), "new"))
+    assert "(+1 -1)" in result
     assert target.read_text() == "new"
 
 
@@ -563,3 +564,131 @@ def test_agent_skips_connect_when_disabled(tmp_path, monkeypatch):
     asyncio.run(agent._init_mcp())
     assert called == []
     MCPManager._instance = None
+
+
+def test_registry_row_maps_an_npm_package_to_npx():
+    from src.core.mcp_manager import _registry_row
+    row = _registry_row({"server": {
+        "name": "io.github.acme/tools",
+        "description": "acme",
+        "packages": [{"registryType": "npm", "identifier": "@acme/mcp", "version": "1.0.0"}],
+    }})
+    assert row["key"] == "io-github-acme-tools"
+    assert row["command"] == "npx"
+    assert row["args"] == ["-y", "@acme/mcp"]
+    assert row["transport"] == "stdio"
+
+
+def test_registry_row_maps_a_pypi_package_to_uvx():
+    from src.core.mcp_manager import _registry_row
+    row = _registry_row({"server": {
+        "name": "acme/py", "description": "",
+        "packages": [{"registryType": "pypi", "identifier": "acme-mcp"}],
+    }})
+    assert row["command"] == "uvx"
+    assert row["args"] == ["acme-mcp"]
+
+
+def test_registry_row_prefers_a_remote_over_a_package():
+    from src.core.mcp_manager import _registry_row
+    row = _registry_row({"server": {
+        "name": "acme/hosted", "description": "",
+        "remotes": [{"type": "streamable-http", "url": "https://x.example/mcp",
+                     "headers": [{"name": "Authorization"}]}],
+        "packages": [{"registryType": "npm", "identifier": "acme"}],
+    }})
+    assert row["transport"] == "http"
+    assert row["url"] == "https://x.example/mcp"
+    assert row["env"] == ["Authorization"]
+
+
+def test_registry_row_without_transport_is_skipped():
+    from src.core.mcp_manager import _registry_row
+    assert _registry_row({"server": {"name": "acme/none", "description": ""}}) is None
+
+
+def test_registry_install_writes_mcp_json_and_keeps_secrets_as_refs(tmp_path, monkeypatch):
+    from src.core import mcp_manager
+    import src.config as config_module
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(mcp_manager, "_registry_rows", {"acme-tools": {
+        "key": "acme-tools", "name": "acme/tools", "description": "", "transport": "stdio",
+        "url": "", "command": "npx", "args": ["-y", "acme"], "target": "npx -y acme",
+        "env": ["ACME_KEY"], "installed": False}})
+    monkeypatch.setattr(config_module, "save_env_var", lambda key, value: True)
+    result = mcp_manager.install_from_registry("acme-tools", {"ACME_KEY": "secret"})
+    assert "installed" in result
+    entry = mcp_manager.project_store()["acme-tools"]
+    assert entry["env"] == {"ACME_KEY": "${ACME_KEY}"}
+    assert "secret" not in str(entry)
+
+
+def test_search_mcp_hub_falls_back_to_the_registry(monkeypatch):
+    from src.core import mcp_manager
+    monkeypatch.setattr(mcp_manager, "search_catalog", lambda q="", limit=20: [])
+
+    async def fake_registry(query="", limit=20):
+        return [{"key": "acme-browser", "name": "acme/browser", "description": "a browser",
+                 "transport": "http", "env": [], "installed": False}]
+
+    monkeypatch.setattr(mcp_manager, "search_registry", fake_registry)
+    out = asyncio.run(tools.search_mcp_hub("browser"))
+    assert "acme-browser" in out
+
+
+def test_ls_pattern_narrows_like_glob(tmp_path, monkeypatch):
+    _root(monkeypatch, tmp_path)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "a.py").write_text("x")
+    (tmp_path / "b.txt").write_text("x")
+    out = asyncio.run(tools.list_files(".", pattern="*.py"))
+    assert "a.py" in out and "b.txt" not in out
+
+
+def test_mcps_takes_an_optional_server_name(monkeypatch):
+    from src.core import mcp_manager
+    fake = type("M", (), {
+        "settings": type("S", (), {"mcp_servers": {
+            "alpha": MCPServerConfig(command="a", enabled=True),
+            "beta": MCPServerConfig(command="b", enabled=True),
+        }})(),
+        "servers": {},
+    })()
+    monkeypatch.setattr(MCPManager, "__new__", lambda cls, *a, **k: fake)
+    out = asyncio.run(tools.list_mcp_servers(name="alpha"))
+    assert list(out) == ["alpha"]
+    MCPManager._instance = None
+
+
+def test_mcps_names_the_missing_server_it_was_asked_for(monkeypatch):
+    fake = type("M", (), {
+        "settings": type("S", (), {"mcp_servers": {
+            "alpha": MCPServerConfig(command="a", enabled=True),
+            "beta": MCPServerConfig(command="b", enabled=True),
+        }})(),
+        "servers": {},
+    })()
+    monkeypatch.setattr(MCPManager, "__new__", lambda cls, *a, **k: fake)
+    out = asyncio.run(tools.list_mcp_servers(name="gamma"))
+    assert out == {"error": "No MCP server named 'gamma'."}
+    MCPManager._instance = None
+
+
+def test_read_returns_the_whole_file_by_default(tmp_path, monkeypatch):
+    _root(monkeypatch, tmp_path)
+    monkeypatch.chdir(tmp_path)
+    body = "".join(f"line {i}\n" for i in range(4000))
+    (tmp_path / "big.txt").write_text(body)
+    out = asyncio.run(tools.read_file("big.txt"))
+    assert out.count("\n") >= 4000
+    assert "end of file" in out
+
+
+def test_read_cuts_a_single_line_that_exceeds_the_cap_and_says_so(tmp_path, monkeypatch):
+    _root(monkeypatch, tmp_path)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "min.js").write_text("x" * 300_000)
+    out = asyncio.run(tools.read_file("min.js", max_chars=1000))
+    assert len(out) < 1200
+    assert "longer than 1000 chars" in out
+    assert "next_offset=" in out

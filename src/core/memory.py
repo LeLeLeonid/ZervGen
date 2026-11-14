@@ -1,4 +1,5 @@
 import asyncio
+import importlib.util
 import json
 import logging
 import os
@@ -176,6 +177,25 @@ class SessionDB:
             return cursor.lastrowid
         self._retry(_insert)
         return msg_id
+
+    def replace_messages(self, session_id: str, messages: List[Dict]) -> None:
+        """Rewrite a session's transcript, so a compaction survives a reload."""
+        now = time.time()
+        rows = [(str(uuid.uuid4()), session_id, str(m.get("role") or "user"),
+                 str(m.get("content") or ""),
+                 str(m.get("tool_name") or m.get("name") or ""), now + i * 0.001)
+                for i, m in enumerate(messages)]
+
+        def _replace(conn):
+            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            conn.executemany(
+                "INSERT INTO messages (id, session_id, role, content, tool_name, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            conn.execute("UPDATE sessions SET message_count = ? WHERE id = ?", (len(rows), session_id))
+            conn.commit()
+
+        self._retry(_replace)
 
     def search(self, query: str, limit: int = 20) -> List[Dict]:
         terms = [t for t in query.lower().split() if t]
@@ -443,7 +463,20 @@ class VectorStore:
         self._vector_dir = vector_dir
         self._client = None
         self._collection = None
-        self._init()
+        self._loaded = False
+
+    @property
+    def enabled(self) -> bool:
+        """Whether vector search would work, without paying the import."""
+        if self._loaded:
+            return self._collection is not None
+        return importlib.util.find_spec("chromadb") is not None
+
+    def _ensure(self) -> None:
+        """Load chromadb on first use; importing it costs over a second."""
+        if not self._loaded:
+            self._loaded = True
+            self._init()
 
     def _init(self) -> None:
         global chromadb
@@ -468,17 +501,20 @@ class VectorStore:
             logger.debug(f"VectorStore init failed: {e}")
 
     def add(self, documents: List[str], metadatas: List[Dict], ids: List[str]) -> None:
+        self._ensure()
         if not self._collection: return
         try: self._collection.add(documents=documents, metadatas=metadatas, ids=ids)
         except Exception as e: logger.debug(f"Vector add failed: {e}")
 
     def delete(self, ids: List[str]) -> None:
+        self._ensure()
         if not self._collection or not ids: return
         try: self._collection.delete(ids=ids)
         except Exception as e: logger.debug(f"Vector delete failed: {e}")
 
     def search(self, query: str, n: int = 10) -> List[Dict]:
         """Return nearest stored facts with their ids."""
+        self._ensure()
         if not self._collection: return []
         try:
             results = self._collection.query(query_texts=[query], n_results=n)
@@ -846,7 +882,7 @@ class MemoryCore:
         stats = {
             "now_count": len(self._short_term),
             "long_term_facts": len(self._kg.get_facts()),
-            "vector_enabled": self._vector._collection is not None,
+            "vector_enabled": self._vector.enabled,
             "bm25_docs": len(self._bm25._docs),
             "blocks": len(self.get_runtime_blocks()),
             "sessions": self._session_db.get_stats().get("sessions", 0),
