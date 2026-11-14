@@ -565,18 +565,20 @@ class SkillRegistry:
 
     @staticmethod
     def _render_index(skills: List[SkillDef], desc_chars: int, matched: set) -> str:
+        """Matched skills get a description; the rest stay names so the index stays small."""
         lines, category = [], None
         for skill in skills:
             group = skill.category or "general"
             if group != category:
                 category = group
                 lines.append(f"{group}:")
+            hit = skill.name in matched
             entry = f"  - {skill.name}"
             if desc_chars and skill.description:
                 entry += ": " + skill.description[:desc_chars]
-            if desc_chars and skill.when_not:
-                entry += f" (not when: {skill.when_not[:desc_chars]})"
-            if skill.name in matched:
+                if hit and skill.when_not:
+                    entry += f" (not when: {skill.when_not[:desc_chars]})"
+            if hit:
                 entry += "  [match]"
             lines.append(entry)
         return "\n".join(lines)
@@ -589,23 +591,28 @@ class SkillRegistry:
                       key=lambda s: (s.category or "general", s.name))
         if not pool:
             return ""
-        head = ("--- SKILL INDEX ---\n"
-                "Load a skill with skill(name) when its description matches the task.")
+        head = ("--- SKILLS ---\n"
+                "skill(\"name\") loads a skill's full instructions; find(\"debug failing test\") searches "
+                "them; skills() lists the categories.")
         budget = max(400, int(budget_chars))
-        shown = pool[:max(1, int(max_skills))]
-        omitted = len(pool) - len(shown)
+        hits = [s for s in pool if s.name in matched]
+        rest = [s for s in pool if s.name not in matched]
+        if hits:
+            head += "\nLoad one of these before acting; it matches this request:\n"
+            head += self._render_index(hits, desc_chars, matched)
+            head += "\nOther skills:"
+        shown = rest[:max(1, int(max_skills))]
+        omitted = len(rest) - len(shown)
         tail = f"\n({omitted} more skills omitted; use find(tags))" if omitted else ""
-        if matched:
-            tail += "\n[match] = relevant to this request; load it before acting."
         for width in (desc_chars, 40, 0):
-            text = f"{head}\n{self._render_index(shown, width, matched)}{tail}"
+            text = f"{head}\n{self._render_index(shown, width, set())}{tail}"
             if len(text) <= budget:
                 return text
-        while shown and len(head) + len(tail) + len(self._render_index(shown, 0, matched)) > budget:
+        while shown and len(head) + len(tail) + len(self._render_index(shown, 0, set())) > budget:
             shown = shown[:-1]
         if not shown:
             return ""
-        return f"{head}\n{self._render_index(shown, 0, matched)}{tail}"
+        return f"{head}\n{self._render_index(shown, 0, set())}{tail}"
 
     def get_body(self, name: str) -> str:
         skill = self.skills.get(name)

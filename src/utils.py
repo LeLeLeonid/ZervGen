@@ -1551,12 +1551,10 @@ def _subdir_hint(base: Path, subdir: str) -> str:
 
 
 def discover_context_files(cwd: str = ".", subdir: str = "") -> str:
-    """Project rules: override file first, then the chain, plus a subdirectory hint."""
+    """Project rules: override file first, then the chain; a subdir adds only its own file."""
     base = Path(cwd).resolve()
     if subdir:
-        hint = _subdir_hint(base, subdir)
-        if hint:
-            return hint
+        return _subdir_hint(base, subdir)
     search = [base]
     cur = base.parent
     while cur != cur.parent and cur.exists():

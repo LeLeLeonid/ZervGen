@@ -251,16 +251,14 @@ def test_ptc_protocol_sends_no_native_tools(tmp_path, monkeypatch):
     assert agent.provider.native_tools == []
 
 
-def test_prompt_reports_degraded_server_with_cached_tools(tmp_path, monkeypatch):
-    from types import SimpleNamespace
+def test_prompt_keeps_tools_when_the_cap_is_tight(tmp_path, monkeypatch):
+    from src.skills_loader import load_role
 
     agent = _agent(tmp_path, monkeypatch, [])
-    agent.settings.prompt_show_mcp_tools = True
-    agent._mcp = SimpleNamespace(servers={"alpha": SimpleNamespace(
-        state="degraded", connected=False, tools={"search": object(), "add": object()})})
-    text = agent._prompt_mcp()
-    assert "alpha: degraded (2 cached tools)" in text
-    assert "call mcp to retry" in text
+    agent.settings.prompt_max_chars = 4000
+    prompt = agent._build_system_prompt(load_role("system"), user_input="fix")
+    assert "--- TOOLS ---" in prompt
+    assert "--- EXECUTION PROTOCOL ---" in prompt
 
 
 
@@ -565,6 +563,18 @@ def test_stagnation_names_spinning_and_oscillation(tmp_path, monkeypatch):
 
     moving = [turn(f'shell({{"command": "grep {i} src/"}})', "10 matches") for i in range(5)]
     assert all(agent._stagnation(x) == "" for x in moving)
+
+    agent._turn_signatures = []
+    assert [agent._stagnation(same) for _ in range(4)] == ["", "", "spinning", "spinning"]
+
+
+def test_repeating_the_same_call_stops_instead_of_spinning(tmp_path, monkeypatch):
+    (tmp_path / "note.txt").write_text("hello", encoding="utf-8")
+    agent = _agent(tmp_path, monkeypatch, ['::read("note.txt")'] * 12, max_steps=20)
+    output = asyncio.run(agent.run("read it forever"))
+    assert agent._run.status is RunStatus.FAILED
+    assert "Stopped" in output and "read" in output
+    assert agent.provider.calls < 12
 
 
 def test_prune_state_caps_files_and_traces(tmp_path, monkeypatch):

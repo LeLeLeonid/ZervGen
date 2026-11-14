@@ -86,15 +86,16 @@ def test_mcp_tools_stay_out_of_the_builtin_list(monkeypatch, tmp_path):
     assert "read" in agent._builtin_names()
 
 
-def test_prompt_marks_mcp_as_a_separate_section(monkeypatch, tmp_path):
+def test_prompt_never_mentions_mcp_tools(monkeypatch, tmp_path):
     agent, _ = _agent(monkeypatch, tmp_path, ["done"])
     server = type("S", (), {"connected": True, "state": "ready", "tools": {"search": {}},
                             "public_names": {"search": "mcp__alpha__search"}})()
-    agent._mcp = type("M", (), {"servers": {"alpha": server}, "_calls": {}})()
-    section = agent._prompt_mcp()
-    assert section.startswith("--- MCP (separate from built-in tools) ---")
-    assert "mcp__alpha__search" in section
-    assert "mcp__alpha__search" not in agent._prompt_tools()
+    agent._mcp = type("M", (), {"servers": {"alpha": server},
+                                "_calls": {"mcp__alpha__search": ("alpha", "search")}})()
+    section = agent._prompt_tools()
+    assert "mcp__alpha__search" not in section
+    assert "mcps" not in section and "mcp_search" not in section
+    assert "read" in section
 
 
 def test_compaction_rewrites_the_session_rows(tmp_path, monkeypatch):

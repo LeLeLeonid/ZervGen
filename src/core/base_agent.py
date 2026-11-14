@@ -164,6 +164,7 @@ class StemAgent:
         self._user_active = False
         self._last_result = None
         self._turn_signatures: List[str] = []
+        self._stagnation_hits = 0
         self._touched_dirs: List[str] = []
         self._cached_system_prompt: Optional[str] = None
         self._compressor = None
@@ -390,15 +391,20 @@ class StemAgent:
         provider = get_provider(getattr(settings, 'provider', 'pollinations'), settings) or get_provider('pollinations', settings)
         return cls(name=role, provider=provider, skill_name=role, settings=settings, mode=mode, memory=memory, initial_history=initial_history)
 
+    BASE_TOOLS = frozenset({
+        "read", "ls", "glob", "grep", "outline", "delegate", "todo",
+        "skill", "find", "skills", "tools", "recall", "remember", "graph", "response",
+    })
+
     def _load_tools(self) -> None:
+        """Every role can inspect, search and delegate; frontmatter adds write, shell and web."""
         role_cfg = load_role(self.skill_name)
-        allowed = {canonical_tool(name) for name in getattr(role_cfg, "tools", []) or []}
-        if self.skill_name == "system" or "all" in allowed:
+        declared = {canonical_tool(name) for name in getattr(role_cfg, "tools", []) or []}
+        if self.skill_name == "system" or "all" in declared:
             allowed = set(TOOL_REGISTRY.keys())
         else:
-            allowed.update({"response", "skill", "find", "skill_hub", "skill_install",
-                            "recall", "graph", "skills", "mcps", "mcp_search",
-                            "skill_external", "tools"})
+            allowed = set(self.BASE_TOOLS) | declared
+            allowed.update({"skill_hub", "skill_install", "skill_external"})
         self.tools = {k: v for k, v in TOOL_REGISTRY.items() if k in allowed}
 
     def _mcp_tools(self) -> Dict[str, Any]:
@@ -442,9 +448,14 @@ class StemAgent:
         protocol = str(getattr(self.settings, "tool_protocol", "auto") or "auto").lower()
         if protocol not in ("native", "auto") or self.provider is None:
             return []
-        if not getattr(self.provider, "supports_native_tools", False):
+        supports = getattr(self.provider, "supports_native_tools", False)
+        if callable(supports):
+            supports = supports()
+        if not supports:
             return []
-        return _native_tool_schemas(self._tool_specs())
+        specs = {k: v for k, v in self._tool_specs().items()
+                 if not self._is_mcp_tool(k) and not k.startswith("mcp")}
+        return _native_tool_schemas(specs)
 
     @staticmethod
     def _native_markup(calls: Iterable[Dict[str, Any]]) -> str:
@@ -695,38 +706,6 @@ class StemAgent:
             logger.debug("Prompt peer cards failed: %s", e)
         return ""
 
-    def _prompt_mcp(self) -> str:
-        """MCP tools live in their own section: they are not built-ins and never mix with them."""
-        if not getattr(self.settings, "mcp_enabled", True) or not self._mcp:
-            return ""
-        if not getattr(self.settings, "prompt_show_mcp_tools", True):
-            return ""
-        budget = max(200, int(getattr(self.settings, "prompt_mcp_chars", 900) or 900))
-        lines: List[str] = []
-        for name, srv in self._mcp.servers.items():
-            if not srv.connected and srv.state not in ("degraded", "dead"):
-                continue
-            names = list((getattr(srv, "public_names", None) or {}).values())
-            if names:
-                lines.append(f"- {name}: {', '.join(names)}")
-            elif srv.connected:
-                lines.append(f"- {name}: {len(srv.tools)} tools")
-            else:
-                lines.append(f"- {name}: {srv.state} ({len(srv.tools)} cached tools) — call mcp to retry")
-        if not lines:
-            return ""
-        header = "--- MCP (separate from built-in tools) ---"
-        kept: List[str] = []
-        used = len(header)
-        for line in lines:
-            if used + len(line) + 1 > budget and kept:
-                break
-            kept.append(line)
-            used += len(line) + 1
-        if len(kept) < len(lines):
-            kept.append(f"- … {len(lines) - len(kept)} more servers, call mcps()")
-        return header + "\n" + "\n".join(kept)
-
     def _prompt_skills(self, user_input: str) -> str:
         """Skill topology: a category-grouped index; bodies load on demand."""
         try:
@@ -741,6 +720,7 @@ class StemAgent:
             visible = [
                 skill for skill in skill_index.visible()
                 if (show_external if skill.external else show_internal)
+                and "mcp" not in skill.tags and not skill.name.startswith("mcp")
             ]
             matched = {
                 skill.name for skill in visible
@@ -771,77 +751,83 @@ class StemAgent:
         return "\n\n".join(blocks)
 
     def _prompt_protocol(self) -> str:
-        """Execution protocol; native backends get the tool-first variant."""
-        text = ZG_PROTOCOL.strip()
-        if self._native_specs():
-            text += ("\n- Native tool calls are enabled: call a tool directly and end with a plain answer."
-                     " Do not print the call as text.")
-        return f"--- EXECUTION PROTOCOL ---\n{text}"
+        """The execution protocol: how a turn calls a tool and how it ends."""
+        return f"--- EXECUTION PROTOCOL ---\n{ZG_PROTOCOL.strip()}"
 
     def _prompt_tools(self, declared_names: set[str] | None = None) -> str:
-        active = {k: v for k, v in self._active_tools().items() if not self._is_mcp_tool(k)}
+        """Every callable tool, the calling convention, and the set that always exists."""
+        active = {k: v for k, v in self._active_tools().items()
+                  if not self._is_mcp_tool(k) and k not in TERMINAL_TOOLS and not k.startswith("mcp")}
         if not active:
             return ""
         subset = {k: v for k, v in active.items() if declared_names is None or k in declared_names}
+        base = ", ".join(sorted(n for n in subset if n in self.BASE_TOOLS))
         if self._native_specs():
-            names = ", ".join(sorted(subset))
             return ("--- TOOLS ---\n"
-                    f"{len(subset)} built-in tools are attached to this request as native functions.\n"
-                    f"{names}\n"
-                    "Call them directly. tools(name) shows one tool's arguments.")
+                    "Attached as native functions: call them directly, never print a call as text.\n"
+                    f"Always available in every role: {base}.\n"
+                    + ", ".join(sorted(subset)))
+        head = ("--- TOOLS ---\n"
+                "Call one per line: `::read(\"src/cli.py\")`, `::shell(\"pytest -q\")`. Arguments bind in order; "
+                "when the order is unclear, name them: `::edit {\"path\": \"a.py\", \"find\": \"x\", \"replace\": \"y\"}`. "
+                f"`tools(\"name\")` prints a signature. Always available in every role: {base}.\n")
         from src.tools import render_tool_index
         budget = max(400, int(getattr(self.settings, "prompt_tools_chars", 2600) or 2600))
-        return ("--- TOOLS ---\n"
-                f"{render_tool_index(subset, budget)}\n"
-                "tools(name) prints one tool's full docstring and arguments.")
+        return head + render_tool_index(subset, budget)
 
     def _prompt_project_rules(self) -> str:
+        """Project rules once, capped: a touched subdirectory may only add new text."""
         try:
             from src.utils import discover_context_files, redact_fast
             text = discover_context_files(".")
             touched = self._touched_dirs[-1] if self._touched_dirs else ""
             if touched and touched not in (".", ""):
                 extra = discover_context_files(".", subdir=touched)
-                if extra:
+                if extra and extra.strip() not in text:
                     text = f"{text}\n{extra}" if text else extra
             if not text:
                 return ""
-            return "--- PROJECT RULES ---\n" + redact_fast(text)
+            budget = max(400, int(getattr(self.settings, "prompt_rules_chars", 1800) or 1800))
+            body = redact_fast(text)
+            if len(body) > budget:
+                body = body[:budget].rsplit("\n", 1)[0] + "\n… read the rest with read(\"AGENTS.md\")"
+            return "--- PROJECT RULES ---\n" + body
         except Exception as e:
             logger.debug("Prompt project rules failed: %s", e)
             return ""
 
+    def prompt_sections(self, role_cfg, user_input: str = "") -> List[Tuple[str, str, int, bool]]:
+        """Every section in prompt order: name, text, drop rank (higher drops first), volatile."""
+        sections = [
+            ("header", self._prompt_header(role_cfg), 0, False),
+            ("protocol", self._prompt_protocol(), 0, False),
+            ("tools", self._prompt_tools(), 1, False),
+            ("skills", self._prompt_skills(user_input), 2, False),
+            ("rules", self._prompt_project_rules(), 3, False),
+            ("forced", self._prompt_forced_skills(), 0, False),
+            ("workspace", self._prompt_workspace(), 4, False),
+            ("memory", self._prompt_memory(user_input), 5, True),
+            ("peers", self._prompt_peer_cards(user_input), 6, True),
+            ("context", f"--- ENVIRONMENT ---\n{get_system_context()}", 7, True),
+            ("run", self._prompt_run(), 8, True),
+        ]
+        return [s for s in sections if s[1]]
+
     def _build_system_prompt(self, role_cfg, user_input: str = "") -> str:
-        """Stable sections first, volatile last, so a provider can cache the prefix."""
-        stable = [
-            ("header", self._prompt_header(role_cfg), 0),
-            ("protocol", self._prompt_protocol(), 0),
-            ("rules", self._prompt_project_rules(), 1),
-            ("tools", self._prompt_tools(), 2),
-            ("mcp", self._prompt_mcp(), 3),
-            ("skills", self._prompt_skills(user_input), 4),
-            ("forced", self._prompt_forced_skills(), 0),
-            ("workspace", self._prompt_workspace(), 1),
-        ]
-        volatile = [
-            ("memory", self._prompt_memory(user_input), 5),
-            ("peers", self._prompt_peer_cards(user_input), 6),
-            ("context", f"--- ENVIRONMENT ---\n{get_system_context()}", 7),
-            ("run", self._prompt_run(), 8),
-        ]
-        self._stable_prefix = "\n\n".join(text for _, text, _ in stable if text)
-        sections = stable + volatile
-        prompt = "\n\n".join(text for _, text, _ in sections if text)
+        """Stable prefix first, volatile tail last; noise is dropped before guidance."""
+        sections = self.prompt_sections(role_cfg, user_input)
+        self._stable_prefix = "\n\n".join(text for _, text, _, volatile in sections if not volatile)
+        prompt = "\n\n".join(text for _, text, _, _ in sections)
         cap = int(getattr(self.settings, "prompt_max_chars", 0) or 0)
         if cap and len(prompt) > cap:
             dropped: set[str] = set()
-            for name, text, priority in sorted(sections, key=lambda s: -s[2]):
+            for name, text, rank, _ in sorted(sections, key=lambda s: -s[2]):
                 if len(prompt) <= cap:
                     break
-                if not text or priority < 1:
+                if rank < 1:
                     continue
                 dropped.add(name)
-                prompt = "\n\n".join(t for n, t, _ in sections if t and n not in dropped)
+                prompt = "\n\n".join(t for n, t, _, _ in sections if n not in dropped)
                 self.trace.record("prompt_drop", self.name, f"{name} ({len(text)} chars)")
             if len(prompt) > cap:
                 keep = prompt.rfind("\n\n", 0, cap)
@@ -893,10 +879,8 @@ class StemAgent:
         self._turn_signatures.append(hashlib.sha1(signature.encode("utf-8", "ignore")).hexdigest()[:12])
         sigs = self._turn_signatures[-6:]
         if len(sigs) >= 3 and len(set(sigs[-3:])) == 1:
-            self._turn_signatures.clear()
             return "spinning"
         if len(sigs) >= 4 and sigs[-4] == sigs[-2] and sigs[-3] == sigs[-1] and sigs[-1] != sigs[-2]:
-            self._turn_signatures.clear()
             return "oscillation"
         return ""
 
@@ -1685,6 +1669,7 @@ class StemAgent:
         self._sensor_attempts = 0
         self._empty_total = 0
         self._turn_signatures = []
+        self._stagnation_hits = 0
         self._file_baseline = {}
         if not task or not isinstance(task, str):
             return "Error: Invalid task"
@@ -1905,10 +1890,17 @@ class StemAgent:
                     shape = self._stagnation(self._call_shape(intent) + "\n---\n" + stable.strip()[:400])
                     if shape:
                         self._set_status(False)
+                        self._stagnation_hits += 1
                         self._log(self.name, f"Stagnation detected: {shape}", "loop", self.mode)
+                        if self._stagnation_hits >= 3:
+                            calls = ", ".join(c.name for c in (intent.calls or [])) or "the same code"
+                            return self._finish(RunStatus.FAILED, (
+                                f"Stopped: {shape} — repeated {calls} three times with the same result "
+                                f"and no progress. Nothing was completed. Tell me what to change, or "
+                                f"narrow the task."))
                         self.history.append({"role": "user", "content": (
-                            f"[LOOP] Stagnation detected: {shape}. The last turns repeated without progress. "
-                            "Different tool, different arguments, or answer with what you have.")})
+                            f"[LOOP] Stagnation detected: {shape}. That call already ran and its result is above. "
+                            "Do not repeat it. Use a different tool, different arguments, or answer with what you have.")})
                         self.invalidate_cache()
                         continue
                     self._set_status(False)

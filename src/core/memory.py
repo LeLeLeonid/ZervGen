@@ -939,12 +939,14 @@ class PeerCard:
     confidence: float = 0.5
 
     def to_prompt_block(self) -> str:
+        """One compact card; MCP tools never reach the prompt."""
         lines = [f"### {self.agent_id}/{self.domain}"]
-        if self.facts: lines.append("Facts: " + ", ".join(self.facts[:5]).replace("→", "->").replace("←", "<-"))
-        if self.strategies: lines.append("Works: " + ", ".join(self.strategies[:3]).replace("→", "->").replace("←", "<-"))
-        if self.anti_patterns: lines.append("Avoid: " + ", ".join(self.anti_patterns[:3]).replace("→", "->").replace("←", "<-"))
+        if self.facts: lines.append("Facts: " + ", ".join(self.facts[:3]).replace("→", "->").replace("←", "<-"))
+        if self.strategies: lines.append("Works: " + ", ".join(self.strategies[:2]).replace("→", "->").replace("←", "<-"))
+        if self.anti_patterns: lines.append("Avoid: " + ", ".join(self.anti_patterns[:2]).replace("→", "->").replace("←", "<-"))
         ranked = sorted(((name, rate) for name, rate in self.tool_preferences.items()
-                         if self.tool_samples.get(name, 0) >= 3), key=lambda item: -item[1])[:5]
+                         if self.tool_samples.get(name, 0) >= 3
+                         and not name.startswith(("mcp", "mcp_"))), key=lambda item: -item[1])[:5]
         if ranked:
             lines.append("Tools: " + ", ".join(f"{name} {rate:.2f}" for name, rate in ranked))
         return "\n".join(lines)
@@ -999,17 +1001,20 @@ class PeerCards:
         self._file.write_text(json.dumps(data, indent=2, ensure_ascii=False), "utf-8")
 
     def get_relevant(self, agent_id: str, query: str = "", limit: int = 2) -> List[PeerCard]:
-        cards = self._configured() + list(self._cards.values())
+        """Configured cards always show; a learned card must share a word with the request."""
+        configured = self._configured()
+        learned = list(self._cards.values())
         q = set(re.findall(r"[a-z0-9_\-]+", query.lower()))
         scored = []
-        for card in cards:
+        for card in configured:
+            scored.append((2.0 + max(0.0, min(1.0, card.confidence)), card))
+        for card in learned:
             tokens = set(re.findall(r"[a-z0-9_\-]+", (card.domain + " " + " ".join(card.facts + card.strategies + card.anti_patterns)).lower()))
             overlap = len(q & tokens)
-            agent_bonus = 2.0 if card.agent_id == agent_id else 0.0
-            confidence = max(0.0, min(1.0, card.confidence))
-            if not overlap and not agent_bonus and confidence < 0.9:
+            if not overlap:
                 continue
-            scored.append((agent_bonus + overlap + confidence, card))
+            agent_bonus = 2.0 if card.agent_id == agent_id else 0.0
+            scored.append((agent_bonus + overlap + max(0.0, min(1.0, card.confidence)), card))
         scored.sort(key=lambda x: x[0], reverse=True)
         return [c for _, c in scored[:limit]]
 

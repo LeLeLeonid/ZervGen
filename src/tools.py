@@ -247,6 +247,7 @@ async def _ddg_lite(query: str, limit: int) -> List[Dict[str, str]]:
 
 
 async def fetch_url(url: str, parse_html: bool = True, max_chars: int = 8000, timeout: float = 30.0, **kwargs) -> str:
+    """Fetch a URL and return its text, HTML stripped when `parse_html`."""
     try:
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https"):
@@ -408,6 +409,7 @@ async def shell_exec(command: str, timeout: int = 60) -> ShellResult:
 
 
 async def shell(command: str, timeout: int = 60) -> str:
+    """Run a shell command in the project root; returns exit code and output."""
     return (await shell_exec(command, timeout)).to_text()
 
 
@@ -567,6 +569,7 @@ async def read_file(path: str, offset: int = 0, max_chars: int = 0) -> str:
 
 
 async def write_file(path: str, content: str = "") -> str:
+    """Create or overwrite a file with `content`; read an existing file first."""
     if not path or not isinstance(path, str) or not _is_safe_path(path):
         return "Error: Invalid path or access denied."
     if Path(path).exists() and not _was_read(path):
@@ -587,6 +590,7 @@ async def write_file(path: str, content: str = "") -> str:
 
 
 async def append_file(path: str, content: str = "") -> str:
+    """Append `content` to a file, creating it when missing."""
     if not path or not isinstance(path, str) or not _is_safe_path(path):
         return "Error: Invalid path or access denied."
     try:
@@ -599,6 +603,7 @@ async def append_file(path: str, content: str = "") -> str:
 
 
 async def edit_file(path: str, find: str, replace: str = "", replace_all: bool = False) -> str:
+    """Replace `find` with `replace` in a file; errors when `find` is absent."""
     if not path or not isinstance(path, str) or not _is_safe_path(path):
         return "Error: Invalid path or access denied."
     try:
@@ -837,6 +842,7 @@ async def type_text(text: str) -> str:
 
 
 async def find_skill(tags) -> str:
+    """Search skills by tag or keyword, e.g. find("debug test"); no args lists all."""
     from src.skills_loader import skill_index
     visible = skill_index.visible()
     if tags is None:
@@ -862,6 +868,7 @@ async def find_skill(tags) -> str:
 
 
 async def list_skills() -> str:
+    """List every skill by category and the agent roles available to delegate to."""
     from src.skills_loader import skill_index, get_all_roles
     roles = ", ".join(get_all_roles().keys())
     groups = skill_index.categories()
@@ -1563,15 +1570,19 @@ def _bare_signature(func: Any) -> str:
     ))
 
 
+CORE_TOOLS = ("read", "write", "edit", "shell", "grep", "glob", "ls", "fetch", "delegate", "tools")
+
+
 def render_tool_index(tools: dict, budget_chars: int = 2600) -> str:
-    """Tool index that degrades to fit: docs, then signatures, then names."""
+    """Core tools keep a signature and a one-line doc; the rest shrink to their names."""
     entries = sorted(((name, _bare_signature(func), " ".join((inspect.getdoc(func) or "").split()))
                       for name, func in tools.items()), key=lambda entry: entry[0])
-    for doc_chars, with_sig in ((70, True), (40, True), (0, True), (0, False)):
-        lines = []
-        for name, sig, doc in entries:
-            head = f"- {name}{sig if with_sig else ''}"
-            lines.append(head + (f": {_clip_doc(doc, doc_chars)}" if doc_chars and doc else ""))
+    core = [e for e in entries if e[0] in CORE_TOOLS]
+    rest = [e for e in entries if e[0] not in CORE_TOOLS]
+    for doc_chars, rest_sig in ((70, True), (70, False), (40, False), (0, False)):
+        lines = [f"- {name}{sig}" + (f": {_clip_doc(doc, doc_chars)}" if doc_chars and doc else "")
+                 for name, sig, doc in core]
+        lines += [f"- {name}{sig}" if rest_sig else f"- {name}" for name, sig, _ in rest]
         text = "\n".join(lines)
         if len(text) <= budget_chars:
             return text
