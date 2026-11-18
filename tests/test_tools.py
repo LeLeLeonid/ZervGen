@@ -692,3 +692,70 @@ def test_read_cuts_a_single_line_that_exceeds_the_cap_and_says_so(tmp_path, monk
     assert len(out) < 1200
     assert "longer than 1000 chars" in out
     assert "next_offset=" in out
+
+
+def test_mcp_schema_keyword_parameter_does_not_break_the_wrapper():
+    schema = {"type": "object",
+              "properties": {"from": {"type": "string"}, "body-text": {"type": "string"}},
+              "required": ["from"]}
+    sig = tools._schema_signature("send_message", schema)
+    assert "from_" in sig.parameters and "body_text" in sig.parameters
+    assert tools._schema_aliases(schema) == {"from_": "from", "body_text": "body-text"}
+
+    seen = {}
+
+    async def wrapper(**kwargs):
+        aliases = tools._schema_aliases(schema)
+        seen.update({aliases.get(k, k): v for k, v in kwargs.items()})
+        return "ok"
+
+    wrapper.__signature__ = sig
+    asyncio.run(wrapper(**{"from_": "alice", "body_text": "hi"}))
+    assert seen == {"from": "alice", "body-text": "hi"}
+
+
+def test_native_schema_keeps_the_server_property_names():
+    schema = {"type": "object", "properties": {"from": {"type": "string"}}, "required": ["from"]}
+
+    async def wrapper(**kwargs):
+        return "ok"
+
+    wrapper.__mcp_schema__ = schema
+    wrapper.__doc__ = "[MCP] send"
+    spec = tools._native_tool_schemas({"send_message": wrapper})[0]
+    assert list(spec["parameters"]["properties"]) == ["from"]
+    assert spec["parameters"]["required"] == ["from"]
+
+
+def test_mcp_wrapper_survives_schema_keys_python_cannot_spell():
+    schema = {"type": "object",
+              "properties": {"from": {"type": "string"}, "to": {"type": "string"},
+                             "class": {"type": "integer"}},
+              "required": ["from", "to"]}
+    sig = tools._schema_signature("send_message", schema)
+    assert list(sig.parameters) == ["from_", "to", "class_"]
+    assert tools._schema_aliases(schema) == {"from_": "from", "class_": "class"}
+
+    seen = {}
+
+    async def wrapper(**kwargs):
+        aliases = tools._schema_aliases(schema)
+        seen.update({aliases.get(k, k): v for k, v in kwargs.items()})
+        return "ok"
+
+    wrapper.__signature__ = sig
+    asyncio.run(wrapper(**{"from_": "alice", "to": "bob"}))
+    assert seen == {"from": "alice", "to": "bob"}
+
+
+def test_mcp_wrapper_keeps_a_raw_schema_key_called_from():
+    seen = {}
+
+    async def wrapper(**kwargs):
+        seen.update(kwargs)
+        return "ok"
+
+    wrapper.__signature__ = tools._schema_signature(
+        "send_message", {"type": "object", "properties": {"from": {"type": "string"}}})
+    asyncio.run(wrapper(**{"from": "alice"}))
+    assert seen == {"from": "alice"}

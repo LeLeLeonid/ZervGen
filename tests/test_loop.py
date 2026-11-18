@@ -859,3 +859,205 @@ def test_response_value_is_shown_when_stream_carried_only_prose(monkeypatch):
 
 
 
+
+
+def test_auto_await_leaves_calls_inside_a_concurrency_argument_alone(monkeypatch, tmp_path):
+    agent = _sandbox_agent(monkeypatch, tmp_path)
+    names = {"read", "shell"}
+    code = agent._auto_await_tools('rs = await asyncio.gather(*[read(f) for f in files])', names)
+    assert "await await" not in code
+    assert "[await read(f) for f in files]" not in code
+    assert "gather(*[read(f) for f in files])" in code
+
+
+def test_auto_await_still_awaits_a_bare_tool_call(monkeypatch, tmp_path):
+    agent = _sandbox_agent(monkeypatch, tmp_path)
+    code = agent._auto_await_tools('x = read("a")\nprint(x)', {"read"})
+    assert "x = await read('a')" in code
+
+
+def test_auto_await_does_not_double_await(monkeypatch, tmp_path):
+    agent = _sandbox_agent(monkeypatch, tmp_path)
+    code = agent._auto_await_tools('x = await read("a")\ny = await read("b")', {"read"})
+    assert "await await" not in code
+
+
+def test_auto_await_skips_gather_arguments(monkeypatch, tmp_path):
+    agent = _sandbox_agent(monkeypatch, tmp_path)
+    code = agent._auto_await_tools('rs = await asyncio.gather(read("a"), read("b"))', {"read"})
+    assert code.count("await") == 1
+
+
+def test_stop_cancels_child_tasks_and_leaves_none_running():
+    from src.core.orchestrator import Orchestrator
+
+    async def drive():
+        orch = object.__new__(Orchestrator)
+        orch._child_tasks = set()
+        orch.interrupt_event = asyncio.Event()
+        steps = {"n": 0, "cancelled": 0}
+
+        async def child():
+            try:
+                while True:
+                    steps["n"] += 1
+                    await asyncio.sleep(0.02)
+            except asyncio.CancelledError:
+                steps["cancelled"] += 1
+                raise
+
+        parent = asyncio.create_task(orch._await_children([child(), child()]))
+        await asyncio.sleep(0.1)
+        parent.cancel()
+        try:
+            await parent
+        except asyncio.CancelledError:
+            pass
+        await asyncio.sleep(0.3)
+        frozen = steps["n"]
+        await asyncio.sleep(0.3)
+        return frozen, steps, len(orch._child_tasks)
+
+    frozen, steps, live = asyncio.run(drive())
+    assert steps["n"] == frozen
+    assert steps["cancelled"] == 2
+    assert live == 0
+
+
+def test_child_agent_obeys_a_stop_that_arrived_before_it_started(monkeypatch, tmp_path):
+    agent = _sandbox_agent(monkeypatch, tmp_path)
+
+    class Parent:
+        interrupt_event = asyncio.Event()
+
+    agent._is_delegated = True
+    agent.orchestrator = Parent()
+    assert agent._child_stopped() is False
+    Parent.interrupt_event.set()
+    assert agent._child_stopped() is True
+
+
+def test_auto_await_leaves_calls_inside_a_concurrency_argument_alone(monkeypatch, tmp_path):
+    agent = _sandbox_agent(monkeypatch, tmp_path)
+    code = 'files = ["a"]\nrs = await asyncio.gather(*[read(f) for f in files])'
+    transformed = agent._auto_await_tools(code, {"read"})
+    assert "[await read(f) for f in files]" not in transformed
+    assert "gather(*[read(f) for f in files])" in transformed
+
+
+def test_auto_await_still_wraps_a_bare_call(monkeypatch, tmp_path):
+    agent = _sandbox_agent(monkeypatch, tmp_path)
+    assert "x = await read('a')" in agent._auto_await_tools('x = read("a")', {"read"})
+
+
+def test_auto_await_does_not_double_wrap_an_awaited_call(monkeypatch, tmp_path):
+    agent = _sandbox_agent(monkeypatch, tmp_path)
+    code = agent._auto_await_tools('x = await read("a")', {"read"})
+    assert code.count("await") == 1
+
+
+def test_auto_await_never_wraps_gather_arguments(monkeypatch, tmp_path):
+    agent = _sandbox_agent(monkeypatch, tmp_path)
+    code = agent._auto_await_tools('rs = await asyncio.gather(read("a"), read("b"))', {"read"})
+    assert code.count("await") == 1
+
+
+def test_stop_cancels_child_tasks_and_leaves_none_running():
+    from src.core.orchestrator import Orchestrator
+
+    async def drive():
+        orch = object.__new__(Orchestrator)
+        orch._child_tasks = set()
+        orch.agents = {}
+        orch.interrupt_event = asyncio.Event()
+        state = {"cancelled": 0}
+
+        async def child():
+            try:
+                while True:
+                    await asyncio.sleep(0.02)
+            except asyncio.CancelledError:
+                state["cancelled"] += 1
+                raise
+
+        task = asyncio.create_task(orch._await_children([child(), child()]))
+        await asyncio.sleep(0.1)
+        assert orch.live_children() == 1
+        orch.request_interrupt()
+        result = await asyncio.wait_for(task, timeout=5)
+        return result, state, orch.live_children()
+
+    result, state, live = asyncio.run(drive())
+    assert result is None
+    assert state["cancelled"] == 2
+    assert live == 0
+
+
+def test_prompt_never_carries_an_unclosed_fence(monkeypatch, tmp_path):
+    from src.config import load_config
+    from src.skills_loader import load_role
+
+    monkeypatch.chdir(Path(__file__).resolve().parents[1])
+    cfg = load_config()
+    cfg.memory_enabled = False
+    cfg.prompt_auto_trigger_skills = False
+    agent = StemAgent(name="system", provider=None, skill_name="system", settings=cfg, mode="BUILD")
+    prompt = agent._build_system_prompt(load_role("system"))
+    fences = sum(1 for line in prompt.splitlines() if line.lstrip().startswith("```"))
+    assert fences % 2 == 0
+
+
+def test_truncated_rules_do_not_swallow_what_follows(monkeypatch, tmp_path):
+    from src.config import load_config
+    from src.skills_loader import load_role
+
+    root = Path(__file__).resolve().parents[1]
+    monkeypatch.chdir(root)
+    cfg = load_config()
+    cfg.memory_enabled = False
+    cfg.prompt_auto_trigger_skills = False
+    agent = StemAgent(name="system", provider=None, skill_name="system", settings=cfg, mode="BUILD")
+    rules = agent._prompt_project_rules()
+    fences = sum(1 for line in rules.splitlines() if line.lstrip().startswith("```"))
+    assert fences % 2 == 0, "a truncated rule section must close its fence"
+
+
+def test_delegated_agent_does_not_resend_its_role_prompt_as_history(monkeypatch, tmp_path):
+    from src.core.orchestrator import Orchestrator
+    from src.skills_loader import load_role
+
+    monkeypatch.chdir(tmp_path)
+    cfg = GlobalSettings()
+    cfg.memory_enabled = False
+    cfg.prompt_auto_trigger_skills = False
+
+    class Provider:
+        name = "rec"
+        model = "rec-1"
+        native_tools = []
+        supports_native_tools = False
+        _last_cost = 0.0
+
+        def request_timeout(self, default):
+            return default
+
+        def clone(self):
+            return self
+
+        async def generate_text(self, messages, system, on_token=None):
+            captured["messages"] = messages
+            captured["system"] = system
+            return "done"
+
+    captured = {}
+    orch = Orchestrator(provider=Provider(), settings=cfg, mode="BUILD")
+    orch._silent = True
+    orch._set_status = lambda *a, **k: None
+    orch._log = lambda *a, **k: None
+    orch.history = [{"role": "user", "content": "earlier"}]
+    asyncio.run(orch._handle_delegation({"agent_name": "code", "task": "do it"}))
+
+    role_prompt = (load_role("code") or load_role("system")).prompt
+    history = captured["messages"]
+    assert not [m for m in history if m.get("role") == "system"]
+    assert captured["system"].count(role_prompt.strip()[:60]) == 1

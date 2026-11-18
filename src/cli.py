@@ -477,11 +477,7 @@ class ZervGenCLI:
         @kb.add("c-c")
         def _(event):
             if self._agent_running:
-                if self.orchestrator:
-                    self.orchestrator.request_interrupt()
-                t = getattr(self, "_agent_task", None)
-                if t and not t.done():
-                    t.cancel()
+                self._halt_run()
             else:
                 self._should_exit = True
                 self._quit_requested = True
@@ -497,11 +493,7 @@ class ZervGenCLI:
         @kb.add("c-z")
         def _(event):
             if self._agent_running:
-                if self.orchestrator:
-                    self.orchestrator.request_interrupt()
-                t = getattr(self, "_agent_task", None)
-                if t and not t.done():
-                    t.cancel()
+                self._halt_run()
             self._should_exit = True
             self._quit_requested = True
             event.app.exit()
@@ -878,13 +870,22 @@ class ZervGenCLI:
         return "\n".join(lines) or "Nothing to show."
 
     def _halt_run(self) -> bool:
-        """Stop the active run now: the interrupt flag plus task cancellation."""
-        if not self.orchestrator or not (self._agent_task and not self._agent_task.done()):
+        """Stop the active run and every subagent, even when the parent task already ended."""
+        if not self.orchestrator:
+            CC.print("[yellow]Nothing is running.[/yellow]")
+            return True
+        live = len(getattr(self.orchestrator, "_child_tasks", ()) or ())
+        running = bool(self._agent_task and not self._agent_task.done())
+        if not running and not live:
             CC.print("[yellow]Nothing is running.[/yellow]")
             return True
         self.orchestrator.request_interrupt()
-        self._agent_task.cancel()
-        CC.print("[bold yellow]Run stopped.[/bold yellow]")
+        if running:
+            self._agent_task.cancel()
+        if live:
+            CC.print(f"[bold yellow]Stopped the run and {live} subagent task(s).[/bold yellow]")
+        else:
+            CC.print("[bold yellow]Run stopped.[/bold yellow]")
         return True
 
     def _cmd_rename(self, args: Optional[str] = None) -> bool:
@@ -2524,9 +2525,7 @@ class ZervGenCLI:
                             self._app.exit()
                         return
                     elif text.lower() in ("/stop", "stop"):
-                        if self._agent_task and not self._agent_task.done():
-                            self.orchestrator.request_interrupt()
-                            self._agent_task.cancel()
+                        self._halt_run()
                     elif text.startswith("/"):
                         if self._safe_midrun(text):
                             await self.handle_system_command(text)

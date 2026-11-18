@@ -186,7 +186,7 @@ ZG_PROTOCOL = """
 Answer in plain text when the task is done; that ends the turn.
 Call a tool when you need something you do not have:
 1. One call per line: `::read("src/cli.py", 0, 4000)`, `::shell("pytest -q")`. Arguments bind in order. When the order is unclear, name them: `::edit {"path": "a.py", "find": "x", "replace": "y"}` — one line, valid JSON, no raw newlines.
-2. A ```python block when you need a loop, parallel calls, or a multi-line shell command. A heredoc goes inside a Python string there.
+2. A fenced block tagged `python` when you need a loop, parallel calls, or a multi-line shell command. A heredoc goes inside a Python string there.
 3. Native tool calls when your provider offers them.
 These are your tools. Guessing a name that is not in --- TOOLS --- is a hallucination; `tools("name")` prints the exact signature.
 Read the whole file before you change it: `read(path)` returns it in one call and the tail says if more remains.

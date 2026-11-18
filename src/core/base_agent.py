@@ -20,7 +20,8 @@ from rich.text import Text
 from src.config import MODES, GlobalSettings, load_config, ZG_PROTOCOL
 from src.core.provider import AIProvider, get_provider, is_provider_fault
 from src.skills_loader import load_role, SkillEngine
-from src.tools import TOOL_NAMES, TOOL_REGISTRY, current_agent, shell_exec, _mcp_schema, _schema_signature, _schema_doc, _native_tool_schemas
+from src.tools import (TOOL_NAMES, TOOL_REGISTRY, current_agent, shell_exec, _mcp_schema,
+                       _schema_aliases, _schema_signature, _schema_doc, _native_tool_schemas)
 from src.utils import get_system_context, sanitize_for_prompt, generate_random_delimiter, count_tokens, add_global_tokens, add_provider_tokens, context_ceiling
 from src.core.runtime import (
     Run, Artifact, RunStatus, Task,
@@ -418,7 +419,10 @@ class StemAgent:
             spec = (getattr(server, "tools", {}) or {}).get(tool_name)
             if public in tools or spec is None:
                 continue
-            tools[public] = self._make_mcp_wrapper(tool_name, spec, server_name)
+            try:
+                tools[public] = self._make_mcp_wrapper(tool_name, spec, server_name)
+            except Exception as e:
+                logger.debug("MCP wrapper %s skipped: %s", public, e)
         return tools
 
     def _is_mcp_tool(self, name: str) -> bool:
@@ -522,14 +526,21 @@ class StemAgent:
     def _make_mcp_wrapper(self, tool_name: str, spec: Any = None, server: str = ""):
         """Wrap one MCP tool, publishing the server's real parameter schema."""
         mcp = self._mcp
+        schema = _mcp_schema(spec)
+        aliases = _schema_aliases(schema)
+
         async def _mcp_call(**kwargs):
             args = kwargs if kwargs else {}
             if "arguments" in args and isinstance(args["arguments"], dict) and len(args) == 1:
                 args = args["arguments"]
+            if aliases:
+                args = {aliases.get(k, k): v for k, v in args.items()}
             return await mcp.execute_tool(tool_name, args, server=server or None)
-        schema = _mcp_schema(spec)
+
         _mcp_call.__signature__ = _schema_signature(tool_name, schema)
         _mcp_call.__doc__ = _schema_doc(tool_name, schema, spec)
+        _mcp_call.__mcp_schema__ = schema
+        _mcp_call.__mcp_aliases__ = aliases
         return _mcp_call
 
     async def cleanup(self) -> None:
@@ -551,6 +562,14 @@ class StemAgent:
 
     def request_interrupt(self) -> None:
         self.interrupt_event.set()
+
+    def _child_stopped(self) -> bool:
+        """A delegated agent obeys the orchestrator's stop even when it starts after /stop."""
+        if not self._is_delegated:
+            return False
+        parent = self.orchestrator
+        event = getattr(parent, "interrupt_event", None) if parent is not None else None
+        return bool(event is not None and event.is_set())
     
     def invalidate_cache(self):
         self._cached_system_prompt = None
@@ -790,7 +809,9 @@ class StemAgent:
             budget = max(400, int(getattr(self.settings, "prompt_rules_chars", 1800) or 1800))
             body = redact_fast(text)
             if len(body) > budget:
-                body = body[:budget].rsplit("\n", 1)[0] + "\n… read the rest with read(\"AGENTS.md\")"
+                from src.utils import balance_fences
+                body = balance_fences(body[:budget].rsplit("\n", 1)[0])
+                body += "\n… read the rest with read(\"AGENTS.md\")"
             return "--- PROJECT RULES ---\n" + body
         except Exception as e:
             logger.debug("Prompt project rules failed: %s", e)
@@ -961,7 +982,10 @@ class StemAgent:
         excluded = set()
         for n in ast.walk(tree):
             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr in conc:
-                excluded.update(id(a) for a in n.args if isinstance(a, ast.Call))
+                for arg in list(n.args) + [k.value for k in n.keywords]:
+                    for inner in ast.walk(arg):
+                        if isinstance(inner, ast.Call):
+                            excluded.add(id(inner))
         awaited = {id(n.value) for n in ast.walk(tree) if isinstance(n, ast.Await)}
         class _AA(ast.NodeTransformer):
             def visit_Call(self, node):
@@ -1662,6 +1686,8 @@ class StemAgent:
         return self._finish(RunStatus.DONE, answer)
 
     async def run(self, task: str) -> str:
+        if self._child_stopped():
+            return "Stopped by user."
         self.interrupt_event.clear()
         self._tripwire_errors = {}
         self._terminal_calls.clear()
@@ -1854,7 +1880,7 @@ class StemAgent:
                         self.history.append({"role": "assistant", "content": response})
                     self._log(self.name, hint, "ptc_error", self.mode)
                     self.history.append({"role": "user", "content":
-                                         f"[LOOP] {hint} Emit a ```python block, a ::name(args) line, or a plain final answer now."})
+                                         f"[LOOP] {hint} Emit a fenced python block, a ::name(args) line, or a plain final answer now."})
                     self.invalidate_cache()
                     continue
                 self._empty_total = 0
@@ -1922,7 +1948,7 @@ class StemAgent:
                     if response.strip():
                         self.history.append({"role": "assistant", "content": response})
                     self.history.append({"role": "user", "content":
-                                         "[LOOP] That message carried no answer. Emit a ```python block, a ::name(args) line, or a plain final answer."})
+                                         "[LOOP] That message carried no answer. Emit a fenced python block, a ::name(args) line, or a plain final answer."})
                     self.invalidate_cache()
                     continue
                 queued, terminal = await self._verify_or_repair()

@@ -7,6 +7,7 @@ import subprocess
 import platform
 import time
 import inspect
+import keyword
 import re
 import uuid
 import base64
@@ -1441,6 +1442,14 @@ def _native_tool_schemas(tools: dict) -> List[Dict[str, Any]]:
              dict: "object", str: "string"}
     schemas = []
     for name, func in (tools or {}).items():
+        raw = getattr(func, "__mcp_schema__", None)
+        if isinstance(raw, dict) and isinstance(raw.get("properties"), dict):
+            params: Dict[str, Any] = {"type": "object", "properties": raw["properties"]}
+            if raw.get("required"):
+                params["required"] = list(raw["required"])
+            doc = " ".join((inspect.getdoc(func) or "").split())
+            schemas.append({"name": name, "description": doc[:240], "parameters": params})
+            continue
         try:
             sig = inspect.signature(func)
         except (TypeError, ValueError):
@@ -1480,8 +1489,38 @@ def _mcp_schema(spec: Any) -> Dict[str, Any]:
     return schema if isinstance(schema, dict) else {}
 
 
+def _param_alias(name: str) -> str:
+    """Spell a schema property as a Python parameter: `from` becomes `from_`."""
+    safe = re.sub(r"\W", "_", str(name)) or "_"
+    if safe[0].isdigit():
+        safe = f"_{safe}"
+    while safe in ("self", "cls") or keyword.iskeyword(safe) or not safe.isidentifier():
+        safe = f"{safe}_"
+    return safe
+
+
+def _schema_names(schema: Dict[str, Any]) -> List[tuple]:
+    """One (alias, real) pair per property, aliases deduped so the signature always builds."""
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return []
+    pairs, used = [], set()
+    for arg in properties:
+        alias = _param_alias(arg)
+        while alias in used:
+            alias = f"{alias}_"
+        used.add(alias)
+        pairs.append((alias, arg))
+    return pairs
+
+
+def _schema_aliases(schema: Dict[str, Any]) -> Dict[str, str]:
+    """Alias to real name, only for properties whose name Python cannot spell."""
+    return {alias: real for alias, real in _schema_names(schema) if alias != real}
+
+
 def _schema_signature(name: str, schema: Dict[str, Any]) -> inspect.Signature:
-    """Give an MCP wrapper a real signature so the model sees its parameters."""
+    """Give an MCP wrapper a real signature so the model sees every parameter."""
     properties = schema.get("properties")
     if not isinstance(properties, dict):
         return inspect.Signature()
@@ -1490,15 +1529,19 @@ def _schema_signature(name: str, schema: Dict[str, Any]) -> inspect.Signature:
     required = set(schema.get("required") or [])
     defaults = {bool: False, int: 0, float: 0.0, str: "", list: [], dict: {}}
     params = []
-    for arg, meta in properties.items():
-        kind = kinds.get(str((meta or {}).get("type")), str)
-        if arg in required:
-            params.append(inspect.Parameter(arg, inspect.Parameter.KEYWORD_ONLY, annotation=kind))
-        else:
-            default = (meta or {}).get("default", defaults[kind])
-            params.append(inspect.Parameter(arg, inspect.Parameter.KEYWORD_ONLY, default=default, annotation=kind))
+    for alias, real in _schema_names(schema):
+        meta = properties.get(real) or {}
+        kind = kinds.get(str(meta.get("type")), str)
+        try:
+            if real in required:
+                params.append(inspect.Parameter(alias, inspect.Parameter.KEYWORD_ONLY, annotation=kind))
+            else:
+                default = meta.get("default", defaults[kind])
+                params.append(inspect.Parameter(alias, inspect.Parameter.KEYWORD_ONLY, default=default, annotation=kind))
+        except (ValueError, TypeError):
+            continue
     try:
-        return inspect.Signature(params)
+        return inspect.Signature(params, return_annotation=str)
     except ValueError:
         return inspect.Signature()
 

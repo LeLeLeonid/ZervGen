@@ -63,6 +63,7 @@ class Orchestrator(StemAgent):
             renderer=renderer,
         )
         self.agents: Dict[str, StemAgent] = {}
+        self._child_tasks: set = set()
         self._last_agent_id: Optional[str] = None
         self._user_active = True
         self._active_session_id: Optional[str] = None
@@ -174,9 +175,41 @@ class Orchestrator(StemAgent):
         return await self.run_task(goal, self.mode)
     
     def request_interrupt(self) -> None:
+        """Stop this agent, every spawned child agent, and every task waiting on them."""
         for agent in self.agents.values():
             agent.request_interrupt()
+        for task in tuple(self._child_tasks):
+            if not task.done():
+                task.cancel()
         super().request_interrupt()
+
+    def live_children(self) -> int:
+        """Child tasks still running; /stop reports this so it never claims a clean stop."""
+        return len([task for task in self._child_tasks if not task.done()])
+
+    def _track(self, task: asyncio.Task) -> asyncio.Task:
+        """Keep a handle on a child task so /stop can cancel it later."""
+        self._child_tasks.add(task)
+        task.add_done_callback(self._child_tasks.discard)
+        return task
+
+    async def _await_children(self, coros: List[Any]) -> Optional[List[Any]]:
+        """Run child agents to completion; a stop cancels every one and leaves none running."""
+        running = self._track(asyncio.ensure_future(asyncio.gather(*coros, return_exceptions=True)))
+        stop = asyncio.ensure_future(self.interrupt_event.wait())
+        try:
+            done, _ = await asyncio.wait({running, stop}, return_when=asyncio.FIRST_COMPLETED)
+            if running in done and not running.cancelled():
+                try:
+                    return list(running.result())
+                except asyncio.CancelledError:
+                    return None
+            return None
+        finally:
+            for task in (running, stop):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(running, stop, return_exceptions=True)
 
     def _child_status(self, role_name: str):
         """Relay a child's status line through the CLI, tagged with its role."""
@@ -390,18 +423,12 @@ End with exactly one line: GRADE: [1-5]"""
                     for start in range(0, len(wave_tasks), limit):
                         batch = wave_tasks[start:start + limit]
                         self._set_status(True, f"orchestrator · waiting on {len(batch)} agent(s)")
-                        stop = asyncio.ensure_future(self.interrupt_event.wait())
-                        running = asyncio.ensure_future(asyncio.gather(*batch, return_exceptions=True))
-                        done, _ = await asyncio.wait({running, stop}, return_when=asyncio.FIRST_COMPLETED)
-                        stop.cancel()
-                        if running in done:
-                            wave_results.extend(running.result())
-                            continue
-                        running.cancel()
-                        await asyncio.gather(running, return_exceptions=True)
-                        for child in self.agents.values():
-                            child.request_interrupt()
-                        return "Stopped by user."
+                        batch_results = await self._await_children(batch)
+                        if batch_results is None:
+                            for child in self.agents.values():
+                                child.request_interrupt()
+                            return "Stopped by user."
+                        wave_results.extend(batch_results)
 
                     for agent_id, result in zip(agent_id_map.keys(), wave_results):
                         if agent_id in self.agents:
@@ -455,16 +482,11 @@ End with exactly one line: GRADE: [1-5]"""
         if str(args.get("memory", "")).strip().lower() in ("off", "false", "0", "no"):
             agent.memory = None
         self._set_status(True, f"orchestrator · waiting on {agent.name}")
-        stop = asyncio.ensure_future(self.interrupt_event.wait())
-        running = asyncio.ensure_future(agent.run(full_task))
-        done, _ = await asyncio.wait({running, stop}, return_when=asyncio.FIRST_COMPLETED)
-        stop.cancel()
-        if running not in done:
-            running.cancel()
-            await asyncio.gather(running, return_exceptions=True)
+        results = await self._await_children([agent.run(full_task)])
+        if results is None:
             agent.request_interrupt()
             return "Stopped by user."
-        result = running.result()
+        result = results[0]
         self._last_agent_id = agent_id
         return str(result)
 
@@ -481,14 +503,13 @@ End with exactly one line: GRADE: [1-5]"""
         graph = {key: set() for key in by_key}
         for spec in agents_spec:
             key = self._task_key(spec)
-            for dep in spec.get("depends_on", []) or []:
-                dep = str(dep)
+            deps = {str(d) for d in (spec.get("depends_on") or [])}
+            for dep in deps:
                 if dep in graph:
                     graph[dep].add(key)
                     in_degree[key] += 1
                 else:
-                    logger.warning(
-                        f"Task '{key}' depends on unknown task '{dep}' — dependency ignored")
+                    logger.warning(f"Task '{key}' depends on unknown task '{dep}' — dependency ignored")
         waves = []
         remaining = [spec for spec in agents_spec if in_degree[self._task_key(spec)] == 0]
         while remaining:
@@ -509,13 +530,11 @@ End with exactly one line: GRADE: [1-5]"""
         if not role_exists(role_name):
             raise ValueError(f"Role '{role_name}' does not exist")
         agent_id = f"{role_name}_{uuid.uuid4().hex[:8]}"
-        role_cfg = load_role(role_name) or load_role("system")
-        prompt = role_cfg.prompt if role_cfg else f"You are {role_name}."
-        initial_history = [{"role": "system", "content": prompt}]
         non_system = [
             m for m in self.history
             if m.get("role") in ("user", "assistant")
         ]
+        initial_history = []
         for msg in non_system[-6:]:
             initial_history.append({"role": msg["role"], "content": msg["content"]})
         child_provider = self.provider.clone() if hasattr(self.provider, "clone") else self.provider

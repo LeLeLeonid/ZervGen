@@ -1506,13 +1506,19 @@ def trim_context(text: str, limit: int) -> str:
         return text
     parts = re.split(r"(?m)^(?=#{1,3} )", text)
     if len(parts) < 2:
-        return text[: max(0, limit - 24)] + "\n...[truncated]"
+        return balance_fences(text[: max(0, limit - 24)]) + "\n...[truncated]"
     head, sections = parts[0], parts[1:]
     per = max(120, (limit - len(head) - 40) // len(sections))
     kept = [head]
     for sec in sections:
-        kept.append(sec if len(sec) <= per else sec[: per - 20].rstrip() + "\n...[truncated]\n")
+        kept.append(sec if len(sec) <= per else balance_fences(sec[: per - 20].rstrip()) + "\n...[truncated]\n")
     return "".join(kept)
+
+
+def balance_fences(text: str) -> str:
+    """Close a dangling code fence so a truncated section cannot swallow what follows."""
+    fences = sum(1 for line in text.splitlines() if line.lstrip().startswith("```"))
+    return f"{text}\n```" if fences % 2 else text
 
 
 def _read_rule_file(path: Path) -> str:
